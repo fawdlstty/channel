@@ -76,7 +76,11 @@ channel 把不同 AI Coding Harness 统一成同一个会话模型。调用方�
 
 ## 6. 恢复历史会话
 
-`initialized.resume(target)` 预留给 provider 侧历史恢复。它会先检查 `initialized.capabilities().effective.provider_resume`，但当前实现尚未提供恢复能力，调用最终会返回 `UnsupportedCapability`。业务代码目前应把恢复视为不可用。
+`initialized.resume(target)` 用于 provider 侧历史恢复。它会先检查 `initialized.capabilities().effective.provider_resume`；Codex App Server（`thread/resume`）和 ClaudeCode（`--resume`）声明了该能力，ACP 与托管脚本 CLI 不支持，返回 `UnsupportedCapability`。
+
+恢复目标用 `ResumeTarget` 表达：`ChannelDefault`、`ProviderSession` 和 `ProviderThread` 都会映射到 provider 侧会话或线程 ID；`NativeUiHandle` 当前不可恢复。恢复得到的 `Session` 处于空闲状态，随后用普通 `send` 开始新回合。会话详情中 `visibility.resumability` 反映实际可恢复性；`set_observability(false)` 创建的临时会话始终为 `InMemoryOnly`。
+
+会话恢复后，Codex 会继续既有 thread，ClaudeCode 会在下一回合通过 `--resume` 续接同一会话 ID；新回合的外部 ID 会在事件回流后出现在 `info().external_ids` 中。
 
 ## 7. 托管 CLI 约定
 

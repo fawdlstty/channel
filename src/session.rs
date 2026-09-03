@@ -421,9 +421,9 @@ impl Session {
         }
         session_info.visibility.resumability = if hidden_codex {
             Resumability::InMemoryOnly
-        } else if matches!(config.conversation.mode, ConversationSpec::Resume(_)) {
-            Resumability::ProviderResume
-        } else if session_info.capabilities.effective.provider_resume {
+        } else if matches!(config.conversation.mode, ConversationSpec::Resume(_))
+            || session_info.capabilities.effective.provider_resume
+        {
             Resumability::ProviderResume
         } else {
             Resumability::InMemoryOnly
@@ -1071,10 +1071,10 @@ mod tests {
     #[tokio::test]
     async fn resume_mode_reports_provider_resumability() {
         let mut config = SessionConfig::default_for(HarnessKind::Codex);
-        config.conversation.mode = ConversationSpec::Resume(ResumeTarget::ProviderSession {
+        config.conversation.mode = ConversationSpec::Resume(crate::protocol::ResumeTarget::ProviderSession {
             id: "th-1".to_owned(),
         });
-        let mut session = Session::with_backend_config(
+        let session = Session::with_backend_config(
             config,
             Some("th-1".to_owned()),
             Box::new(MockBackend::new(Vec::new())),
