@@ -16,8 +16,20 @@ impl JsonlProcess {
         args: &[&str],
         cwd: Option<&std::path::Path>,
     ) -> Result<Self, Error> {
+        Self::spawn_with_cwd_and_env(command, args, cwd, &[]).await
+    }
+
+    pub(crate) async fn spawn_with_cwd_and_env(
+        command: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+        envs: &[(&str, &std::path::Path)],
+    ) -> Result<Self, Error> {
         let mut command_builder = Command::new(command);
         command_builder.args(args);
+        for (name, value) in envs {
+            command_builder.env(name, value);
+        }
         if let Some(cwd) = cwd {
             command_builder.current_dir(cwd);
         }

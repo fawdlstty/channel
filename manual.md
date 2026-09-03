@@ -4,37 +4,33 @@ channel 把不同 AI Coding Harness 统一成同一个会话模型。调用方�
 
 ## 1. 选择并准备 Harness
 
-先用 `HarnessType` 表达业务上要接入哪类工具：
+先用 `HarnessKind` 表达业务上要接入哪类工具：
 
 - `Codex` 走 Codex App Server。
-- `OpenCode`、`ZedAcp`、`ZCode`、`DeepSeek` 走 Agent Client Protocol。
+- `OpenCode`、`ZedAcp`、`ZCode`、`DeepSeek`、`Hermes` 走 Agent Client Protocol。
 - `ClaudeCode`、`Aider`、`Goose`、`Cline`、`RooCode`、`OpenHands`、`SweAgent`、`GeminiCli`、`Continue` 走托管 CLI。
-- `Custom { command, args }` 接入自有 CLI。
 
-`initialize(harness)` 用于在真正开始对话前确认运行环境，默认使用当前工作目录。发现失败时，用 `initialize_with(config)` 传入工作目录、可执行文件、endpoint 或 port：
+`Harness::initialize(kind)` 用于在真正开始对话前确认运行环境，默认使用当前工作目录。发现失败时，用 `Harness::initialize_with(config)` 传入工作目录、可执行文件、endpoint 或 port：
 
 - `workspace` 决定业务工作目录，默认使用当前目录；
 - `executable` 覆盖默认可执行文件；
 - `endpoint` 或 `port` 当前只有 Codex 后端消费，且二者不能同时指定；Codex endpoint 只允许本机 `ws://` 地址；
 - 普通 CLI 只接受托管 stdio，传入 endpoint 或 port 会失败。
 
-成功后得到不透明的 `Harness`，解析出的运行时类型不对用户暴露。`initialized.capabilities()` 用于判断该后端能提供流式事件、工具调用、文件读取、取消等能力。
+成功后得到不透明的 `Harness`，解析出的运行时类型不对用户暴露。`initialized.capabilities()` 用于判断该后端能提供流式事件、工具调用、文件读取、取消等能力。Codex 的 `initialized.available_models()` 返回协议层当前报告的模型 ID。
 
 ## 2. 创建会话
 
-最短路径是 `create_session(harness, first_message)`。它使用默认配置初始化 harness，并立刻把第一条用户消息提交给后端；返回的 `Session` 通常已经处于 `Running`。
+会话通过 `Session::create(config, first_message)` 创建；它使用配置初始化 harness，并立刻把第一条用户消息提交给后端；返回的 `Session` 通常已经处于 `Running`。
 
 需要控制工作目录、模型、网络、审批、权限、运行时或后端协议时，改用分层配置：
 
-1. `SessionConfig::for_harness(harness)` 打开配置构造器。
-2. 按业务约束设置 `workspace`、`model`、`network`、`approval`、`permissions`、`runtime`、`conversation`、`observability`、`metadata`、`provider_option`。
-3. 通常保持 `Auto` 后端；确有需要时用 `codex_app_server`、`acp`、`structured_cli`、`plain_cli` 或 `custom_command` 显式指定连接方式。
-4. `build()` 生成 `SessionConfig`。
-5. `initialize_with(config)` 返回 `Harness`，再调用 `create_session(first_message)`；`CreateSessionWithConfig(config, first_message)` 是这两步的组合入口。
+1. `SessionConfig::for_kind(kind)` 直接返回可变的 `SessionConfig`。
+2. 按业务约束修改安全、运行时、会话、元数据、provider 选项或后端字段；工作目录、观测性、模型和推理强度可用 `set_workspace`、`set_observability`、`set_model`、`set_reasoning_effort` 设置。`set_workspace(None)` 表示初始化时使用当前目录；`set_observability(false)` 请求目标 harness 不可见，`set_observability(true)` 使用 provider 默认可见性。
+3. 通常保持 `Auto` 后端；确有需要时显式修改 `backend` 为 `CodexAppServer`、`Acp`、`StructuredCli` 或 `PlainCli`。
+4. `Session::create(config, first_message)` 负责初始化并创建会话；`Harness::initialize_with(config)` 可单独用于提前检查 `Harness` 能力和模型列表。
 
-配置在 builder 阶段是不可变的。`build()` 之后只能通过 `harness()`、`workspace()`、`security()`、`model()`、`runtime()`、`conversation()`、`observability()`、`metadata()`、`provider_options()` 回读，不能继续改值；要变更就重新走 builder。常用默认值有 `WorkspaceOptions::directory(path)` 和 `PermissionSpec::workspace_read_write()`。
-
-简单入口是 `CreateSession(harness, cwd, first_message)`，其中 `cwd` 为 `Option<String>`；传 `None` 时使用当前目录。
+配置对象可直接回读：`get_workspace`、`get_observability`、`get_model` 和 `get_reasoning_effort`；推理强度使用 `ReasoningEffort`（`Minimal`、`Low`、`Medium`、`High`、`XHigh`、`Max`）。其他只读访问器包括 `kind()`、`security()`、`runtime()`、`conversation()`、`metadata()` 和 `provider_options()`。常用默认值有 `WorkspaceOptions::directory(path)` 和 `PermissionSpec::workspace_read_write()`。
 
 创建即提交首条消息，所以创建成功后不需要再调用一次发送。
 
@@ -80,11 +76,9 @@ channel 把不同 AI Coding Harness 统一成同一个会话模型。调用方�
 
 ## 6. 恢复历史会话
 
-`resume_session(initialized, target)` 预留给 provider 侧历史恢复。它会先检查 `initialized.capabilities().effective.provider_resume`，但当前实现尚未提供恢复能力，调用最终会返回 `UnsupportedCapability`。业务代码目前应把恢复视为不可用。
+`initialized.resume(target)` 预留给 provider 侧历史恢复。它会先检查 `initialized.capabilities().effective.provider_resume`，但当前实现尚未提供恢复能力，调用最终会返回 `UnsupportedCapability`。业务代码目前应把恢复视为不可用。
 
-## 7. 自定义 CLI 约定
-
-`HarnessType::Custom` 通过命令加参数接入。参数里的 `{message}` 会被替换为用户消息，`{session_id}` 会被替换为后端会话 ID；若没有 `{message}`，消息会追加为最后一个参数。
+## 7. 托管 CLI 约定
 
 CLI 每回合启动一次进程，从 stdout 读取按行分隔的输出。普通文本会归一化为回答增量；JSON 行会识别会话 ID、文本、工具调用、工具结果、文件读取、状态和最终结果。最简单的完成事件形如 `{"type":"result","result":"最终回答"}`；标记 `is_error` 或 `status: "failed"` 会形成失败终态。
 

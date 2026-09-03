@@ -1,25 +1,25 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HarnessType {
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HarnessKind {
     Codex,
     ClaudeCode,
     OpenCode,
     ZedAcp,
     ZCode,
     DeepSeek,
-    Aider,
-    Goose,
-    Cline,
-    RooCode,
-    OpenHands,
-    SweAgent,
-    GeminiCli,
-    Continue,
-    Custom { command: String, args: Vec<String> },
+    Hermes,
+}
+
+/// The registry used to resolve switch-managed provider keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SwitchProvider {
+    CcSwitch,
 }
 
 /// A requested provider endpoint. `Auto` deliberately does not imply a port.
@@ -67,13 +67,25 @@ impl Default for HarnessInit {
     }
 }
 
+impl HarnessInit {
+    pub(crate) fn for_config(config: &SessionConfig) -> Self {
+        Self {
+            endpoint: config.endpoint.clone(),
+            executable: config.runtime.process.executable.clone(),
+            cwd: Some(config.workspace_cwd().to_path_buf()),
+            port: config.port,
+        }
+    }
+}
+
 /// Resolved initialization metadata retained for internal session creation.
 #[derive(Clone, Debug)]
-pub(crate) struct HarnessRuntime {
+pub(crate) struct HarnessState {
     pub(crate) config: SessionConfig,
     pub(crate) backend: BackendInfo,
     pub(crate) runtime: RuntimeInfo,
     pub(crate) capabilities: CapabilityReport,
+    pub(crate) available_models: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,16 +108,40 @@ impl Default for SecurityOptions {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelOptions {
     pub requested: Option<String>,
+    pub available_models: Vec<String>,
     pub provider: Option<String>,
-    pub reasoning_effort: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub temperature: Option<f32>,
     pub max_output_tokens: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
 impl Default for ModelOptions {
     fn default() -> Self {
         Self {
             requested: None,
+            available_models: Vec::new(),
             provider: None,
             reasoning_effort: None,
             temperature: None,
@@ -142,58 +178,90 @@ impl Default for ConversationOptions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObservabilityOptions {
-    pub visibility: VisibilityRequest,
-    pub events: EventPolicy,
-}
-
-impl Default for ObservabilityOptions {
-    fn default() -> Self {
-        Self {
-            visibility: VisibilityRequest::ProviderDefault,
-            events: EventPolicy::default(),
-        }
-    }
-}
-
 pub type ProviderOptions = serde_json::Map<String, serde_json::Value>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionConfig {
-    pub(crate) harness: HarnessType,
-    pub(crate) workspace: WorkspaceOptions,
-    pub(crate) security: SecurityOptions,
-    pub(crate) model: ModelOptions,
-    pub(crate) runtime: RuntimeOptions,
-    pub(crate) conversation: ConversationOptions,
-    pub(crate) observability: ObservabilityOptions,
-    pub(crate) metadata: BTreeMap<String, String>,
-    pub(crate) endpoint: EndpointRequest,
-    pub(crate) port: Option<u16>,
-    provider_options: ProviderOptions,
-    pub(crate) backend: BackendSpec,
+    pub kind: HarnessKind,
+    pub workspace: WorkspaceOptions,
+    pub security: SecurityOptions,
+    pub model: ModelOptions,
+    pub runtime: RuntimeOptions,
+    pub conversation: ConversationOptions,
+    pub observability: Option<bool>,
+    pub metadata: BTreeMap<String, String>,
+    pub endpoint: EndpointRequest,
+    pub port: Option<u16>,
+    pub provider_options: ProviderOptions,
+    pub switch_key: Option<String>,
+    pub backend: BackendSpec,
 }
 
 impl SessionConfig {
-    pub fn for_harness(harness: HarnessType) -> SessionConfigBuilder {
-        SessionConfigBuilder::new(harness)
+    pub fn for_kind(kind: HarnessKind) -> Self {
+        Self::default_for(kind)
     }
 
-    pub fn harness(&self) -> &HarnessType {
-        &self.harness
+    pub fn get_workspace(&self) -> Option<PathBuf> {
+        self.workspace.cwd.clone()
     }
 
-    pub fn workspace(&self) -> &WorkspaceOptions {
-        &self.workspace
+    pub fn set_workspace(&mut self, workspace: Option<PathBuf>) {
+        self.workspace.cwd = workspace;
+    }
+
+    pub(crate) fn workspace_cwd(&self) -> &Path {
+        self.workspace
+            .cwd
+            .as_deref()
+            .unwrap_or_else(|| Path::new("."))
+    }
+
+    pub fn get_observability(&self) -> Option<bool> {
+        self.observability
+    }
+
+    pub fn set_observability(&mut self, visible: bool) {
+        self.observability = Some(visible);
+    }
+
+    pub fn get_model(&self) -> Option<String> {
+        self.model.requested.clone()
+    }
+
+    pub fn set_model(&mut self, model: Option<String>) {
+        self.model.requested = model;
+    }
+
+    pub fn get_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.model.reasoning_effort
+    }
+
+    pub fn set_reasoning_effort(&mut self, reasoning_effort: Option<ReasoningEffort>) {
+        self.model.reasoning_effort = reasoning_effort;
+    }
+
+    pub(crate) fn is_full_access(&self) -> bool {
+        self.security.approval == ApprovalPolicy::AutoApprove
+            && self.security.permissions.filesystem.mode == FilesystemAccess::FullHost
+    }
+
+    pub fn set_full_access(&mut self, full_access: bool) {
+        if full_access {
+            self.security.approval = ApprovalPolicy::AutoApprove;
+            self.security.permissions.filesystem.mode = FilesystemAccess::FullHost;
+        } else {
+            self.security.approval = ApprovalPolicy::ProviderDefault;
+            self.security.permissions.filesystem.mode = FilesystemAccess::WorkspaceReadWrite;
+        }
+    }
+
+    pub fn kind(&self) -> &HarnessKind {
+        &self.kind
     }
 
     pub fn security(&self) -> &SecurityOptions {
         &self.security
-    }
-
-    pub fn model(&self) -> &ModelOptions {
-        &self.model
     }
 
     pub fn runtime(&self) -> &RuntimeOptions {
@@ -204,10 +272,6 @@ impl SessionConfig {
         &self.conversation
     }
 
-    pub fn observability(&self) -> &ObservabilityOptions {
-        &self.observability
-    }
-
     pub fn metadata(&self) -> &BTreeMap<String, String> {
         &self.metadata
     }
@@ -216,169 +280,78 @@ impl SessionConfig {
         &self.provider_options
     }
 
-    pub(crate) fn default_for(harness: HarnessType) -> Self {
+    pub fn set_switch_provider(&mut self, source: SwitchProvider, provider: impl Into<String>) {
+        match source {
+            SwitchProvider::CcSwitch => self.switch_key = Some(provider.into()),
+        }
+    }
+
+    pub fn clear_switch_provider(&mut self, source: SwitchProvider) {
+        match source {
+            SwitchProvider::CcSwitch => self.switch_key = None,
+        }
+    }
+
+    pub fn get_switch_key(&self, source: SwitchProvider) -> Option<&str> {
+        match source {
+            SwitchProvider::CcSwitch => self.switch_key.as_deref(),
+        }
+    }
+
+    pub(crate) fn default_for(kind: HarnessKind) -> Self {
         Self {
-            harness,
+            kind,
             workspace: WorkspaceOptions::default(),
             security: SecurityOptions::default(),
             model: ModelOptions::default(),
             runtime: RuntimeOptions::default(),
             conversation: ConversationOptions::default(),
-            observability: ObservabilityOptions::default(),
+            observability: None,
             metadata: BTreeMap::new(),
             endpoint: EndpointRequest::Auto,
             port: None,
             provider_options: ProviderOptions::new(),
+            switch_key: None,
             backend: BackendSpec::Auto,
         }
     }
-}
 
-pub struct SessionConfigBuilder {
-    config: SessionConfig,
-}
-
-impl SessionConfigBuilder {
-    fn new(harness: HarnessType) -> Self {
-        Self {
-            config: SessionConfig::default_for(harness),
+    pub(crate) fn prepare_workspace(&mut self) -> Result<(), Error> {
+        self.workspace.cwd.get_or_insert_with(|| PathBuf::from("."));
+        let cwd = self.workspace_cwd();
+        if !cwd.exists() {
+            match self.workspace.existence {
+                DirectoryRequirement::CreateIfMissing => {
+                    std::fs::create_dir_all(cwd).map_err(|error| {
+                        Error::InvalidConfig(format!(
+                            "failed to create workspace {}: {error}",
+                            cwd.display()
+                        ))
+                    })?
+                }
+                DirectoryRequirement::MustExist => {
+                    return Err(Error::InvalidConfig(format!(
+                        "workspace does not exist: {}",
+                        cwd.display()
+                    )))
+                }
+                DirectoryRequirement::MayBeMissing => {}
+            }
         }
-    }
-
-    pub fn workspace(mut self, path: impl Into<PathBuf>) -> Self {
-        self.config.workspace.cwd = path.into();
-        self
-    }
-
-    pub fn model(mut self, name: impl Into<String>) -> Self {
-        self.config.model.requested = Some(name.into());
-        self
-    }
-
-    pub fn network(mut self, network: NetworkPolicy) -> Self {
-        self.config.security.network = network;
-        self
-    }
-
-    pub fn approval(mut self, approval: ApprovalPolicy) -> Self {
-        self.config.security.approval = approval;
-        self
-    }
-
-    pub fn permissions(mut self, permissions: PermissionSpec) -> Self {
-        self.config.security.permissions = permissions;
-        self
-    }
-
-    pub fn runtime(mut self, runtime: RuntimeOptions) -> Self {
-        self.config.runtime = runtime;
-        self
-    }
-
-    pub fn conversation(mut self, conversation: ConversationOptions) -> Self {
-        self.config.conversation = conversation;
-        self
-    }
-
-    pub fn observability(mut self, observability: ObservabilityOptions) -> Self {
-        self.config.observability = observability;
-        self
-    }
-
-    pub fn endpoint(mut self, endpoint: impl Into<EndpointRequest>) -> Self {
-        self.config.endpoint = endpoint.into();
-        self
-    }
-
-    pub fn executable(mut self, path: impl Into<PathBuf>) -> Self {
-        self.config.runtime.process.executable = Some(path.into());
-        self
-    }
-
-    pub fn port(mut self, port: u16) -> Self {
-        self.config.port = Some(port);
-        self
-    }
-
-    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.config.metadata.insert(key.into(), value.into());
-        self
-    }
-
-    pub fn provider_option(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
-        self.config.provider_options.insert(key.into(), value);
-        self
-    }
-
-    pub fn codex_app_server(
-        mut self,
-        command: impl Into<String>,
-        args: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.config.backend = BackendSpec::CodexAppServer {
-            command: command.into(),
-            args: args.into_iter().map(Into::into).collect(),
-        };
-        self
-    }
-
-    pub fn acp(
-        mut self,
-        command: impl Into<String>,
-        args: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.config.backend = BackendSpec::Acp {
-            command: command.into(),
-            args: args.into_iter().map(Into::into).collect(),
-        };
-        self
-    }
-
-    pub fn structured_cli(
-        mut self,
-        command: impl Into<String>,
-        args: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.config.backend = BackendSpec::StructuredCli {
-            command: command.into(),
-            args: args.into_iter().map(Into::into).collect(),
-        };
-        self
-    }
-
-    pub fn plain_cli(
-        mut self,
-        command: impl Into<String>,
-        args: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.config.backend = BackendSpec::PlainCli {
-            command: command.into(),
-            args: args.into_iter().map(Into::into).collect(),
-        };
-        self
-    }
-
-    pub fn custom_command(
-        mut self,
-        command: impl Into<String>,
-        args: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.config.backend = BackendSpec::Custom {
-            command: command.into(),
-            args: args.into_iter().map(Into::into).collect(),
-        };
-        self
-    }
-
-    pub fn build(self) -> SessionConfig {
-        self.config
+        if cwd.exists() && !cwd.is_dir() {
+            return Err(Error::InvalidConfig(format!(
+                "workspace is not a directory: {}",
+                cwd.display()
+            )));
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceOptions {
     /// The requested working directory passed to the harness.
-    pub cwd: PathBuf,
+    pub cwd: Option<PathBuf>,
     /// Allowed path ranges; an empty list does not mean full host access.
     pub roots: Vec<WorkspaceRoot>,
     pub existence: DirectoryRequirement,
@@ -389,7 +362,7 @@ pub struct WorkspaceOptions {
 impl WorkspaceOptions {
     pub fn directory(path: impl Into<PathBuf>) -> Self {
         Self {
-            cwd: path.into(),
+            cwd: Some(path.into()),
             ..Self::default()
         }
     }
@@ -398,7 +371,7 @@ impl WorkspaceOptions {
 impl Default for WorkspaceOptions {
     fn default() -> Self {
         Self {
-            cwd: PathBuf::from("."),
+            cwd: None,
             roots: Vec::new(),
             existence: DirectoryRequirement::MustExist,
             repository_detection: RepositoryDetection::BestEffort,
@@ -601,7 +574,6 @@ pub enum BackendSpec {
     Acp { command: String, args: Vec<String> },
     StructuredCli { command: String, args: Vec<String> },
     PlainCli { command: String, args: Vec<String> },
-    Custom { command: String, args: Vec<String> },
 }
 
 impl Default for BackendSpec {
@@ -644,7 +616,6 @@ pub enum BackendKind {
     Acp,
     StructuredCli,
     PlainCli,
-    Custom,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -727,7 +698,7 @@ pub struct ModelInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VisibilityRequest {
     Private,
-    channelOnly,
+    ChannelOnly,
     ProviderSession {
         discoverable: bool,
         resumable: bool,
@@ -774,7 +745,7 @@ pub enum VisibilityState {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Resumability {
     InMemoryOnly,
-    channelResume,
+    ChannelResume,
     ProviderResume,
     NativeUiResume,
     #[default]
@@ -822,10 +793,23 @@ impl Default for ConversationSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResumeTarget {
-    channelSession(String),
+    ChannelDefault(String),
     ProviderSession { id: String },
     ProviderThread { id: String },
     NativeUiHandle { id: String },
+}
+
+impl ResumeTarget {
+    /// The provider-side identifier this target refers to, if the target kind
+    /// maps onto a provider session or thread.
+    pub fn provider_id(&self) -> Option<&str> {
+        match self {
+            Self::ChannelDefault(id) | Self::ProviderSession { id } | Self::ProviderThread { id } => {
+                Some(id)
+            }
+            Self::NativeUiHandle { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -895,7 +879,7 @@ impl Default for ResourcePolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionInfo {
     pub session_id: String,
-    pub harness: HarnessType,
+    pub kind: HarnessKind,
     pub backend: BackendInfo,
     pub state: SessionState,
     pub created_at: SystemTime,
@@ -949,7 +933,7 @@ pub struct AccountRef {
 pub enum CredentialSource {
     Environment,
     File,
-    Agent,
+    Harness,
     #[default]
     Unknown,
 }
@@ -1073,7 +1057,7 @@ pub enum ObservationSource {
     ToolExecution,
     ToolInputInference,
     TextInference,
-    channelDefault,
+    ChannelDefault,
     #[default]
     Unknown,
 }
@@ -1448,7 +1432,7 @@ impl Finish {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
-    UnsupportedHarness(HarnessType),
+    UnsupportedHarness(HarnessKind),
     Initialization(String),
     InvalidConfig(String),
     PermissionDenied(String),

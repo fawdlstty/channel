@@ -1,8 +1,10 @@
 use crate::protocol::{
-    Confidence, Error, Event, FileRead, FileReadSource, Finish, HarnessType, Status, ToolCall,
+    Confidence, Error, Event, FileRead, FileReadSource, Finish, HarnessKind, Status, ToolCall,
     ToolStatus,
 };
+use crate::runtime::HarnessDiscovery;
 use crate::session::{Backend, BackendFuture, SendMode};
+use crate::utils::json::JsonValueExt;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -146,7 +148,7 @@ impl AcpBackend {
         backend.protocol_version = initialize_result
             .get("protocolVersion")
             .or_else(|| initialize_result.get("protocol_version"))
-            .and_then(protocol_version_string);
+            .and_then(AcpValue::protocol_version_string);
         backend.server_name = initialize_result
             .get("serverInfo")
             .or_else(|| initialize_result.get("server_info"))
@@ -231,7 +233,7 @@ impl AcpBackend {
     }
 
     fn queue_update(&mut self, message: &Value) {
-        for event in parse_update(message) {
+        for event in message.parse_update() {
             if let Event::Status(Status::Completed) = event {
                 self.queue_finished(Status::Completed);
             } else if let Event::Status(Status::Interrupted) = event {
@@ -277,7 +279,7 @@ impl AcpBackend {
                         .get("stopReason")
                         .or_else(|| result.get("stop_reason"))
                         .and_then(Value::as_str)
-                        .map(stop_reason_status)
+                        .map(WireStatus::stop_reason_status)
                         .unwrap_or_else(|| {
                             if self.cancel_requested {
                                 Status::Interrupted
@@ -358,366 +360,357 @@ pub(crate) struct AcpInitialization {
     pub server_name: Option<String>,
 }
 
-pub(crate) async fn initialize(
-    harness: &HarnessType,
-    backend: &crate::protocol::BackendSpec,
-    init: &crate::protocol::HarnessInit,
-) -> Result<AcpInitialization, Error> {
-    if init.port.is_some() || !matches!(init.endpoint, crate::protocol::EndpointRequest::Auto) {
-        return Err(Error::InvalidConfig(
-            "the selected ACP harness only supports managed stdio connections".to_owned(),
-        ));
-    }
-    let cwd = crate::runtime::resolve_cwd(init.cwd.as_deref())?;
-    let (command, args) = match backend {
-        crate::protocol::BackendSpec::Auto => command_for(harness)?,
-        crate::protocol::BackendSpec::Acp { command, args } => (command.clone(), args.clone()),
-        _ => {
+impl AcpBackend {
+    pub(crate) async fn initialize(
+        kind: &HarnessKind,
+        backend: &crate::protocol::BackendSpec,
+        init: &crate::protocol::HarnessInit,
+    ) -> Result<AcpInitialization, Error> {
+        if init.port.is_some() || !matches!(init.endpoint, crate::protocol::EndpointRequest::Auto) {
             return Err(Error::InvalidConfig(
-                "ACP backend requires an Acp or Auto specification".to_owned(),
-            ))
+                "the selected ACP harness only supports managed stdio connections".to_owned(),
+            ));
         }
-    };
-    let executable =
-        crate::runtime::resolve_executable(init.executable.as_deref(), &command, Some(&cwd))?;
-    let mut backend =
-        AcpBackend::connect_with_cwd(command.clone(), args.clone(), Some(&cwd), Some(&executable))
-            .await?;
-    let initialization = AcpInitialization {
-        command,
-        args,
-        executable,
-        protocol_version: backend.protocol_version.clone(),
-        server_name: backend.server_name.clone(),
-    };
-    backend.close().await?;
-    Ok(initialization)
-}
+        let cwd = HarnessDiscovery::resolve_cwd(init.cwd.as_deref())?;
+        let (command, args) = match backend {
+            crate::protocol::BackendSpec::Auto => kind.acp_command()?,
+            crate::protocol::BackendSpec::Acp { command, args } => (command.clone(), args.clone()),
+            _ => {
+                return Err(Error::InvalidConfig(
+                    "ACP backend requires an Acp or Auto specification".to_owned(),
+                ));
+            }
+        };
+        let executable =
+            HarnessDiscovery::resolve_executable(init.executable.as_deref(), &command, Some(&cwd))?;
+        let mut backend = AcpBackend::connect_with_cwd(
+            command.clone(),
+            args.clone(),
+            Some(&cwd),
+            Some(&executable),
+        )
+        .await?;
+        let initialization = AcpInitialization {
+            command,
+            args,
+            executable,
+            protocol_version: backend.protocol_version.clone(),
+            server_name: backend.server_name.clone(),
+        };
+        backend.close().await?;
+        Ok(initialization)
+    }
 
-pub(crate) fn supported_capabilities() -> crate::protocol::CapabilitySet {
-    crate::protocol::CapabilitySet {
-        streaming_events: true,
-        structured_text: true,
-        tool_calls: true,
-        tool_inputs: true,
-        tool_outputs: true,
-        file_reads: true,
-        command_execution: true,
-        permission_requests: true,
-        permission_responses: true,
-        turn_cancel: true,
-        session_close: true,
-        raw_events: true,
-        ..crate::protocol::CapabilitySet::default()
+    pub(crate) fn supported_capabilities() -> crate::protocol::CapabilitySet {
+        crate::protocol::CapabilitySet {
+            streaming_events: true,
+            structured_text: true,
+            tool_calls: true,
+            tool_inputs: true,
+            tool_outputs: true,
+            file_reads: true,
+            command_execution: true,
+            permission_requests: true,
+            permission_responses: true,
+            turn_cancel: true,
+            session_close: true,
+            raw_events: true,
+            ..crate::protocol::CapabilitySet::default()
+        }
+    }
+
+    pub(crate) async fn create_session_with_config(
+        config: crate::protocol::SessionConfig,
+        first_message: String,
+        initialized: Option<crate::protocol::HarnessState>,
+    ) -> Result<crate::session::Session, Error> {
+        if !matches!(
+            config.conversation.mode,
+            crate::protocol::ConversationSpec::New
+        ) {
+            return Err(Error::UnsupportedCapability(
+                "ACP sessions cannot be resumed across process restarts".to_owned(),
+            ));
+        }
+        let kind = config.kind.clone();
+        let cwd = HarnessDiscovery::resolve_cwd(Some(config.workspace_cwd()))?;
+        let (command, args) = match &config.backend {
+            crate::protocol::BackendSpec::Acp { command, args } => (command.clone(), args.clone()),
+            crate::protocol::BackendSpec::Auto => kind.acp_command()?,
+            _ => {
+                return Err(Error::InvalidConfig(
+                    "ACP backend requires an Acp or Auto specification".to_owned(),
+                ));
+            }
+        };
+        let executable = HarnessDiscovery::resolve_executable(
+            config.runtime.process.executable.as_deref(),
+            &command,
+            Some(&cwd),
+        )?;
+        let backend =
+            AcpBackend::connect_with_cwd(command, args, Some(&cwd), Some(&executable)).await?;
+        let id = backend.session_id.clone();
+        let mut session = crate::session::Session::with_backend_config(
+            config,
+            Some(id),
+            Box::new(backend),
+            initialized,
+        );
+        if !first_message.is_empty() {
+            session.send(first_message, SendMode::Immediate).await?;
+        }
+        Ok(session)
     }
 }
 
-pub(crate) async fn create_session_with_config(
-    config: crate::protocol::SessionConfig,
-    first_message: String,
-    initialized: Option<crate::protocol::HarnessRuntime>,
-) -> Result<crate::session::Session, Error> {
-    let harness = config.harness.clone();
-    let cwd = crate::runtime::resolve_cwd(Some(config.workspace.cwd.as_path()))?;
-    let (command, args) = match &config.backend {
-        crate::protocol::BackendSpec::Acp { command, args } => (command.clone(), args.clone()),
-        crate::protocol::BackendSpec::Auto => command_for(&harness)?,
-        _ => {
-            return Err(Error::InvalidConfig(
-                "ACP backend requires an Acp or Auto specification".to_owned(),
-            ))
-        }
-    };
-    let executable = crate::runtime::resolve_executable(
-        config.runtime.process.executable.as_deref(),
-        &command,
-        Some(&cwd),
-    )?;
-    let backend =
-        AcpBackend::connect_with_cwd(command, args, Some(&cwd), Some(&executable)).await?;
-    let id = backend.session_id.clone();
-    let mut session = crate::session::Session::with_backend_config(
-        config,
-        Some(id),
-        Box::new(backend),
-        initialized,
-    );
-    session.send(first_message, SendMode::Immediate).await?;
-    Ok(session)
+trait AcpCommand {
+    fn acp_command(&self) -> Result<(String, Vec<String>), Error>;
 }
 
-fn command_for(harness: &HarnessType) -> Result<(String, Vec<String>), Error> {
-    match harness {
-        HarnessType::OpenCode => Ok(("opencode".to_owned(), vec!["acp".to_owned()])),
-        HarnessType::ZedAcp => Ok(("zed".to_owned(), vec!["acp".to_owned()])),
-        HarnessType::ZCode => Ok(("zcode".to_owned(), vec!["acp".to_owned()])),
-        HarnessType::DeepSeek => Ok(("deepseek".to_owned(), vec!["acp".to_owned()])),
-        HarnessType::Custom { command, args } => Ok((command.clone(), args.clone())),
-        _ => Err(Error::UnsupportedHarness(harness.clone())),
+impl AcpCommand for HarnessKind {
+    fn acp_command(&self) -> Result<(String, Vec<String>), Error> {
+        match self {
+            HarnessKind::OpenCode => Ok(("opencode".to_owned(), vec!["acp".to_owned()])),
+            HarnessKind::ZedAcp => Ok(("zed".to_owned(), vec!["acp".to_owned()])),
+            HarnessKind::ZCode => Ok(("zcode".to_owned(), vec!["acp".to_owned()])),
+            HarnessKind::DeepSeek => Ok(("deepseek".to_owned(), vec!["acp".to_owned()])),
+            HarnessKind::Hermes => Ok(("hermes".to_owned(), vec!["acp".to_owned()])),
+            _ => Err(Error::UnsupportedHarness(self.clone())),
+        }
     }
 }
 
-fn protocol_version_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(value) => Some(value.clone()),
-        Value::Number(value) => Some(value.to_string()),
-        _ => None,
-    }
+trait AcpValue {
+    fn protocol_version_string(&self) -> Option<String>;
+    fn parse_update(&self) -> Vec<Event>;
+    fn tool_events(&self, kind: &str) -> Vec<Event>;
+    fn tool_status(&self, kind: &str) -> ToolStatus;
+    fn text_event(&self, reasoning: bool) -> Option<Event>;
+    fn status(&self) -> Option<Status>;
 }
 
-fn parse_update(message: &Value) -> Vec<Event> {
-    let params = message.get("params").unwrap_or(message);
-    let update = params.get("update").unwrap_or(params);
-    let kind = update
-        .get("sessionUpdate")
-        .or_else(|| update.get("session_update"))
-        .or_else(|| update.get("type"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let content = update.get("content").unwrap_or(update);
-    match kind {
-        "agent_message_chunk" | "agentMessageChunk" | "text_delta" => {
-            text_event(content, false).into_iter().collect()
+impl AcpValue for Value {
+    fn protocol_version_string(&self) -> Option<String> {
+        match self {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
         }
-        "agent_thought_chunk" | "agentThoughtChunk" | "reasoning_delta" => {
-            text_event(content, true).into_iter().collect()
-        }
-        "tool_call" | "toolCall" | "tool_call_update" | "toolCallUpdate" | "tool_result"
-        | "toolResult" | "file_read" | "fileRead" => tool_events(update, kind),
-        "permission_request" | "permissionRequest" => vec![Event::PermissionRequired {
-            id: update
-                .get("id")
-                .and_then(string_value)
-                .unwrap_or_else(|| "permission".to_owned()),
-            detail: update.to_string(),
-        }],
-        "status" => update
-            .get("status")
-            .and_then(status_from_value)
-            .map(|status| {
-                if status.is_terminal() {
-                    Event::Finished(Finish::new(status, ""))
-                } else {
-                    Event::Status(status)
-                }
-            })
-            .into_iter()
-            .collect(),
-        _ => {
-            if let Some(status) = params
+    }
+
+    fn parse_update(&self) -> Vec<Event> {
+        let params = self.get("params").unwrap_or(self);
+        let update = params.get("update").unwrap_or(params);
+        let kind = update
+            .get("sessionUpdate")
+            .or_else(|| update.get("session_update"))
+            .or_else(|| update.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let content = update.get("content").unwrap_or(update);
+        match kind {
+            "agent_message_chunk" | "agentMessageChunk" | "text_delta" => {
+                content.text_event(false).into_iter().collect()
+            }
+            "agent_thought_chunk" | "agentThoughtChunk" | "reasoning_delta" => {
+                content.text_event(true).into_iter().collect()
+            }
+            "tool_call" | "toolCall" | "tool_call_update" | "toolCallUpdate" | "tool_result"
+            | "toolResult" | "file_read" | "fileRead" => update.tool_events(kind),
+            "permission_request" | "permissionRequest" => vec![Event::PermissionRequired {
+                id: update
+                    .get("id")
+                    .and_then(JsonValueExt::string_value)
+                    .unwrap_or_else(|| "permission".to_owned()),
+                detail: update.to_string(),
+            }],
+            "status" => update
                 .get("status")
-                .and_then(status_from_value)
-                .or_else(|| update.get("status").and_then(status_from_value))
-            {
-                if status.is_terminal() {
-                    vec![Event::Finished(Finish::new(status, ""))]
+                .and_then(AcpValue::status)
+                .map(|status| {
+                    if status.is_terminal() {
+                        Event::Finished(Finish::new(status, ""))
+                    } else {
+                        Event::Status(status)
+                    }
+                })
+                .into_iter()
+                .collect(),
+            _ => {
+                if let Some(status) = params
+                    .get("status")
+                    .and_then(AcpValue::status)
+                    .or_else(|| update.get("status").and_then(AcpValue::status))
+                {
+                    if status.is_terminal() {
+                        vec![Event::Finished(Finish::new(status, ""))]
+                    } else {
+                        vec![Event::Status(status)]
+                    }
                 } else {
-                    vec![Event::Status(status)]
+                    vec![Event::Raw(self.clone())]
                 }
-            } else {
-                vec![Event::Raw(message.clone())]
             }
         }
     }
-}
 
-fn tool_events(update: &Value, kind: &str) -> Vec<Event> {
-    let name = update
-        .get("title")
-        .or_else(|| update.get("name"))
-        .or_else(|| update.get("toolName"))
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            if kind.to_ascii_lowercase().contains("file") {
-                "file_read"
-            } else {
-                "tool"
-            }
-        });
-    let id = update
-        .get("toolCallId")
-        .or_else(|| update.get("tool_call_id"))
-        .or_else(|| update.get("id"))
-        .and_then(string_value);
-    let input = update
-        .get("rawInput")
-        .or_else(|| update.get("raw_input"))
-        .or_else(|| update.get("input"))
-        .or_else(|| update.get("arguments"))
-        .or_else(|| update.get("args"));
-    let output = update
-        .get("rawOutput")
-        .or_else(|| update.get("raw_output"))
-        .or_else(|| update.get("output"))
-        .or_else(|| update.get("result"));
-    let error = update.get("error").or_else(|| update.get("errorMessage"));
-    let status = tool_status(update, kind);
-    let mut events = vec![Event::ToolCall(ToolCall {
-        id: id.clone(),
-        name: name.to_owned(),
-        status,
-        input: input.map(value_text),
-        output: output.map(value_text),
-        error: error.map(value_text),
-        sequence: 0,
-    })];
+    fn tool_events(&self, kind: &str) -> Vec<Event> {
+        let name = self
+            .get("title")
+            .or_else(|| self.get("name"))
+            .or_else(|| self.get("toolName"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                if kind.to_ascii_lowercase().contains("file") {
+                    "file_read"
+                } else {
+                    "tool"
+                }
+            });
+        let id = self
+            .get("toolCallId")
+            .or_else(|| self.get("tool_call_id"))
+            .or_else(|| self.get("id"))
+            .and_then(JsonValueExt::string_value);
+        let input = self
+            .get("rawInput")
+            .or_else(|| self.get("raw_input"))
+            .or_else(|| self.get("input"))
+            .or_else(|| self.get("arguments"))
+            .or_else(|| self.get("args"));
+        let output = self
+            .get("rawOutput")
+            .or_else(|| self.get("raw_output"))
+            .or_else(|| self.get("output"))
+            .or_else(|| self.get("result"));
+        let error = self.get("error").or_else(|| self.get("errorMessage"));
+        let status = self.tool_status(kind);
+        let mut events = vec![Event::ToolCall(ToolCall {
+            id: id.clone(),
+            name: name.to_owned(),
+            status,
+            input: input.map(JsonValueExt::value_text),
+            output: output.map(JsonValueExt::value_text),
+            error: error.map(JsonValueExt::value_text),
+            sequence: 0,
+        })];
 
-    let explicit = matches!(kind, "file_read" | "fileRead");
-    if let Some(path) = file_path(input)
-        .or_else(|| {
-            if explicit {
-                file_path(Some(update))
+        let explicit = matches!(kind, "file_read" | "fileRead");
+        if let Some(path) = input
+            .and_then(JsonValueExt::file_path)
+            .or_else(|| explicit.then(|| self.file_path()).flatten())
+            .or_else(|| name.inferred_command_path(input))
+        {
+            events.push(Event::FileRead(FileRead {
+                path,
+                tool_id: id,
+                status,
+                line_start: input.and_then(|input| {
+                    input.line_number(&["line_start", "start_line", "startLine"])
+                }),
+                line_end: input
+                    .and_then(|input| input.line_number(&["line_end", "end_line", "endLine"])),
+                summary: output.map(JsonValueExt::value_text),
+                source: if explicit {
+                    FileReadSource::Protocol
+                } else {
+                    FileReadSource::ToolInput
+                },
+                confidence: if explicit {
+                    Confidence::High
+                } else {
+                    Confidence::Medium
+                },
+                sequence: 0,
+            }));
+        }
+        events
+    }
+
+    fn tool_status(&self, kind: &str) -> ToolStatus {
+        let status = self
+            .get("status")
+            .or_else(|| self.get("state"))
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase);
+        match status.as_deref().or({
+            if matches!(kind, "tool_call" | "toolCall") {
+                Some("pending")
+            } else if matches!(kind, "tool_result" | "toolResult") {
+                Some("completed")
             } else {
                 None
             }
-        })
-        .or_else(|| inferred_command_path(name, input))
-    {
-        events.push(Event::FileRead(FileRead {
-            path,
-            tool_id: id,
-            status,
-            line_start: line_number(input, &["line_start", "start_line", "startLine"]),
-            line_end: line_number(input, &["line_end", "end_line", "endLine"]),
-            summary: output.map(value_text),
-            source: if explicit {
-                FileReadSource::Protocol
-            } else {
-                FileReadSource::ToolInput
-            },
-            confidence: if explicit {
-                Confidence::High
-            } else {
-                Confidence::Medium
-            },
-            sequence: 0,
-        }));
+        }) {
+            Some("pending") | Some("requested") => ToolStatus::Requested,
+            Some("running") | Some("in_progress") | Some("inprogress") => ToolStatus::Running,
+            Some("completed") | Some("complete") | Some("success") | Some("succeeded") => {
+                ToolStatus::Completed
+            }
+            Some("failed") | Some("error") => ToolStatus::Failed,
+            Some("cancelled") | Some("canceled") | Some("interrupted") => ToolStatus::Cancelled,
+            _ => ToolStatus::Unknown,
+        }
     }
-    events
-}
 
-fn tool_status(update: &Value, kind: &str) -> ToolStatus {
-    let status = update
-        .get("status")
-        .or_else(|| update.get("state"))
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase);
-    match status.as_deref().or({
-        if matches!(kind, "tool_call" | "toolCall") {
-            Some("pending")
-        } else if matches!(kind, "tool_result" | "toolResult") {
-            Some("completed")
+    fn text_event(&self, reasoning: bool) -> Option<Event> {
+        let text = self
+            .get("text")
+            .or_else(|| self.get("delta"))
+            .and_then(Value::as_str)?
+            .to_owned();
+        Some(if reasoning {
+            Event::ReasoningDelta(text)
         } else {
-            None
-        }
-    }) {
-        Some("pending") | Some("requested") => ToolStatus::Requested,
-        Some("running") | Some("in_progress") | Some("inprogress") => ToolStatus::Running,
-        Some("completed") | Some("complete") | Some("success") | Some("succeeded") => {
-            ToolStatus::Completed
-        }
-        Some("failed") | Some("error") => ToolStatus::Failed,
-        Some("cancelled") | Some("canceled") | Some("interrupted") => ToolStatus::Cancelled,
-        _ => ToolStatus::Unknown,
-    }
-}
-
-fn value_text(value: &Value) -> String {
-    value
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.to_string())
-}
-
-fn string_value(value: &Value) -> Option<String> {
-    match value {
-        Value::String(value) => Some(value.clone()),
-        Value::Number(value) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-fn file_path(value: Option<&Value>) -> Option<String> {
-    let value = value?.as_object()?;
-    [
-        "path",
-        "file_path",
-        "filePath",
-        "filename",
-        "file",
-        "target",
-        "uri",
-    ]
-    .iter()
-    .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_owned))
-}
-
-fn line_number(value: Option<&Value>, keys: &[&str]) -> Option<usize> {
-    let object = value?.as_object()?;
-    keys.iter()
-        .find_map(|key| object.get(*key).and_then(Value::as_u64).map(|n| n as usize))
-}
-
-fn inferred_command_path(name: &str, input: Option<&Value>) -> Option<String> {
-    let name = name.to_ascii_lowercase();
-    if !matches!(
-        name.as_str(),
-        "cat" | "grep" | "rg" | "ripgrep" | "read" | "read_file" | "readfile"
-    ) {
-        return None;
-    }
-    let command = input?.as_str()?;
-    command
-        .split_whitespace()
-        .find(|part| {
-            part.starts_with("./")
-                || part.starts_with("../")
-                || part.starts_with('/')
-                || part.contains('.')
+            Event::TextDelta(text)
         })
-        .map(|part| part.trim_matches('"').trim_matches('\'').to_owned())
+    }
+
+    fn status(&self) -> Option<Status> {
+        self.as_str().and_then(WireStatus::status).or_else(|| {
+            self.get("type")
+                .and_then(Value::as_str)
+                .and_then(WireStatus::status)
+        })
+    }
 }
 
-fn text_event(value: &Value, reasoning: bool) -> Option<Event> {
-    let text = value
-        .get("text")
-        .or_else(|| value.get("delta"))
-        .and_then(Value::as_str)?
-        .to_owned();
-    Some(if reasoning {
-        Event::ReasoningDelta(text)
-    } else {
-        Event::TextDelta(text)
-    })
+trait CommandName {
+    fn inferred_command_path(&self, input: Option<&Value>) -> Option<String>;
 }
 
-fn status_from_value(value: &Value) -> Option<Status> {
-    value.as_str().and_then(status_from_str).or_else(|| {
-        value
-            .get("type")
-            .and_then(Value::as_str)
-            .and_then(status_from_str)
-    })
+impl CommandName for str {
+    fn inferred_command_path(&self, input: Option<&Value>) -> Option<String> {
+        input.and_then(|input| input.inferred_command_path(self))
+    }
 }
 
-fn status_from_str(value: &str) -> Option<Status> {
-    Some(match value {
-        "working" | "running" | "in_progress" | "inProgress" => Status::Running,
-        "idle" | "completed" | "complete" => Status::Completed,
-        "cancelled" | "canceled" | "interrupted" => Status::Interrupted,
-        "failed" | "error" => Status::Failed,
-        "waitingForPermission" | "waiting_for_permission" | "permission" => {
-            Status::WaitingForPermission
+trait WireStatus {
+    fn status(&self) -> Option<Status>;
+    fn stop_reason_status(&self) -> Status;
+}
+
+impl WireStatus for str {
+    fn status(&self) -> Option<Status> {
+        Some(match self {
+            "working" | "running" | "in_progress" | "inProgress" => Status::Running,
+            "idle" | "completed" | "complete" => Status::Completed,
+            "cancelled" | "canceled" | "interrupted" => Status::Interrupted,
+            "failed" | "error" => Status::Failed,
+            "waitingForPermission" | "waiting_for_permission" | "permission" => {
+                Status::WaitingForPermission
+            }
+            _ => return None,
+        })
+    }
+
+    fn stop_reason_status(&self) -> Status {
+        match self {
+            "cancelled" | "canceled" | "interrupted" => Status::Interrupted,
+            "refusal" | "error" => Status::Failed,
+            _ => Status::Completed,
         }
-        _ => return None,
-    })
-}
-
-fn stop_reason_status(value: &str) -> Status {
-    match value {
-        "cancelled" | "canceled" | "interrupted" => Status::Interrupted,
-        "refusal" | "error" => Status::Failed,
-        _ => Status::Completed,
     }
 }
 
@@ -737,7 +730,7 @@ mod tests {
             }
         });
         assert_eq!(
-            parse_update(&message),
+            message.parse_update(),
             vec![Event::TextDelta("你好".to_owned())]
         );
 
@@ -745,7 +738,7 @@ mod tests {
             "method": "session/update",
             "params": { "update": { "sessionUpdate": "tool_call", "title": "shell" } }
         });
-        let events = parse_update(&message);
+        let events = message.parse_update();
         assert!(
             matches!(events[0], Event::ToolCall(ToolCall { ref name, status: ToolStatus::Requested, .. }) if name == "shell")
         );
@@ -764,7 +757,7 @@ mod tests {
                 "rawOutput": "contents"
             }}
         });
-        let events = parse_update(&message);
+        let events = message.parse_update();
         assert!(matches!(&events[0], Event::ToolCall(call)
             if call.id.as_deref() == Some("read-1")
                 && call.status == ToolStatus::Completed
@@ -779,8 +772,28 @@ mod tests {
 
     #[test]
     fn maps_stop_reasons() {
-        assert_eq!(stop_reason_status("end_turn"), Status::Completed);
-        assert_eq!(stop_reason_status("cancelled"), Status::Interrupted);
-        assert_eq!(stop_reason_status("error"), Status::Failed);
+        assert_eq!("end_turn".stop_reason_status(), Status::Completed);
+        assert_eq!("cancelled".stop_reason_status(), Status::Interrupted);
+        assert_eq!("error".stop_reason_status(), Status::Failed);
+    }
+
+    #[test]
+    fn hermes_uses_acp_command() {
+        assert_eq!(
+            HarnessKind::Hermes.acp_command().unwrap(),
+            ("hermes".to_owned(), vec!["acp".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_mode_is_rejected_before_connecting() {
+        let mut config = crate::protocol::SessionConfig::default_for(HarnessKind::Hermes);
+        config.conversation.mode = crate::protocol::ConversationSpec::Resume(
+            crate::protocol::ResumeTarget::ProviderSession { id: "s-1".to_owned() },
+        );
+        assert!(matches!(
+            AcpBackend::create_session_with_config(config, String::new(), None).await,
+            Err(Error::UnsupportedCapability(message)) if message.contains("ACP")
+        ));
     }
 }

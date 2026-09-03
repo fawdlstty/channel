@@ -1,9 +1,9 @@
 use crate::protocol::{
     AuthInfo, AuthState, BackendInfo, BackendKind, Capabilities, CapabilityReport, CapabilitySet,
-    Confidence, Error, Event, FileChange, FileRead, FileReadSource, Finish, HarnessRuntime,
-    HarnessType, ModelInfo, ObservationSource, PermissionInfo, Resumability, RuntimeInfo,
-    SessionConfig, SessionInfo, Shareability, Status, ToolCall, ToolStatus, TransportKind,
-    TurnInfo, VisibilityInfo, VisibilityState, WorkspaceInfo,
+    Confidence, ConversationSpec, Error, Event, FileChange, FileRead, FileReadSource, Finish,
+    HarnessKind, HarnessState, ModelInfo, ObservationSource, PermissionInfo, Resumability,
+    RuntimeInfo, SessionConfig, SessionInfo, Shareability, Status, ToolCall, ToolStatus,
+    TransportKind, TurnInfo, VisibilityInfo, VisibilityState, WorkspaceInfo,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -33,7 +33,7 @@ pub enum ActivityKind {
     ReadFile,
     WriteFile,
     RunCommand,
-    Agent,
+    Subagent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,155 +129,159 @@ pub struct Session {
     turns: Vec<TurnInfo>,
 }
 
-fn activity_kind(name: &str) -> ActivityKind {
-    let name = name.to_ascii_lowercase();
-    if name.contains("agent") {
-        ActivityKind::Agent
-    } else if name.contains("read") || name.contains("cat") || name.contains("list") {
-        ActivityKind::ReadFile
-    } else if name.contains("write") || name.contains("edit") || name.contains("patch") {
-        ActivityKind::WriteFile
-    } else if name.contains("command") || name.contains("shell") || name.contains("exec") {
-        ActivityKind::RunCommand
-    } else {
-        ActivityKind::Tool
+trait ActivityName {
+    fn activity_kind(&self) -> ActivityKind;
+    fn activity_display(&self, detail: Option<&str>) -> String;
+}
+
+impl ActivityName for str {
+    fn activity_kind(&self) -> ActivityKind {
+        let name = self.to_ascii_lowercase();
+        if name.contains("agent") {
+            ActivityKind::Subagent
+        } else if name.contains("read") || name.contains("cat") || name.contains("list") {
+            ActivityKind::ReadFile
+        } else if name.contains("write") || name.contains("edit") || name.contains("patch") {
+            ActivityKind::WriteFile
+        } else if name.contains("command") || name.contains("shell") || name.contains("exec") {
+            ActivityKind::RunCommand
+        } else {
+            ActivityKind::Tool
+        }
+    }
+
+    fn activity_display(&self, detail: Option<&str>) -> String {
+        detail
+            .filter(|detail| !detail.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.to_owned())
     }
 }
 
-fn activity_display(name: &str, detail: Option<&str>) -> String {
-    detail
-        .filter(|detail| !detail.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| name.to_owned())
-}
-
-fn activity_for_tool(call: &ToolCall) -> ActivityEvent {
-    ActivityEvent {
-        id: call
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("activity-{}", call.sequence)),
-        kind: activity_kind(&call.name),
-        status: call.status,
-        display: activity_display(&call.name, call.output.as_deref()),
+impl ToolCall {
+    fn activity_event(&self) -> ActivityEvent {
+        ActivityEvent {
+            id: self
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("activity-{}", self.sequence)),
+            kind: self.name.activity_kind(),
+            status: self.status,
+            display: self.name.activity_display(self.output.as_deref()),
+        }
     }
 }
 
-fn activity_for_file_read(file: &FileRead) -> ActivityEvent {
-    ActivityEvent {
-        id: file
-            .tool_id
-            .clone()
-            .unwrap_or_else(|| format!("activity-{}", file.sequence)),
-        kind: ActivityKind::ReadFile,
-        status: file.status,
-        display: format!("Read {}", file.path),
+impl FileRead {
+    fn activity_event(&self) -> ActivityEvent {
+        ActivityEvent {
+            id: self
+                .tool_id
+                .clone()
+                .unwrap_or_else(|| format!("activity-{}", self.sequence)),
+            kind: ActivityKind::ReadFile,
+            status: self.status,
+            display: format!("Read {}", self.path),
+        }
     }
 }
 
-fn activity_for_file_change(change: &FileChange) -> ActivityEvent {
-    ActivityEvent {
-        id: change
-            .tool_id
-            .clone()
-            .unwrap_or_else(|| format!("activity-{}", change.sequence)),
-        kind: ActivityKind::WriteFile,
-        status: change.status,
-        display: format!("Changed {}", change.path),
+impl FileChange {
+    fn activity_event(&self) -> ActivityEvent {
+        ActivityEvent {
+            id: self
+                .tool_id
+                .clone()
+                .unwrap_or_else(|| format!("activity-{}", self.sequence)),
+            kind: ActivityKind::WriteFile,
+            status: self.status,
+            display: format!("Changed {}", self.path),
+        }
     }
 }
 
-fn backend_kind(harness: &HarnessType, backend: &crate::protocol::BackendSpec) -> BackendKind {
-    match backend {
-        crate::protocol::BackendSpec::CodexAppServer { .. } => BackendKind::CodexAppServer,
-        crate::protocol::BackendSpec::Acp { .. } => BackendKind::Acp,
-        crate::protocol::BackendSpec::StructuredCli { .. } => BackendKind::StructuredCli,
-        crate::protocol::BackendSpec::PlainCli { .. } => BackendKind::PlainCli,
-        crate::protocol::BackendSpec::Custom { .. } => BackendKind::Custom,
-        crate::protocol::BackendSpec::Auto => match harness {
-            HarnessType::Codex => BackendKind::CodexAppServer,
-            HarnessType::OpenCode
-            | HarnessType::ZedAcp
-            | HarnessType::ZCode
-            | HarnessType::DeepSeek => BackendKind::Acp,
-            HarnessType::Custom { .. } => BackendKind::Custom,
-            _ => BackendKind::PlainCli,
-        },
+impl crate::protocol::BackendSpec {
+    fn backend_kind(&self, kind: &HarnessKind) -> BackendKind {
+        match self {
+            Self::CodexAppServer { .. } => BackendKind::CodexAppServer,
+            Self::Acp { .. } => BackendKind::Acp,
+            Self::StructuredCli { .. } => BackendKind::StructuredCli,
+            Self::PlainCli { .. } => BackendKind::PlainCli,
+            Self::Auto => match kind {
+                HarnessKind::Codex => BackendKind::CodexAppServer,
+                HarnessKind::OpenCode
+                | HarnessKind::ZedAcp
+                | HarnessKind::ZCode
+                | HarnessKind::DeepSeek
+                | HarnessKind::Hermes => BackendKind::Acp,
+                HarnessKind::ClaudeCode => BackendKind::StructuredCli,
+            },
+        }
+    }
+
+    fn command(&self, kind: &HarnessKind) -> Option<String> {
+        match self {
+            Self::CodexAppServer { command, .. }
+            | Self::Acp { command, .. }
+            | Self::StructuredCli { command, .. }
+            | Self::PlainCli { command, .. } => Some(command.clone()),
+            Self::Auto => match kind {
+                HarnessKind::Codex => Some("codex".to_owned()),
+                HarnessKind::OpenCode => Some("opencode".to_owned()),
+                HarnessKind::ZedAcp => Some("zed".to_owned()),
+                HarnessKind::ZCode => Some("zcode".to_owned()),
+                HarnessKind::DeepSeek => Some("deepseek".to_owned()),
+                HarnessKind::Hermes => Some("hermes".to_owned()),
+                HarnessKind::ClaudeCode => Some("claude".to_owned()),
+            },
+        }
+    }
+
+    fn args(&self, kind: &HarnessKind) -> Vec<String> {
+        match self {
+            Self::CodexAppServer { args, .. }
+            | Self::Acp { args, .. }
+            | Self::StructuredCli { args, .. }
+            | Self::PlainCli { args, .. } => args.clone(),
+            Self::Auto => match kind {
+                HarnessKind::Codex => vec!["app-server".to_owned(), "--stdio".to_owned()],
+                HarnessKind::OpenCode
+                | HarnessKind::ZedAcp
+                | HarnessKind::ZCode
+                | HarnessKind::DeepSeek
+                | HarnessKind::Hermes => vec!["acp".to_owned()],
+                _ => Vec::new(),
+            },
+        }
     }
 }
 
-fn observed_capabilities(capabilities: Capabilities, reasoning_summary: bool) -> CapabilitySet {
-    CapabilitySet {
-        streaming_events: capabilities.streaming_events,
-        structured_text: capabilities.streaming_events,
-        reasoning_summary,
-        tool_calls: capabilities.tool_calls,
-        tool_inputs: capabilities.tool_inputs,
-        tool_outputs: capabilities.tool_outputs,
-        file_reads: capabilities.file_reads,
-        ..CapabilitySet::default()
+impl Capabilities {
+    fn observed(&self, reasoning_summary: bool) -> CapabilitySet {
+        CapabilitySet {
+            streaming_events: self.streaming_events,
+            structured_text: self.streaming_events,
+            reasoning_summary,
+            tool_calls: self.tool_calls,
+            tool_inputs: self.tool_inputs,
+            tool_outputs: self.tool_outputs,
+            file_reads: self.file_reads,
+            ..CapabilitySet::default()
+        }
     }
-}
 
-fn unknown_capabilities(capabilities: Capabilities, reasoning_summary: bool) -> CapabilitySet {
-    let observed = observed_capabilities(capabilities, reasoning_summary);
-    CapabilitySet {
-        streaming_events: !observed.streaming_events,
-        structured_text: !observed.structured_text,
-        reasoning_summary: !observed.reasoning_summary,
-        tool_calls: !observed.tool_calls,
-        tool_inputs: !observed.tool_inputs,
-        tool_outputs: !observed.tool_outputs,
-        file_reads: !observed.file_reads,
-        ..CapabilitySet::all()
-    }
-}
-
-fn backend_command(
-    backend: &crate::protocol::BackendSpec,
-    harness: &HarnessType,
-) -> Option<String> {
-    match backend {
-        crate::protocol::BackendSpec::CodexAppServer { command, .. }
-        | crate::protocol::BackendSpec::Acp { command, .. }
-        | crate::protocol::BackendSpec::StructuredCli { command, .. }
-        | crate::protocol::BackendSpec::PlainCli { command, .. }
-        | crate::protocol::BackendSpec::Custom { command, .. } => Some(command.clone()),
-        crate::protocol::BackendSpec::Auto => match harness {
-            HarnessType::Codex => Some("codex".to_owned()),
-            HarnessType::OpenCode => Some("opencode".to_owned()),
-            HarnessType::ZedAcp => Some("zed".to_owned()),
-            HarnessType::ZCode => Some("zcode".to_owned()),
-            HarnessType::DeepSeek => Some("deepseek".to_owned()),
-            HarnessType::ClaudeCode => Some("claude".to_owned()),
-            HarnessType::Aider => Some("aider".to_owned()),
-            HarnessType::Goose => Some("goose".to_owned()),
-            HarnessType::Cline => Some("cline".to_owned()),
-            HarnessType::RooCode => Some("roo".to_owned()),
-            HarnessType::OpenHands => Some("openhands".to_owned()),
-            HarnessType::SweAgent => Some("sweagent".to_owned()),
-            HarnessType::GeminiCli => Some("gemini".to_owned()),
-            HarnessType::Continue => Some("cn".to_owned()),
-            HarnessType::Custom { command, .. } => Some(command.clone()),
-        },
-    }
-}
-
-fn backend_args(backend: &crate::protocol::BackendSpec, harness: &HarnessType) -> Vec<String> {
-    match backend {
-        crate::protocol::BackendSpec::CodexAppServer { args, .. }
-        | crate::protocol::BackendSpec::Acp { args, .. }
-        | crate::protocol::BackendSpec::StructuredCli { args, .. }
-        | crate::protocol::BackendSpec::PlainCli { args, .. }
-        | crate::protocol::BackendSpec::Custom { args, .. } => args.clone(),
-        crate::protocol::BackendSpec::Auto => match harness {
-            HarnessType::Codex => vec!["app-server".to_owned(), "--stdio".to_owned()],
-            HarnessType::OpenCode
-            | HarnessType::ZedAcp
-            | HarnessType::ZCode
-            | HarnessType::DeepSeek => vec!["acp".to_owned()],
-            _ => Vec::new(),
-        },
+    fn unknown(&self, reasoning_summary: bool) -> CapabilitySet {
+        let observed = self.observed(reasoning_summary);
+        CapabilitySet {
+            streaming_events: !observed.streaming_events,
+            structured_text: !observed.structured_text,
+            reasoning_summary: !observed.reasoning_summary,
+            tool_calls: !observed.tool_calls,
+            tool_inputs: !observed.tool_inputs,
+            tool_outputs: !observed.tool_outputs,
+            file_reads: !observed.file_reads,
+            ..CapabilitySet::all()
+        }
     }
 }
 
@@ -286,9 +290,21 @@ impl Session {
         config: SessionConfig,
         id: Option<String>,
         backend: Box<dyn Backend>,
-        initialized: Option<HarnessRuntime>,
+        initialized: Option<HarnessState>,
     ) -> Self {
-        let harness = config.harness.clone();
+        let kind = config.kind.clone();
+        let requested_visibility = config
+            .observability
+            .map(|visible| {
+                if visible {
+                    crate::protocol::VisibilityRequest::ProviderDefault
+                } else {
+                    crate::protocol::VisibilityRequest::Private
+                }
+            })
+            .unwrap_or(crate::protocol::VisibilityRequest::ProviderDefault);
+        let hidden_codex = requested_visibility == crate::protocol::VisibilityRequest::Private
+            && config.backend.backend_kind(&kind) == BackendKind::CodexAppServer;
         let session_id = format!(
             "session-{}",
             NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
@@ -304,10 +320,10 @@ impl Session {
         let now = SystemTime::now();
         let mut session_info = SessionInfo {
             session_id: session_id.clone(),
-            harness: harness.clone(),
+            kind: kind.clone(),
             backend: BackendInfo {
-                kind: backend_kind(&harness, &config.backend),
-                command: backend_command(&config.backend, &harness),
+                kind: config.backend.backend_kind(&kind),
+                command: config.backend.command(&kind),
                 transport: TransportKind::Stdio,
                 protocol: None,
                 version: None,
@@ -317,12 +333,12 @@ impl Session {
             created_at: now,
             updated_at: now,
             workspace: WorkspaceInfo {
-                requested_cwd: config.workspace.cwd.clone(),
-                effective_cwd: std::fs::metadata(&config.workspace.cwd)
+                requested_cwd: config.workspace_cwd().to_path_buf(),
+                effective_cwd: std::fs::metadata(config.workspace_cwd())
                     .ok()
                     .filter(|m| m.is_dir())
-                    .map(|_| config.workspace.cwd.clone()),
-                canonical_cwd: std::fs::canonicalize(&config.workspace.cwd).ok(),
+                    .map(|_| config.workspace_cwd().to_path_buf()),
+                canonical_cwd: std::fs::canonicalize(config.workspace_cwd()).ok(),
                 roots: config
                     .workspace
                     .roots
@@ -347,20 +363,32 @@ impl Session {
                 limitations: Vec::new(),
             },
             visibility: VisibilityInfo {
-                requested: config.observability.visibility.clone(),
+                requested: requested_visibility.clone(),
                 channel: VisibilityState::Yes,
-                provider: VisibilityState::Unknown,
-                native_ui: VisibilityState::Unknown,
+                provider: if hidden_codex {
+                    VisibilityState::No
+                } else {
+                    VisibilityState::Unknown
+                },
+                native_ui: if hidden_codex {
+                    VisibilityState::No
+                } else {
+                    VisibilityState::Unknown
+                },
                 resumability: Resumability::InMemoryOnly,
                 shareability: Shareability::No,
                 account: None,
                 external_ids: external_ids.clone(),
-                source: ObservationSource::channelDefault,
+                source: if requested_visibility == crate::protocol::VisibilityRequest::Private {
+                    ObservationSource::UserConfig
+                } else {
+                    ObservationSource::ChannelDefault
+                },
                 limitations: Vec::new(),
             },
             runtime: RuntimeInfo {
-                command: backend_command(&config.backend, &harness),
-                args: backend_args(&config.backend, &harness),
+                command: config.backend.command(&kind),
+                args: config.backend.args(&kind),
                 executable_path: config.runtime.process.executable.clone(),
                 ..RuntimeInfo::default()
             },
@@ -391,6 +419,15 @@ impl Session {
             session_info.runtime = initialized.runtime;
             session_info.capabilities = initialized.capabilities;
         }
+        session_info.visibility.resumability = if hidden_codex {
+            Resumability::InMemoryOnly
+        } else if matches!(config.conversation.mode, ConversationSpec::Resume(_)) {
+            Resumability::ProviderResume
+        } else if session_info.capabilities.effective.provider_resume {
+            Resumability::ProviderResume
+        } else {
+            Resumability::InMemoryOnly
+        };
         Self {
             id,
             status: Status::Idle,
@@ -536,7 +573,7 @@ impl Session {
                     .unwrap_or_else(|| format!("activity-{}", call.sequence)),
                 kind: ActivityKind::Tool,
                 status: call.status,
-                display: activity_display(call.name.as_str(), call.output.as_deref()),
+                display: call.name.activity_display(call.output.as_deref()),
             }
         }));
         items.extend(self.files_read.iter().map(|file| {
@@ -633,7 +670,7 @@ impl Session {
                 Ok(None) => {
                     return Err(Error::Backend(
                         "interrupt ended without completion".to_owned(),
-                    ))
+                    ));
                 }
                 Err(error) => return Err(error),
             }
@@ -668,13 +705,11 @@ impl Session {
                     .unwrap_or_else(|| format!("activity-{}", self.next_sequence)),
                 kind: ActivityKind::Tool,
                 status: ToolStatus::Requested,
-                display: activity_display(name, detail.as_deref()),
+                display: name.activity_display(detail.as_deref()),
             })),
-            Event::ToolCall(call) => Some(SessionEvent::Activity(activity_for_tool(call))),
-            Event::FileRead(file) => Some(SessionEvent::Activity(activity_for_file_read(file))),
-            Event::FileChange(change) => {
-                Some(SessionEvent::Activity(activity_for_file_change(change)))
-            }
+            Event::ToolCall(call) => Some(SessionEvent::Activity(call.activity_event())),
+            Event::FileRead(file) => Some(SessionEvent::Activity(file.activity_event())),
+            Event::FileChange(change) => Some(SessionEvent::Activity(change.activity_event())),
             Event::PermissionRequired { id, detail } => {
                 Some(SessionEvent::Permission(PermissionEvent {
                     id: id.clone(),
@@ -873,9 +908,9 @@ impl Session {
     fn touch_info(&mut self) {
         self.session_info.state = self.status;
         self.session_info.capabilities.observed =
-            observed_capabilities(self.capabilities, !self.reasoning.is_empty());
+            self.capabilities.observed(!self.reasoning.is_empty());
         self.session_info.capabilities.unknown =
-            unknown_capabilities(self.capabilities, !self.reasoning.is_empty());
+            self.capabilities.unknown(!self.reasoning.is_empty());
         self.session_info.visibility.external_ids = self.session_info.external_ids.clone();
         self.session_info.turns = self.turns.clone();
         self.session_info.updated_at = SystemTime::now();
@@ -928,7 +963,7 @@ mod tests {
 
     fn session(events: impl IntoIterator<Item = Event>) -> Session {
         Session::with_backend_config(
-            SessionConfig::default_for(HarnessType::Codex),
+            SessionConfig::default_for(HarnessKind::Codex),
             Some("test-session".to_owned()),
             Box::new(MockBackend::new(events)),
             None,
@@ -1031,5 +1066,32 @@ mod tests {
         session.send("请求", SendMode::Immediate).await.unwrap();
         assert!(matches!(session.wait_event().await, Err(Error::Backend(_))));
         assert_eq!(session.state(), Status::Failed);
+    }
+
+    #[tokio::test]
+    async fn resume_mode_reports_provider_resumability() {
+        let mut config = SessionConfig::default_for(HarnessKind::Codex);
+        config.conversation.mode = ConversationSpec::Resume(ResumeTarget::ProviderSession {
+            id: "th-1".to_owned(),
+        });
+        let mut session = Session::with_backend_config(
+            config,
+            Some("th-1".to_owned()),
+            Box::new(MockBackend::new(Vec::new())),
+            None,
+        );
+        assert_eq!(
+            session.info().visibility.resumability,
+            Resumability::ProviderResume
+        );
+    }
+
+    #[tokio::test]
+    async fn new_sessions_default_to_in_memory_resumability() {
+        let session = session([]);
+        assert_eq!(
+            session.info().visibility.resumability,
+            Resumability::InMemoryOnly
+        );
     }
 }
