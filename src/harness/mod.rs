@@ -119,11 +119,14 @@ impl Adapter {
 }
 
 impl BackendKind {
-    pub(crate) fn supported_capabilities(self) -> crate::protocol::CapabilitySet {
+    pub(crate) fn supported_capabilities(
+        self,
+        kind: &HarnessKind,
+    ) -> crate::protocol::CapabilitySet {
         match self {
             BackendKind::Acp => acp::AcpBackend::supported_capabilities(),
             BackendKind::CodexAppServer => codex::CodexBackend::supported_capabilities(),
-            BackendKind::StructuredCli => cli::CliBackend::structured_capabilities(),
+            BackendKind::StructuredCli => cli::CliBackend::structured_capabilities(kind),
             BackendKind::PlainCli => cli::CliBackend::plain_capabilities(),
         }
     }

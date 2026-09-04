@@ -11,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             channel::SessionEvent::Message(ev) => {
                 if is_reasoning != ev.reasoning {
                     if !is_newline && ev.reasoning {
-                        println!("");
+                        println!();
                     }
                     match ev.reasoning {
                         true => print!("<reasoning>"),
@@ -26,6 +26,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             channel::SessionEvent::Finished(_) => {}
         }
     }
-    println!("");
+    println!();
     Ok(())
 }

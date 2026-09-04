@@ -1,6 +1,6 @@
 # channel
 
-![version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffawdlstty%2Fchannel%2Fmain%2F/channel/Cargo.toml&query=package.version&label=version)
+![version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffawdlstty%2Fchannel/main/Cargo.toml&query=package.version&label=version)
 ![status](https://img.shields.io/github/actions/workflow/status/fawdlstty/channel/rust.yml)
 
 English | [简体中文](README.zh.md)

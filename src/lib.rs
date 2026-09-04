@@ -26,8 +26,8 @@ pub use protocol::{
 };
 pub use session::{
     ActivityCounts, ActivityEvent, ActivityId, ActivityKind, ActivityStatus, ActivitySummary,
-    ActivityView, InterruptAction, InterruptResult, MessageEvent, PermissionEvent, SendMode,
-    SendResult, Session, SessionEvent,
+    ActivityView, InterruptAction, InterruptResult, MessageEvent, PermissionEvent,
+    PermissionResponse, SendMode, SendResult, Session, SessionEvent,
 };
 
 /// An initialized harness handle. The resolved runtime remains private.

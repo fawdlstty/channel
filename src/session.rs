@@ -5,6 +5,7 @@ use crate::protocol::{
     RuntimeInfo, SessionConfig, SessionInfo, Shareability, Status, ToolCall, ToolStatus,
     TransportKind, TurnInfo, VisibilityInfo, VisibilityState, WorkspaceInfo,
 };
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +23,18 @@ pub(crate) trait Backend: Send {
     fn next_event<'a>(&'a mut self) -> BackendFuture<'a, Option<Event>>;
     fn interrupt<'a>(&'a mut self) -> BackendFuture<'a, ()>;
     fn close<'a>(&'a mut self) -> BackendFuture<'a, ()>;
+    fn respond_permission<'a>(
+        &'a mut self,
+        id: &'a str,
+        response: PermissionResponse,
+    ) -> BackendFuture<'a, ()> {
+        let _ = (id, response);
+        Box::pin(async {
+            Err(Error::UnsupportedCapability(
+                "this backend cannot respond to permission requests".to_owned(),
+            ))
+        })
+    }
 }
 
 pub type ActivityId = String;
@@ -59,6 +72,7 @@ pub struct ActivityCounts {
     pub completed: usize,
     pub failed: usize,
     pub cancelled: usize,
+    pub unknown: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -78,6 +92,14 @@ pub struct MessageEvent {
 pub struct PermissionEvent {
     pub id: String,
     pub detail: String,
+}
+
+/// A decision sent back to the backend after a
+/// [`SessionEvent::Permission`](SessionEvent::Permission) event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionResponse {
+    Approve,
+    Deny,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,6 +149,9 @@ pub struct Session {
     finish: Option<Finish>,
     session_info: SessionInfo,
     turns: Vec<TurnInfo>,
+    pending_permissions: HashSet<String>,
+    resources: crate::protocol::ResourcePolicy,
+    last_error: Option<String>,
 }
 
 trait ActivityName {
@@ -164,7 +189,8 @@ impl ToolCall {
             id: self
                 .id
                 .clone()
-                .unwrap_or_else(|| format!("activity-{}", self.sequence)),
+                .map(|id| format!("tool-{id}"))
+                .unwrap_or_else(|| format!("tool-activity-{}", self.sequence)),
             kind: self.name.activity_kind(),
             status: self.status,
             display: self.name.activity_display(self.output.as_deref()),
@@ -178,7 +204,8 @@ impl FileRead {
             id: self
                 .tool_id
                 .clone()
-                .unwrap_or_else(|| format!("activity-{}", self.sequence)),
+                .map(|id| format!("file-read-{id}"))
+                .unwrap_or_else(|| format!("file-read-activity-{}", self.sequence)),
             kind: ActivityKind::ReadFile,
             status: self.status,
             display: format!("Read {}", self.path),
@@ -192,7 +219,8 @@ impl FileChange {
             id: self
                 .tool_id
                 .clone()
-                .unwrap_or_else(|| format!("activity-{}", self.sequence)),
+                .map(|id| format!("file-change-{id}"))
+                .unwrap_or_else(|| format!("file-change-activity-{}", self.sequence)),
             kind: ActivityKind::WriteFile,
             status: self.status,
             display: format!("Changed {}", self.path),
@@ -443,6 +471,9 @@ impl Session {
             finish: None,
             session_info,
             turns: Vec::new(),
+            pending_permissions: HashSet::new(),
+            resources: config.runtime.resources,
+            last_error: None,
         }
     }
 
@@ -457,6 +488,13 @@ impl Session {
         if self.active_turn {
             return Err(Error::Busy);
         }
+        if let Some(max_turns) = self.resources.max_turns {
+            if self.turns.len() >= max_turns as usize {
+                return Err(Error::ProviderRejected(format!(
+                    "session reached the configured turn limit: {max_turns}"
+                )));
+            }
+        }
 
         let message = message.into();
         self.text.clear();
@@ -467,6 +505,7 @@ impl Session {
         self.capabilities = Capabilities::default();
         self.next_sequence = 0;
         self.finish = None;
+        self.pending_permissions.clear();
         self.active_turn = true;
         self.status = Status::Running;
         let turn_id = format!(
@@ -539,6 +578,49 @@ impl Session {
                 }
             };
 
+            if let Some(max_tool_calls) = self.resources.max_tool_calls {
+                let tool_calls = match &event {
+                    Event::Tool { .. } | Event::ToolCall(_) => 1,
+                    Event::FileRead(_) => 0,
+                    _ => 0,
+                };
+                if tool_calls > 0 && self.tool_calls.len() + tool_calls > max_tool_calls as usize {
+                    let message =
+                        format!("turn reached the configured tool call limit: {max_tool_calls}");
+                    self.fail(message.clone());
+                    return Err(Error::ProviderRejected(message));
+                }
+            }
+            if let Some(max_output_bytes) = self.resources.max_output_bytes {
+                let incoming_bytes = match &event {
+                    Event::TextDelta(delta) => delta.len(),
+                    Event::ReasoningDelta(delta) => delta.len(),
+                    Event::ToolCall(call) => call.output.as_ref().map(String::len).unwrap_or(0),
+                    _ => 0,
+                };
+                if self.turn_output_bytes() + incoming_bytes > max_output_bytes as usize {
+                    let message = format!(
+                        "turn reached the configured output limit: {max_output_bytes} bytes"
+                    );
+                    self.fail(message.clone());
+                    return Err(Error::ProviderRejected(message));
+                }
+            }
+            if let Some(max_event_bytes) = self.resources.max_event_bytes {
+                if let Event::Raw(raw) = &event {
+                    if serde_json::to_vec(raw)
+                        .map(|bytes| bytes.len())
+                        .unwrap_or(0)
+                        > max_event_bytes as usize
+                    {
+                        let message = format!(
+                            "event exceeded the configured size limit: {max_event_bytes} bytes"
+                        );
+                        self.fail(message.clone());
+                        return Err(Error::ProviderRejected(message));
+                    }
+                }
+            }
             self.apply(&event);
             if self.id.is_none() {
                 self.id = self.backend.id();
@@ -547,6 +629,13 @@ impl Session {
                 }
             }
             self.touch_info();
+
+            if self.status == Status::Closed {
+                self.backend.close().await?;
+                return self.session_event(&event).map(Some).ok_or_else(|| {
+                    Error::Backend("backend closed without a final status".to_owned())
+                });
+            }
 
             if let Event::Error(message) = &event {
                 return Err(Error::Backend(message.clone()));
@@ -570,7 +659,8 @@ impl Session {
                 id: call
                     .id
                     .clone()
-                    .unwrap_or_else(|| format!("activity-{}", call.sequence)),
+                    .map(|id| format!("tool-{id}"))
+                    .unwrap_or_else(|| format!("tool-activity-{}", call.sequence)),
                 kind: ActivityKind::Tool,
                 status: call.status,
                 display: call.name.activity_display(call.output.as_deref()),
@@ -581,7 +671,8 @@ impl Session {
                 id: file
                     .tool_id
                     .clone()
-                    .unwrap_or_else(|| format!("activity-{}", file.sequence)),
+                    .map(|id| format!("file-read-{id}"))
+                    .unwrap_or_else(|| format!("file-read-activity-{}", file.sequence)),
                 kind: ActivityKind::ReadFile,
                 status: file.status,
                 display: format!("Read {}", file.path),
@@ -592,7 +683,8 @@ impl Session {
                 id: change
                     .tool_id
                     .clone()
-                    .unwrap_or_else(|| format!("activity-{}", change.sequence)),
+                    .map(|id| format!("file-change-{id}"))
+                    .unwrap_or_else(|| format!("file-change-activity-{}", change.sequence)),
                 kind: ActivityKind::WriteFile,
                 status: change.status,
                 display: format!("Changed {}", change.path),
@@ -610,7 +702,7 @@ impl Session {
                 ToolStatus::Completed => counts.completed += 1,
                 ToolStatus::Failed => counts.failed += 1,
                 ToolStatus::Cancelled => counts.cancelled += 1,
-                ToolStatus::Unknown => {}
+                ToolStatus::Unknown => counts.unknown += 1,
             }
         }
         let display = items
@@ -627,6 +719,34 @@ impl Session {
 
     pub fn result(&self) -> Option<&Finish> {
         self.finish.as_ref()
+    }
+
+    /// Answers a pending permission request emitted as
+    /// [`SessionEvent::Permission`](SessionEvent::Permission). Backends that
+    /// cannot receive responses fail with
+    /// [`Error::UnsupportedCapability`](crate::protocol::Error::UnsupportedCapability).
+    pub async fn respond_permission(
+        &mut self,
+        id: impl AsRef<str>,
+        response: PermissionResponse,
+    ) -> Result<(), Error> {
+        if self.status == Status::Closed {
+            return Err(Error::Closed);
+        }
+        let id = id.as_ref();
+        if !self.active_turn {
+            return Err(Error::NoActiveTurn);
+        }
+        if !matches!(self.status, Status::WaitingForPermission | Status::Running) {
+            return Err(Error::NoActiveTurn);
+        }
+        self.backend.respond_permission(id, response).await?;
+        self.pending_permissions.remove(id);
+        if self.status == Status::WaitingForPermission {
+            self.status = Status::Running;
+            self.touch_info();
+        }
+        Ok(())
     }
 
     pub fn info(&self) -> &SessionInfo {
@@ -763,7 +883,10 @@ impl Session {
             Event::FileChange(change) => {
                 self.merge_file_change(change.clone());
             }
-            Event::PermissionRequired { .. } => self.status = Status::WaitingForPermission,
+            Event::PermissionRequired { id, .. } => {
+                self.pending_permissions.insert(id.clone());
+                self.status = Status::WaitingForPermission;
+            }
             Event::Status(status) => self.set_status(*status),
             Event::Finished(finish) => {
                 let finish = if finish.text.is_empty() {
@@ -804,6 +927,26 @@ impl Session {
                 self.sync_current_turn();
                 return;
             }
+            if !incoming.name.is_empty() {
+                if let Some(existing) = self
+                    .tool_calls
+                    .iter_mut()
+                    .find(|call| call.id.is_none() && call.name == incoming.name)
+                {
+                    existing.status = incoming.status;
+                    if incoming.input.is_some() {
+                        existing.input = incoming.input;
+                    }
+                    if incoming.output.is_some() {
+                        existing.output = incoming.output;
+                    }
+                    if incoming.error.is_some() {
+                        existing.error = incoming.error;
+                    }
+                    self.sync_current_turn();
+                    return;
+                }
+            }
         }
         incoming.sequence = self.next_sequence;
         self.next_sequence += 1;
@@ -842,6 +985,34 @@ impl Session {
                 return;
             }
         }
+        if !incoming.path.is_empty() {
+            if let Some(existing) = self
+                .files_read
+                .iter_mut()
+                .find(|file| file.tool_id.is_none() && file.path == incoming.path)
+            {
+                if incoming.status != ToolStatus::Unknown {
+                    existing.status = incoming.status;
+                }
+                if incoming.line_start.is_some() {
+                    existing.line_start = incoming.line_start;
+                }
+                if incoming.line_end.is_some() {
+                    existing.line_end = incoming.line_end;
+                }
+                if incoming.summary.is_some() {
+                    existing.summary = incoming.summary;
+                }
+                if incoming.source != FileReadSource::Unknown {
+                    existing.source = incoming.source;
+                }
+                if incoming.confidence != Confidence::Unknown {
+                    existing.confidence = incoming.confidence;
+                }
+                self.sync_current_turn();
+                return;
+            }
+        }
         incoming.sequence = self.next_sequence;
         self.next_sequence += 1;
         self.files_read.push(incoming);
@@ -853,6 +1024,28 @@ impl Session {
             if let Some(existing) = self.files_changed.iter_mut().find(|change| {
                 change.tool_id.as_deref() == Some(tool_id) && change.path == incoming.path
             }) {
+                if incoming.status != ToolStatus::Unknown {
+                    existing.status = incoming.status;
+                }
+                if incoming.diff_summary.is_some() {
+                    existing.diff_summary = incoming.diff_summary;
+                }
+                if incoming.source != ObservationSource::Unknown {
+                    existing.source = incoming.source;
+                }
+                if incoming.confidence != Confidence::Unknown {
+                    existing.confidence = incoming.confidence;
+                }
+                self.sync_current_turn();
+                return;
+            }
+        }
+        if !incoming.path.is_empty() {
+            if let Some(existing) = self
+                .files_changed
+                .iter_mut()
+                .find(|change| change.tool_id.is_none() && change.path == incoming.path)
+            {
                 if incoming.status != ToolStatus::Unknown {
                     existing.status = incoming.status;
                 }
@@ -917,8 +1110,41 @@ impl Session {
         self.sync_current_turn();
     }
 
-    fn fail(&mut self, _message: String) {
+    fn fail(&mut self, message: String) {
+        self.last_error = Some(message.clone());
         self.finish_turn(Finish::new(Status::Failed, self.text.clone()));
+        let termination = crate::protocol::TerminationInfo {
+            reason: crate::protocol::TerminationReason::ProviderError,
+            provider_reason: Some(message.clone()),
+            error: Some(crate::protocol::StructuredError {
+                kind: "backend_error".to_owned(),
+                message,
+                retryable: false,
+                provider_code: None,
+            }),
+            source: ObservationSource::ProviderProtocol,
+        };
+        if let Some(turn) = self.turns.last_mut() {
+            turn.termination = Some(termination);
+        }
+        self.touch_info();
+    }
+
+    fn turn_output_bytes(&self) -> usize {
+        self.text.len()
+            + self.reasoning.len()
+            + self
+                .tool_calls
+                .iter()
+                .filter_map(|call| call.output.as_ref())
+                .map(String::len)
+                .sum::<usize>()
+            + self
+                .files_read
+                .iter()
+                .filter_map(|file| file.summary.as_ref())
+                .map(String::len)
+                .sum::<usize>()
     }
 }
 
@@ -1071,9 +1297,10 @@ mod tests {
     #[tokio::test]
     async fn resume_mode_reports_provider_resumability() {
         let mut config = SessionConfig::default_for(HarnessKind::Codex);
-        config.conversation.mode = ConversationSpec::Resume(crate::protocol::ResumeTarget::ProviderSession {
-            id: "th-1".to_owned(),
-        });
+        config.conversation.mode =
+            ConversationSpec::Resume(crate::protocol::ResumeTarget::ProviderSession {
+                id: "th-1".to_owned(),
+            });
         let session = Session::with_backend_config(
             config,
             Some("th-1".to_owned()),
@@ -1092,6 +1319,71 @@ mod tests {
         assert_eq!(
             session.info().visibility.resumability,
             Resumability::InMemoryOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_events_can_be_answered_and_tracked() {
+        static ANSWERS: std::sync::Mutex<Vec<(String, PermissionResponse)>> =
+            std::sync::Mutex::new(Vec::new());
+        struct PermissionBackend;
+        impl Backend for PermissionBackend {
+            fn send<'a>(&'a mut self, _message: String) -> BackendFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn next_event<'a>(&'a mut self) -> BackendFuture<'a, Option<Event>> {
+                Box::pin(async {
+                    Ok(Some(Event::PermissionRequired {
+                        id: "perm-1".to_owned(),
+                        detail: "run rm -rf".to_owned(),
+                    }))
+                })
+            }
+            fn interrupt<'a>(&'a mut self) -> BackendFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn close<'a>(&'a mut self) -> BackendFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn respond_permission<'a>(
+                &'a mut self,
+                id: &'a str,
+                response: PermissionResponse,
+            ) -> BackendFuture<'a, ()> {
+                Box::pin(async move {
+                    ANSWERS.lock().unwrap().push((id.to_owned(), response));
+                    Ok(())
+                })
+            }
+        }
+
+        let mut session = Session::with_backend_config(
+            SessionConfig::default_for(HarnessKind::Codex),
+            Some("test-session".to_owned()),
+            Box::new(PermissionBackend),
+            None,
+        );
+        session.send("请求", SendMode::Immediate).await.unwrap();
+        assert!(matches!(
+            session.wait_event().await.unwrap(),
+            Some(SessionEvent::Permission(PermissionEvent { id, detail }))
+                if id == "perm-1" && detail == "run rm -rf"
+        ));
+        assert_eq!(session.state(), Status::WaitingForPermission);
+        session
+            .respond_permission("perm-1", PermissionResponse::Approve)
+            .await
+            .unwrap();
+        assert!(session
+            .respond_permission("missing", PermissionResponse::Deny)
+            .await
+            .is_ok());
+        assert_eq!(
+            *ANSWERS.lock().unwrap(),
+            vec![
+                ("perm-1".to_owned(), PermissionResponse::Approve),
+                ("missing".to_owned(), PermissionResponse::Deny),
+            ]
         );
     }
 }

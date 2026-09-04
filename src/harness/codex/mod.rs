@@ -3,11 +3,11 @@ use crate::protocol::{
     Confidence, Error, Event, FileRead, FileReadSource, Finish, Status, ToolCall, ToolStatus,
 };
 use crate::runtime::HarnessDiscovery;
-use crate::session::{Backend, BackendFuture, SendMode};
+use crate::session::{Backend, BackendFuture, PermissionResponse, SendMode};
 use crate::utils::websocket::LocalWebSocket;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
@@ -18,7 +18,7 @@ const COMMAND: &str = "codex";
 const ARGS: &[&str] = &["app-server", "--stdio"];
 
 enum CodexTransport {
-    Process(JsonlProcess),
+    Process(Box<JsonlProcess>),
     WebSocket(Box<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>),
 }
 
@@ -66,9 +66,9 @@ impl CodexTransport {
         }
     }
 
-    async fn close(&mut self) -> Result<(), Error> {
+    async fn close(&mut self, grace: Duration) -> Result<(), Error> {
         match self {
-            Self::Process(process) => process.close().await,
+            Self::Process(process) => process.close(grace).await,
             Self::WebSocket(stream) => {
                 let _ = stream.send(Message::Close(None)).await;
                 stream.flush().await.map_err(|error| {
@@ -98,7 +98,10 @@ pub(crate) struct CodexBackend {
     model: crate::protocol::ModelOptions,
     next_request_id: u64,
     queued: VecDeque<Event>,
+    pending_permissions: HashMap<String, Value>,
+    pending_responses: HashMap<u64, String>,
     text: String,
+    kill_grace_period: Duration,
     #[allow(dead_code)]
     resources: Option<crate::switch::PreparedResources>,
 }
@@ -141,7 +144,7 @@ impl CodexBackend {
                 CodexTransport::connect_websocket(&endpoint).await?,
             ))
         } else {
-            CodexTransport::Process(
+            CodexTransport::Process(Box::new(
                 JsonlProcess::spawn_with_cwd_and_env(
                     &command,
                     &arg_refs,
@@ -152,7 +155,7 @@ impl CodexBackend {
                         .unwrap_or(&[]),
                 )
                 .await?,
-            )
+            ))
         };
         let mut backend = Self {
             transport,
@@ -161,11 +164,33 @@ impl CodexBackend {
             model: config.model.clone(),
             next_request_id: 1,
             queued: VecDeque::new(),
+            pending_permissions: HashMap::new(),
+            pending_responses: HashMap::new(),
             text: String::new(),
+            kill_grace_period: config.runtime.process.kill_grace_period,
             resources,
         };
 
-        backend
+        if let Some(model) = config.model.requested.as_deref() {
+            if config.model.available_models.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "Codex model availability is unknown; initialize the harness before selecting a model"
+                        .to_owned(),
+                ));
+            }
+            if !config
+                .model
+                .available_models
+                .iter()
+                .any(|available| available == model)
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "Codex model is unavailable: {model}"
+                )));
+            }
+        }
+
+        let initialize_result = backend
             .request(
                 "initialize",
                 json!({
@@ -178,18 +203,25 @@ impl CodexBackend {
                 }),
             )
             .await?;
+        if initialize_result.get("protocolVersion").is_none()
+            && initialize_result.get("protocol_version").is_none()
+            && initialize_result.get("serverInfo").is_none()
+            && initialize_result.get("server_info").is_none()
+            && initialize_result.get("userAgent").is_none()
+            && initialize_result.get("user_agent").is_none()
+        {
+            return Err(Error::ProtocolError(
+                "Codex initialize response contains no protocol or server information".to_owned(),
+            ));
+        }
         backend
             .notify("initialized", Value::Object(Default::default()))
             .await?;
 
         let resume_id = config.conversation_thread_id()?;
-        let (method, params, fallback_id) = match resume_id {
-            Some(id) => (
-                "thread/resume",
-                config.thread_resume_params(id),
-                Some(id.to_owned()),
-            ),
-            None => ("thread/start", config.thread_start_params(), None),
+        let (method, params) = match resume_id {
+            Some(id) => ("thread/resume", config.thread_resume_params(id)),
+            None => ("thread/start", config.thread_start_params()),
         };
         let result = backend.request(method, params).await?;
         backend.thread_id = result
@@ -197,10 +229,8 @@ impl CodexBackend {
             .and_then(|thread| thread.get("id"))
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .or(fallback_id)
             .ok_or_else(|| Error::Backend(format!("{method} returned no thread id")))?
             .to_owned();
-        backend.queued.clear();
         Ok(backend)
     }
 
@@ -213,6 +243,7 @@ impl CodexBackend {
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, Error> {
         let id = self.next_request_id;
         self.next_request_id += 1;
+        self.pending_responses.insert(id, method.to_owned());
         self.transport
             .write(&json!({ "id": id, "method": method, "params": params }))
             .await?;
@@ -232,6 +263,7 @@ impl CodexBackend {
             }
 
             if message.get("id") == Some(&json!(id)) {
+                self.pending_responses.remove(&id);
                 if let Some(error) = message.get("error") {
                     return Err(Error::Backend(format!(
                         "Codex RPC {method} failed: {error}"
@@ -239,6 +271,9 @@ impl CodexBackend {
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
+            return Err(Error::ProtocolError(format!(
+                "Codex returned an unexpected response while waiting for {method}: {message}"
+            )));
         }
     }
 
@@ -251,25 +286,45 @@ impl CodexBackend {
             .get("params")
             .map(Value::to_string)
             .unwrap_or_else(|| "Codex requested permission".to_owned());
-        let is_permission = method.is_permission_request();
-        if is_permission {
+        if method.is_permission_request() {
             self.queued.push_back(Event::PermissionRequired {
                 id: id.to_string(),
                 detail,
             });
-        } else {
-            self.queued.push_back(Event::Raw(message.clone()));
+            self.pending_permissions.insert(id.to_string(), id);
+            return Ok(());
         }
-
-        let response = if method.contains("requestApproval") || method.contains("approval") {
-            json!({ "id": id, "result": { "decision": "decline" } })
-        } else {
-            json!({
-                "id": id,
-                "error": { "code": -32601, "message": "request is not supported by channel" }
-            })
-        };
+        self.queued.push_back(Event::Raw(message.clone()));
+        let response = json!({
+            "id": id,
+            "error": { "code": -32601, "message": "request is not supported by channel" }
+        });
         self.transport.write(&response).await
+    }
+
+    async fn respond(&mut self, id: &str, response: PermissionResponse) -> Result<(), Error> {
+        let id = self
+            .pending_permissions
+            .remove(id)
+            .ok_or_else(|| Error::Backend(format!("unknown permission request id: {id}")))?;
+        let decision = match response {
+            PermissionResponse::Approve => "approve",
+            PermissionResponse::Deny => "decline",
+        };
+        self.transport
+            .write(&json!({ "id": id, "result": { "decision": decision } }))
+            .await
+    }
+
+    async fn deny_pending_permissions(&mut self) {
+        let ids: Vec<Value> = self.pending_permissions.values().cloned().collect();
+        self.pending_permissions.clear();
+        for id in ids {
+            let _ = self
+                .transport
+                .write(&json!({ "id": id, "result": { "decision": "decline" } }))
+                .await;
+        }
     }
 
     fn queue_notification(&mut self, message: &Value) {
@@ -369,20 +424,17 @@ impl crate::protocol::SessionConfig {
     fn conversation_thread_id(&self) -> Result<Option<&str>, Error> {
         match &self.conversation.mode {
             crate::protocol::ConversationSpec::New => Ok(None),
-            crate::protocol::ConversationSpec::Resume(target) => target
-                .provider_id()
-                .map(Some)
-                .ok_or_else(|| {
+            crate::protocol::ConversationSpec::Resume(target) => {
+                target.provider_id().map(Some).ok_or_else(|| {
                     Error::UnsupportedCapability(
                         "native UI handles cannot be resumed by the Codex backend".to_owned(),
                     )
-                }),
-            crate::protocol::ConversationSpec::Fork(_) | crate::protocol::ConversationSpec::Attach(_) => {
-                Err(Error::UnsupportedCapability(
-                    "conversation fork and attach are not supported by the Codex backend"
-                        .to_owned(),
-                ))
+                })
             }
+            crate::protocol::ConversationSpec::Fork(_)
+            | crate::protocol::ConversationSpec::Attach(_) => Err(Error::UnsupportedCapability(
+                "conversation fork and attach are not supported by the Codex backend".to_owned(),
+            )),
         }
     }
 }
@@ -412,7 +464,18 @@ impl Backend for CodexBackend {
     }
 
     fn close<'a>(&'a mut self) -> BackendFuture<'a, ()> {
-        Box::pin(async move { self.transport.close().await })
+        Box::pin(async move {
+            self.deny_pending_permissions().await;
+            self.transport.close(self.kill_grace_period).await
+        })
+    }
+
+    fn respond_permission<'a>(
+        &'a mut self,
+        id: &'a str,
+        response: PermissionResponse,
+    ) -> BackendFuture<'a, ()> {
+        Box::pin(async move { self.respond(id, response).await })
     }
 }
 
@@ -577,7 +640,7 @@ impl CodexTransport {
             .await?;
         let result = stream.read_response(2, "model/list").await?;
         let models = result.model_ids();
-        stream.close().await?;
+        stream.close(Duration::from_secs(1)).await?;
         Ok(models)
     }
 
@@ -592,9 +655,9 @@ impl CodexTransport {
                 Self::connect_websocket(endpoint).await?,
             )));
         }
-        Ok(Self::Process(
+        Ok(Self::Process(Box::new(
             JsonlProcess::spawn_with_cwd(command, args, cwd).await?,
-        ))
+        )))
     }
 
     async fn connect_websocket(
@@ -1056,7 +1119,9 @@ mod tests {
         assert_eq!(config.conversation_thread_id().unwrap(), None);
 
         config.conversation.mode = crate::protocol::ConversationSpec::Resume(
-            crate::protocol::ResumeTarget::ProviderThread { id: "th-1".to_owned() },
+            crate::protocol::ResumeTarget::ProviderThread {
+                id: "th-1".to_owned(),
+            },
         );
         assert_eq!(config.conversation_thread_id().unwrap(), Some("th-1"));
         assert_eq!(
@@ -1065,7 +1130,9 @@ mod tests {
         );
 
         config.conversation.mode = crate::protocol::ConversationSpec::Resume(
-            crate::protocol::ResumeTarget::NativeUiHandle { id: "ui-1".to_owned() },
+            crate::protocol::ResumeTarget::NativeUiHandle {
+                id: "ui-1".to_owned(),
+            },
         );
         assert!(matches!(
             config.conversation_thread_id(),
@@ -1073,7 +1140,9 @@ mod tests {
         ));
 
         config.conversation.mode = crate::protocol::ConversationSpec::Fork(
-            crate::protocol::ResumeTarget::ProviderSession { id: "s-1".to_owned() },
+            crate::protocol::ResumeTarget::ProviderSession {
+                id: "s-1".to_owned(),
+            },
         );
         assert!(matches!(
             config.conversation_thread_id(),

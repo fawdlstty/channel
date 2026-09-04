@@ -29,6 +29,27 @@ fn shell_executable() -> &'static str {
     "/bin/sh"
 }
 
+/// Builds a shell script that prints each JSON line on either PowerShell or sh.
+fn emit_script(lines: &[&str]) -> String {
+    let quoted: Vec<String> = lines.iter().map(|line| format!("'{line}'")).collect();
+    #[cfg(windows)]
+    {
+        quoted
+            .iter()
+            .map(|line| format!("Write-Output {line}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+    #[cfg(not(windows))]
+    {
+        quoted
+            .iter()
+            .map(|line| format!("echo {line}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
 async fn wait_finished(session: &mut channel::Session) -> channel::Finish {
     loop {
         match session.wait_event().await.unwrap() {
@@ -42,7 +63,7 @@ async fn wait_finished(session: &mut channel::Session) -> channel::Finish {
 #[tokio::test(flavor = "current_thread")]
 async fn simple_create_and_wait_send_work() {
     let mut session = channel::Session::create(
-        script_config(r#"Write-Output '{"type":"result","result":"ok"}'"#),
+        script_config(&emit_script(&[r#"{"type":"result","result":"ok"}"#])),
         "hello",
     )
     .await
@@ -57,9 +78,11 @@ async fn simple_create_and_wait_send_work() {
 #[tokio::test(flavor = "current_thread")]
 async fn plain_cli_events_are_normalized_and_aggregated() {
     let mut session = channel::Session::create(
-        script_config(
-            r#"Write-Output '{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"src/lib.rs"}}'; Write-Output '{"type":"tool_result","tool_use_id":"read-1","name":"Read","output":"ok"}'; Write-Output '{"type":"result","result":"done"}'"#,
-        ),
+        script_config(&emit_script(&[
+            r#"{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"src/lib.rs"}}"#,
+            r#"{"type":"tool_result","tool_use_id":"read-1","name":"Read","output":"ok"}"#,
+            r#"{"type":"result","result":"done"}"#,
+        ])),
         "hello",
     )
     .await
@@ -82,7 +105,9 @@ async fn plain_cli_events_are_normalized_and_aggregated() {
 #[tokio::test(flavor = "current_thread")]
 async fn advanced_config_and_runtime_initialization_work() {
     let cwd = std::env::current_dir().unwrap();
-    let mut config = script_config(r#"Write-Output '{"type":"result","result":"configured"}'"#);
+    let mut config = script_config(&emit_script(&[
+        r#"{"type":"result","result":"configured"}"#,
+    ]));
     config.set_workspace(Some(cwd.clone()));
     config.set_model(Some("test-model".to_owned()));
     config.set_reasoning_effort(Some(channel::ReasoningEffort::High));
@@ -164,14 +189,14 @@ fn session_config_accessors_support_optional_values() {
 #[tokio::test(flavor = "current_thread")]
 async fn initialized_runtime_applies_cwd_and_executable() {
     let cwd = std::env::current_dir().unwrap();
-    let mut config = script_config(r#"Write-Output '{"type":"result","result":"runtime"}'"#);
+    let mut config = script_config(&emit_script(&[r#"{"type":"result","result":"runtime"}"#]));
     config.set_workspace(Some(cwd.clone()));
     let executable = std::path::PathBuf::from(shell_executable());
     config.runtime.process.executable = Some(executable.clone());
     let harness = channel::Harness::initialize_with(config.clone())
         .await
         .unwrap();
-    assert_eq!(harness.capabilities().effective.provider_resume, false);
+    assert!(!harness.capabilities().effective.provider_resume);
     assert!(harness.available_models().is_empty());
 
     let mut session = channel::Session::create(config, "hello").await.unwrap();
@@ -189,7 +214,7 @@ async fn resume_requires_an_effective_provider_capability() {
     let harness = channel::Harness::initialize_with(script_config("exit 0"))
         .await
         .unwrap();
-    assert_eq!(harness.capabilities().effective.provider_resume, false);
+    assert!(!harness.capabilities().effective.provider_resume);
 
     assert!(matches!(
         harness
@@ -220,13 +245,12 @@ async fn resume_target_reaches_cli_session_arguments() {
         ],
     );
     config.backend = channel::BackendSpec::PlainCli { command, args };
-    config.conversation.mode = channel::ConversationSpec::Resume(
-        channel::ResumeTarget::ProviderSession { id: "42".to_owned() },
-    );
+    config.conversation.mode =
+        channel::ConversationSpec::Resume(channel::ResumeTarget::ProviderSession {
+            id: "42".to_owned(),
+        });
 
-    let mut session = channel::Session::create(config, "continue")
-        .await
-        .unwrap();
+    let mut session = channel::Session::create(config, "continue").await.unwrap();
     assert_eq!(
         session.info().visibility.resumability,
         channel::Resumability::ProviderResume

@@ -23,16 +23,11 @@ pub enum SwitchProvider {
 }
 
 /// A requested provider endpoint. `Auto` deliberately does not imply a port.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum EndpointRequest {
+    #[default]
     Auto,
     Explicit(String),
-}
-
-impl Default for EndpointRequest {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl From<String> for EndpointRequest {
@@ -105,7 +100,7 @@ impl Default for SecurityOptions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModelOptions {
     pub requested: Option<String>,
     pub available_models: Vec<String>,
@@ -137,32 +132,10 @@ impl ReasoningEffort {
         }
     }
 }
-impl Default for ModelOptions {
-    fn default() -> Self {
-        Self {
-            requested: None,
-            available_models: Vec::new(),
-            provider: None,
-            reasoning_effort: None,
-            temperature: None,
-            max_output_tokens: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeOptions {
     pub process: RuntimeSpec,
     pub resources: ResourcePolicy,
-}
-
-impl Default for RuntimeOptions {
-    fn default() -> Self {
-        Self {
-            process: RuntimeSpec::default(),
-            resources: ResourcePolicy::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,15 +217,28 @@ impl SessionConfig {
     pub(crate) fn is_full_access(&self) -> bool {
         self.security.approval == ApprovalPolicy::AutoApprove
             && self.security.permissions.filesystem.mode == FilesystemAccess::FullHost
+            && self.security.network == NetworkPolicy::Unrestricted
+            && self.security.permissions.process.execute == TriState::Yes
+            && self.security.permissions.secrets.access == SecretAccess::Allow
     }
 
     pub fn set_full_access(&mut self, full_access: bool) {
         if full_access {
             self.security.approval = ApprovalPolicy::AutoApprove;
             self.security.permissions.filesystem.mode = FilesystemAccess::FullHost;
+            self.security.network = NetworkPolicy::Unrestricted;
+            self.security.permissions.process.execute = TriState::Yes;
+            self.security.permissions.process.terminate = TriState::Yes;
+            self.security.permissions.process.control = TriState::Yes;
+            self.security.permissions.secrets.access = SecretAccess::Allow;
         } else {
             self.security.approval = ApprovalPolicy::ProviderDefault;
             self.security.permissions.filesystem.mode = FilesystemAccess::WorkspaceReadWrite;
+            self.security.network = NetworkPolicy::ProviderDefault;
+            self.security.permissions.process.execute = TriState::Unknown;
+            self.security.permissions.process.terminate = TriState::Unknown;
+            self.security.permissions.process.control = TriState::Unknown;
+            self.security.permissions.secrets.access = SecretAccess::ProviderDefault;
         }
     }
 
@@ -567,19 +553,26 @@ pub enum ApprovalPolicy {
     Unsupported,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum BackendSpec {
+    #[default]
     Auto,
-    CodexAppServer { command: String, args: Vec<String> },
-    Acp { command: String, args: Vec<String> },
-    StructuredCli { command: String, args: Vec<String> },
-    PlainCli { command: String, args: Vec<String> },
-}
-
-impl Default for BackendSpec {
-    fn default() -> Self {
-        Self::Auto
-    }
+    CodexAppServer {
+        command: String,
+        args: Vec<String>,
+    },
+    Acp {
+        command: String,
+        args: Vec<String>,
+    },
+    StructuredCli {
+        command: String,
+        args: Vec<String>,
+    },
+    PlainCli {
+        command: String,
+        args: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -695,8 +688,10 @@ pub struct ModelInfo {
     pub source: ObservationSource,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum VisibilityRequest {
+    #[default]
+    ProviderDefault,
     Private,
     ChannelOnly,
     ProviderSession {
@@ -710,13 +705,6 @@ pub enum VisibilityRequest {
     Shared {
         audience: ShareAudience,
     },
-    ProviderDefault,
-}
-
-impl Default for VisibilityRequest {
-    fn default() -> Self {
-        Self::ProviderDefault
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -777,18 +765,13 @@ pub struct ExternalSessionIds {
     pub process_id: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ConversationSpec {
+    #[default]
     New,
     Resume(ResumeTarget),
     Fork(ResumeTarget),
     Attach(ResumeTarget),
-}
-
-impl Default for ConversationSpec {
-    fn default() -> Self {
-        Self::New
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -804,9 +787,9 @@ impl ResumeTarget {
     /// maps onto a provider session or thread.
     pub fn provider_id(&self) -> Option<&str> {
         match self {
-            Self::ChannelDefault(id) | Self::ProviderSession { id } | Self::ProviderThread { id } => {
-                Some(id)
-            }
+            Self::ChannelDefault(id)
+            | Self::ProviderSession { id }
+            | Self::ProviderThread { id } => Some(id),
             Self::NativeUiHandle { .. } => None,
         }
     }
@@ -868,10 +851,10 @@ impl Default for ResourcePolicy {
     fn default() -> Self {
         Self {
             turn_timeout: None,
-            max_turns: None,
-            max_tool_calls: None,
-            max_output_bytes: None,
-            max_event_bytes: None,
+            max_turns: Some(100),
+            max_tool_calls: Some(200),
+            max_output_bytes: Some(2 * 1024 * 1024),
+            max_event_bytes: Some(1024 * 1024),
         }
     }
 }

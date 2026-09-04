@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "channel"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "futures-util",
  "reqwest",

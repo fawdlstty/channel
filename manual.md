@@ -8,7 +8,7 @@ channel 把不同 AI Coding Harness 统一成同一个会话模型。调用方�
 
 - `Codex` 走 Codex App Server。
 - `OpenCode`、`ZedAcp`、`ZCode`、`DeepSeek`、`Hermes` 走 Agent Client Protocol。
-- `ClaudeCode`、`Aider`、`Goose`、`Cline`、`RooCode`、`OpenHands`、`SweAgent`、`GeminiCli`、`Continue` 走托管 CLI。
+- `ClaudeCode` 走托管 CLI。
 
 `Harness::initialize(kind)` 用于在真正开始对话前确认运行环境，默认使用当前工作目录。发现失败时，用 `Harness::initialize_with(config)` 传入工作目录、可执行文件、endpoint 或 port：
 
@@ -47,7 +47,7 @@ channel 把不同 AI Coding Harness 统一成同一个会话模型。调用方�
 
 - `Message`：增量回答或推理摘要；
 - `Activity`：工具、读文件、写文件、命令或子代理活动；
-- `Permission`：后端要求授权；
+- `Permission`：后端要求授权；用 `respond_permission(id, response)` 回复 `PermissionResponse::Approve` 或 `PermissionResponse::Deny`，未回复的请求会在会话关闭或下一回合开始时自动拒绝；
 - `Finished`：回合终态，包含状态和聚合后的最终文本；
 
 状态变化只反映在 `state()` 和会话详情中，不作为事件推送。回合结束后再次等待会得到 `Ok(None)`；中断后没有后续事件时也返回 `Ok(None)`。后端或协议异常通过 `Err(Error)` 返回。
@@ -63,7 +63,7 @@ channel 把不同 AI Coding Harness 统一成同一个会话模型。调用方�
 - `result()` 在收到终态后返回 `Finish`。
 - `info()` 返回会话详情，包括工作目录、后端、运行时、安全配置、外部 ID、模型和历史回合。
 - `capabilities()` 返回能力报告；初始化时是声明/生效能力，回合推进后还会补上实际观察能力。
-- `refresh_info()` 补一次后端会话 ID 并刷新更新时间。
+- `refresh_info()` 读取本地缓存的后端会话 ID 并刷新更新时间，不会向后端发起请求。
 
 ## 5. 中断或结束
 

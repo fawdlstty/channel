@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 
@@ -16,7 +17,14 @@ struct CliProcess {
     stdout: BufReader<ChildStdout>,
 }
 
+impl Drop for CliProcess {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
 pub(crate) struct CliBackend {
+    backend_kind: crate::protocol::BackendKind,
     kind: HarnessKind,
     command: String,
     args: Vec<String>,
@@ -28,6 +36,7 @@ pub(crate) struct CliBackend {
     interrupt_requested: bool,
     stream_tools: HashMap<usize, StreamTool>,
     cwd: PathBuf,
+    kill_grace_period: Duration,
 }
 
 impl CliBackend {
@@ -55,6 +64,12 @@ impl CliBackend {
             }
         };
         Ok(Self {
+            backend_kind: match config.backend {
+                crate::protocol::BackendSpec::PlainCli { .. } => {
+                    crate::protocol::BackendKind::PlainCli
+                }
+                _ => crate::protocol::BackendKind::StructuredCli,
+            },
             kind,
             command,
             args,
@@ -66,6 +81,7 @@ impl CliBackend {
             interrupt_requested: false,
             stream_tools: HashMap::new(),
             cwd: config.workspace_cwd().to_path_buf(),
+            kill_grace_period: config.runtime.process.kill_grace_period,
         })
     }
 
@@ -75,6 +91,7 @@ impl CliBackend {
             .kind
             .turn_args(&self.args, self.session_id.as_deref(), &message);
         let mut child = Command::new(&self.command)
+            .kill_on_drop(true)
             .args(&args)
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
@@ -110,8 +127,13 @@ impl CliBackend {
                 .try_wait()
                 .map_err(|error| Error::Backend(format!("failed to inspect CLI process: {error}")))?
                 .is_none()
+                && tokio::time::timeout(self.kill_grace_period, process.child.wait())
+                    .await
+                    .is_err()
             {
-                let _ = process.child.kill().await;
+                process.child.start_kill().map_err(|error| {
+                    Error::Backend(format!("failed to stop CLI process: {error}"))
+                })?;
             }
             process
                 .child
@@ -166,6 +188,11 @@ impl CliBackend {
                 let events = self.parse_json(&value);
                 self.queued.extend(events);
             } else {
+                if self.backend_kind == crate::protocol::BackendKind::StructuredCli {
+                    return Err(Error::ProtocolError(format!(
+                        "invalid structured CLI JSON output: {trimmed}"
+                    )));
+                }
                 self.text_seen = true;
                 self.queued.push_back(Event::TextDelta(line));
             }
@@ -303,7 +330,7 @@ impl Backend for CliBackend {
                     })?
                     .is_none()
                 {
-                    process.child.kill().await.map_err(|error| {
+                    process.child.start_kill().map_err(|error| {
                         Error::Backend(format!("failed to interrupt CLI process: {error}"))
                     })?;
                 }
@@ -331,9 +358,7 @@ impl CliBackend {
         let cwd = crate::runtime::HarnessDiscovery::resolve_cwd(init.cwd.as_deref())?;
         let (command, args) = backend.cli_command(kind)?;
         let backend_kind = match backend {
-            crate::protocol::BackendSpec::PlainCli { .. } => {
-                crate::protocol::BackendKind::PlainCli
-            }
+            crate::protocol::BackendSpec::PlainCli { .. } => crate::protocol::BackendKind::PlainCli,
             _ => crate::protocol::BackendKind::StructuredCli,
         };
         let executable = crate::runtime::HarnessDiscovery::resolve_executable(
@@ -352,7 +377,7 @@ impl CliBackend {
         ))
     }
 
-    pub(crate) fn structured_capabilities() -> crate::protocol::CapabilitySet {
+    pub(crate) fn structured_capabilities(kind: &HarnessKind) -> crate::protocol::CapabilitySet {
         crate::protocol::CapabilitySet {
             streaming_events: true,
             structured_text: true,
@@ -364,7 +389,7 @@ impl CliBackend {
             command_execution: true,
             turn_cancel: true,
             session_close: true,
-            provider_resume: true,
+            provider_resume: matches!(kind, HarnessKind::ClaudeCode),
             raw_events: true,
             ..crate::protocol::CapabilitySet::default()
         }
@@ -374,15 +399,8 @@ impl CliBackend {
         crate::protocol::CapabilitySet {
             streaming_events: true,
             structured_text: true,
-            tool_calls: true,
-            tool_inputs: true,
-            tool_outputs: true,
-            file_reads: true,
-            file_writes: true,
-            command_execution: true,
             turn_cancel: true,
             session_close: true,
-            raw_events: true,
             ..crate::protocol::CapabilitySet::default()
         }
     }
@@ -847,7 +865,9 @@ mod tests {
     fn resume_mode_seeds_the_claude_session_id() {
         let mut config = crate::protocol::SessionConfig::default_for(HarnessKind::ClaudeCode);
         config.conversation.mode = crate::protocol::ConversationSpec::Resume(
-            crate::protocol::ResumeTarget::ProviderSession { id: "s-9".to_owned() },
+            crate::protocol::ResumeTarget::ProviderSession {
+                id: "s-9".to_owned(),
+            },
         );
         let backend = CliBackend::new_with_config(config).unwrap();
         assert_eq!(backend.session_id.as_deref(), Some("s-9"));
@@ -874,7 +894,9 @@ mod tests {
     fn fork_and_attach_modes_are_rejected() {
         let mut config = crate::protocol::SessionConfig::default_for(HarnessKind::ClaudeCode);
         config.conversation.mode = crate::protocol::ConversationSpec::Fork(
-            crate::protocol::ResumeTarget::ProviderSession { id: "s-1".to_owned() },
+            crate::protocol::ResumeTarget::ProviderSession {
+                id: "s-1".to_owned(),
+            },
         );
         assert!(matches!(
             CliBackend::new_with_config(config),

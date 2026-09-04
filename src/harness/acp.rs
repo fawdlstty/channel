@@ -3,12 +3,13 @@ use crate::protocol::{
     ToolStatus,
 };
 use crate::runtime::HarnessDiscovery;
-use crate::session::{Backend, BackendFuture, SendMode};
+use crate::session::{Backend, BackendFuture, PermissionResponse, SendMode};
 use crate::utils::json::JsonValueExt;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -18,6 +19,12 @@ struct AcpProcess {
     stdout: BufReader<ChildStdout>,
 }
 
+impl Drop for AcpProcess {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
 impl AcpProcess {
     async fn spawn_with_cwd(
         command: &str,
@@ -25,6 +32,7 @@ impl AcpProcess {
         cwd: Option<&std::path::Path>,
     ) -> Result<Self, Error> {
         let mut command_builder = Command::new(command);
+        command_builder.kill_on_drop(true);
         command_builder.args(args);
         if let Some(cwd) = cwd {
             command_builder.current_dir(cwd);
@@ -81,14 +89,22 @@ impl AcpProcess {
             .map_err(|error| Error::Backend(format!("invalid ACP JSON message: {error}")))
     }
 
-    async fn stop(&mut self) -> Result<(), Error> {
+    async fn stop(&mut self, grace: Duration) -> Result<(), Error> {
         if self
             .child
             .try_wait()
             .map_err(|error| Error::Backend(format!("failed to inspect ACP process: {error}")))?
             .is_none()
         {
-            let _ = self.child.kill().await;
+            let _ = self.stdin.shutdown().await;
+            if tokio::time::timeout(grace, self.child.wait())
+                .await
+                .is_err()
+            {
+                self.child.start_kill().map_err(|error| {
+                    Error::Backend(format!("failed to stop ACP process: {error}"))
+                })?;
+            }
         }
         self.child
             .wait()
@@ -106,6 +122,10 @@ pub(crate) struct AcpBackend {
     cancel_requested: bool,
     finished: bool,
     queued: VecDeque<Event>,
+    pending_permissions: HashMap<String, Value>,
+    pending_responses: HashMap<u64, String>,
+    next_permission_id: u64,
+    kill_grace_period: Duration,
     protocol_version: Option<String>,
     server_name: Option<String>,
 }
@@ -128,6 +148,10 @@ impl AcpBackend {
             cancel_requested: false,
             finished: false,
             queued: VecDeque::new(),
+            pending_permissions: HashMap::new(),
+            pending_responses: HashMap::new(),
+            next_permission_id: 1,
+            kill_grace_period: Duration::from_secs(2),
             protocol_version: None,
             server_name: None,
         };
@@ -177,6 +201,7 @@ impl AcpBackend {
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, Error> {
         let id = self.next_request_id;
         self.next_request_id += 1;
+        self.pending_responses.insert(id, method.to_owned());
         self.process
             .write(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
             .await?;
@@ -195,12 +220,15 @@ impl AcpBackend {
                 continue;
             }
             if message.get("id") == Some(&json!(id)) {
+                self.pending_responses.remove(&id);
                 if let Some(error) = message.get("error") {
                     return Err(Error::Backend(format!("ACP RPC {method} failed: {error}")));
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
-            self.queued.push_back(Event::Raw(message));
+            return Err(Error::ProtocolError(format!(
+                "ACP returned an unexpected response while waiting for {method}: {message}"
+            )));
         }
     }
 
@@ -209,35 +237,89 @@ impl AcpBackend {
             .get("id")
             .cloned()
             .ok_or_else(|| Error::Backend("ACP server request has no id".to_owned()))?;
-        self.queued.push_back(Event::PermissionRequired {
-            id: id.to_string(),
-            detail: message
-                .get("params")
-                .map(Value::to_string)
-                .unwrap_or_else(|| method.to_owned()),
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        if method.contains("permission") || method.contains("approval") {
+            self.queued.push_back(Event::PermissionRequired {
+                id: id.to_string(),
+                detail: params.to_string(),
+            });
+            self.pending_permissions
+                .insert(id.to_string(), json!({ "id": id, "params": params }));
+            return Ok(());
+        }
+        self.queued.push_back(Event::Raw(message.clone()));
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": "request is not supported by channel" }
         });
-        let response = if method.contains("permission") || method.contains("approval") {
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "outcome": { "outcome": "cancelled" } }
-            })
-        } else {
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32601, "message": "request is not supported by channel" }
-            })
-        };
         self.process.write(&response).await
     }
 
+    async fn respond(&mut self, id: &str, response: PermissionResponse) -> Result<(), Error> {
+        let mut pending = self
+            .pending_permissions
+            .remove(id)
+            .ok_or_else(|| Error::Backend(format!("unknown permission request id: {id}")))?;
+        let outcome = match response {
+            PermissionResponse::Approve => pending.permission_selection(),
+            PermissionResponse::Deny => pending.deny_selection(),
+        };
+        let id = pending.get("id").cloned().unwrap_or(Value::Null);
+        self.process
+            .write(&json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": outcome } }))
+            .await
+    }
+
+    async fn deny_pending_permissions(&mut self) {
+        let pendings: Vec<Value> = self.pending_permissions.values().cloned().collect();
+        self.pending_permissions.clear();
+        for pending in pendings {
+            let id = pending.get("id").cloned().unwrap_or(Value::Null);
+            let _ = self
+                .process
+                .write(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "outcome": { "outcome": "cancelled" } }
+                }))
+                .await;
+        }
+    }
+
     fn queue_update(&mut self, message: &Value) {
+        let params = message.get("params").unwrap_or(message);
+        let update = params.get("update").unwrap_or(params);
+        if matches!(
+            update
+                .get("sessionUpdate")
+                .or_else(|| update.get("session_update"))
+                .or_else(|| update.get("type"))
+                .and_then(Value::as_str),
+            Some("permission_request" | "permissionRequest")
+        ) {
+            let mut update = update.clone();
+            if update
+                .get("id")
+                .and_then(JsonValueExt::string_value)
+                .is_none()
+            {
+                let id = self.next_permission_id;
+                self.next_permission_id += 1;
+                update["id"] = Value::String(format!("permission-{id}"));
+            }
+            let id = update["id"].as_str().expect("permission id").to_owned();
+            self.pending_permissions
+                .insert(id.clone(), json!({ "id": id, "params": update }));
+            self.queued.push_back(Event::PermissionRequired {
+                id,
+                detail: update.to_string(),
+            });
+            return;
+        }
         for event in message.parse_update() {
-            if let Event::Status(Status::Completed) = event {
-                self.queue_finished(Status::Completed);
-            } else if let Event::Status(Status::Interrupted) = event {
-                self.queue_finished(Status::Interrupted);
+            if let Event::Finished(finish) = &event {
+                self.queue_finished(finish.status);
             } else {
                 self.queued.push_back(event);
             }
@@ -307,10 +389,12 @@ impl Backend for AcpBackend {
         Box::pin(async move {
             self.cancel_requested = false;
             self.finished = false;
-            self.queued.clear();
+            self.deny_pending_permissions().await;
             let id = self.next_request_id;
             self.next_request_id += 1;
             self.prompt_id = Some(id);
+            // The prompt response is consumed by `next` so permission
+            // requests can be answered while the turn is still running.
             self.process
                 .write(&json!({
                     "jsonrpc": "2.0",
@@ -344,11 +428,20 @@ impl Backend for AcpBackend {
 
     fn close<'a>(&'a mut self) -> BackendFuture<'a, ()> {
         Box::pin(async move {
+            self.deny_pending_permissions().await;
             let _ = self
                 .request("session/close", json!({ "sessionId": self.session_id }))
                 .await;
-            self.process.stop().await
+            self.process.stop(self.kill_grace_period).await
         })
+    }
+
+    fn respond_permission<'a>(
+        &'a mut self,
+        id: &'a str,
+        response: PermissionResponse,
+    ) -> BackendFuture<'a, ()> {
+        Box::pin(async move { self.respond(id, response).await })
     }
 }
 
@@ -488,6 +581,73 @@ trait AcpValue {
     fn tool_status(&self, kind: &str) -> ToolStatus;
     fn text_event(&self, reasoning: bool) -> Option<Event>;
     fn status(&self) -> Option<Status>;
+    fn permission_selection(&mut self) -> Value;
+    fn deny_selection(&mut self) -> Value;
+}
+
+trait AcpPermissionOption {
+    fn approve_option(&self) -> Option<Value>;
+    fn deny_option(&self) -> Option<Value>;
+}
+
+impl AcpPermissionOption for Value {
+    fn approve_option(&self) -> Option<Value> {
+        let options = self.get("options").and_then(Value::as_array)?;
+        options
+            .iter()
+            .find(|option| option.name_contains(&["allow", "accept", "approve", "proceed", "yes"]))
+            .and_then(Value::option_id)
+            .map(|option_id| json!({ "outcome": "selected", "optionId": option_id }))
+    }
+
+    fn deny_option(&self) -> Option<Value> {
+        let options = self.get("options").and_then(Value::as_array)?;
+        options
+            .iter()
+            .find(|option| {
+                option.name_contains(&[
+                    "deny", "reject", "cancel", "block", "decline", "disallow", "no",
+                ])
+            })
+            .and_then(Value::option_id)
+            .map(|option_id| json!({ "outcome": "selected", "optionId": option_id }))
+    }
+}
+
+trait AcpPermissionOptionValue {
+    fn name_contains(&self, terms: &[&str]) -> bool;
+    fn option_id(&self) -> Option<Value>;
+}
+
+impl AcpPermissionOptionValue for Value {
+    fn name_contains(&self, terms: &[&str]) -> bool {
+        self.get("name")
+            .or_else(|| self.get("id"))
+            .and_then(Value::as_str)
+            .map(|name| {
+                let name = name.to_ascii_lowercase();
+                terms.iter().any(|term| name.contains(term))
+            })
+            .unwrap_or(false)
+    }
+
+    fn option_id(&self) -> Option<Value> {
+        self.get("optionId").or_else(|| self.get("id")).cloned()
+    }
+}
+
+trait AcpPendingPermission {
+    fn permission_params_mut(&mut self) -> &mut Value;
+}
+
+impl AcpPendingPermission for Value {
+    fn permission_params_mut(&mut self) -> &mut Value {
+        if self.get("params").is_some() {
+            self.get_mut("params").expect("params checked above")
+        } else {
+            self
+        }
+    }
 }
 
 impl AcpValue for Value {
@@ -674,6 +834,18 @@ impl AcpValue for Value {
                 .and_then(WireStatus::status)
         })
     }
+
+    fn permission_selection(&mut self) -> Value {
+        self.permission_params_mut()
+            .approve_option()
+            .unwrap_or_else(|| json!({ "outcome": "cancelled" }))
+    }
+
+    fn deny_selection(&mut self) -> Value {
+        self.permission_params_mut()
+            .deny_option()
+            .unwrap_or_else(|| json!({ "outcome": "cancelled" }))
+    }
 }
 
 trait CommandName {
@@ -778,6 +950,29 @@ mod tests {
     }
 
     #[test]
+    fn permission_options_are_selected_explicitly() {
+        let options = json!({
+            "options": [
+                { "optionId": "reject_once", "name": "Reject" },
+                { "optionId": "allow_once", "name": "Allow once" }
+            ]
+        });
+        assert_eq!(
+            options.approve_option(),
+            Some(json!({ "outcome": "selected", "optionId": "allow_once" }))
+        );
+
+        let unnamed = json!({ "options": [{ "id": "first" }, { "id": "second" }] });
+        assert_eq!(unnamed.approve_option(), None);
+
+        assert_eq!(json!({}).approve_option(), None);
+        assert_eq!(
+            options.deny_option(),
+            Some(json!({ "outcome": "selected", "optionId": "reject_once" }))
+        );
+    }
+
+    #[test]
     fn hermes_uses_acp_command() {
         assert_eq!(
             HarnessKind::Hermes.acp_command().unwrap(),
@@ -789,7 +984,9 @@ mod tests {
     async fn resume_mode_is_rejected_before_connecting() {
         let mut config = crate::protocol::SessionConfig::default_for(HarnessKind::Hermes);
         config.conversation.mode = crate::protocol::ConversationSpec::Resume(
-            crate::protocol::ResumeTarget::ProviderSession { id: "s-1".to_owned() },
+            crate::protocol::ResumeTarget::ProviderSession {
+                id: "s-1".to_owned(),
+            },
         );
         assert!(matches!(
             AcpBackend::create_session_with_config(config, String::new(), None).await,

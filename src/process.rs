@@ -1,6 +1,7 @@
 use crate::protocol::Error;
 use serde_json::Value;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -8,6 +9,12 @@ pub(crate) struct JsonlProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+impl Drop for JsonlProcess {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
 }
 
 impl JsonlProcess {
@@ -26,6 +33,7 @@ impl JsonlProcess {
         envs: &[(&str, &std::path::Path)],
     ) -> Result<Self, Error> {
         let mut command_builder = Command::new(command);
+        command_builder.kill_on_drop(true);
         command_builder.args(args);
         for (name, value) in envs {
             command_builder.env(name, value);
@@ -85,16 +93,24 @@ impl JsonlProcess {
             .map_err(|error| Error::Backend(format!("invalid JSONL message: {error}")))
     }
 
-    pub(crate) async fn close(&mut self) -> Result<(), Error> {
+    pub(crate) async fn close(&mut self, grace: Duration) -> Result<(), Error> {
         if self
             .child
             .try_wait()
             .map_err(|error| Error::Backend(format!("failed to inspect JSONL process: {error}")))?
             .is_none()
         {
-            self.child.kill().await.map_err(|error| {
+            self.child.start_kill().map_err(|error| {
                 Error::Backend(format!("failed to stop JSONL process: {error}"))
             })?;
+            if tokio::time::timeout(grace, self.child.wait())
+                .await
+                .is_err()
+            {
+                // start_kill has already requested SIGKILL; this reaps a child
+                // that ignored the request or was scheduled slowly.
+                let _ = self.child.kill().await;
+            }
         }
         self.child
             .wait()

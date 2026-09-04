@@ -2,9 +2,10 @@ use crate::protocol::Error;
 use rusqlite::OpenFlags;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 const DEFAULT_API_FORMAT: &str = "openai_responses";
@@ -196,8 +197,9 @@ impl ResolvedProvider {
     }
 }
 
+#[derive(Clone)]
 struct TempCodexHome {
-    path: PathBuf,
+    path: std::sync::Arc<PathBuf>,
 }
 
 impl TempCodexHome {
@@ -208,19 +210,34 @@ impl TempCodexHome {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|error| Error::Initialization(error.to_string()))?
                 .as_nanos();
+            let entropy = &root as *const _ as usize ^ &attempt as *const _ as usize;
             let path = root.join(format!(
-                "channel-codex-{}-{nanos}-{attempt}",
+                "channel-codex-{}-{nanos}-{entropy:x}-{attempt}",
                 std::process::id()
             ));
-            match std::fs::create_dir(&path) {
+            #[cfg_attr(not(unix), allow(unused_mut))]
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
                 Ok(()) => {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                            .map_err(|error| Error::Initialization(error.to_string()))?;
-                    }
-                    return Ok(Self { path });
+                    // Codex rejects CODEX_HOME values containing 8.3 short
+                    // path components (e.g. FAWDLS~1), so hand it the
+                    // canonical long path with the verbatim prefix removed.
+                    let canonical = std::fs::canonicalize(&path)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .into_owned();
+                    let canonical = canonical
+                        .strip_prefix(r"\\?\")
+                        .map(str::to_owned)
+                        .unwrap_or(canonical);
+                    return Ok(Self {
+                        path: std::sync::Arc::new(PathBuf::from(canonical)),
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
@@ -267,7 +284,11 @@ impl TempCodexHome {
 
 impl Drop for TempCodexHome {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        // Clones share the directory (e.g. the relay branch moves a clone
+        // into a blocking task); only the last owner removes it.
+        if std::sync::Arc::strong_count(&self.path) == 1 {
+            let _ = std::fs::remove_dir_all(&*self.path);
+        }
     }
 }
 
@@ -298,7 +319,12 @@ impl CodexResources {
                 "a configured cc-switch key requires the default Codex process endpoint".to_owned(),
             ));
         }
-        let provider = CodexDatabase::path()?.resolve_provider(provider_name)?;
+        let database = CodexDatabase::path()?;
+        let provider_name = provider_name.to_owned();
+        let provider =
+            tokio::task::spawn_blocking(move || database.resolve_provider(&provider_name))
+                .await
+                .map_err(|error| Error::Initialization(error.to_string()))??;
         let codex_home = TempCodexHome::create()?;
         let relay = if provider.api_format == DEFAULT_API_FORMAT {
             codex_home.write(&provider, &provider.base_url)?;
@@ -308,13 +334,22 @@ impl CodexResources {
                 "openai_chat" => {
                     let relay = Relay::start(&provider).await?;
                     let upstream = format!("{}/v1", relay.endpoint.trim_end_matches('/'));
-                    codex_home.write(&provider, &upstream)?;
+                    let home = codex_home.clone();
+                    let provider = provider.clone();
+                    let upstream = upstream.clone();
+                    tokio::task::spawn_blocking(move || home.write(&provider, &upstream))
+                        .await
+                        .map_err(|error| Error::Initialization(error.to_string()))??;
                     Some(relay)
                 }
                 "anthropic" => {
                     let relay = Relay::start(&provider).await?;
                     let upstream = relay.endpoint.trim_end_matches('/').to_owned();
-                    codex_home.write(&provider, &upstream)?;
+                    let home = codex_home.clone();
+                    let provider = provider.clone();
+                    tokio::task::spawn_blocking(move || home.write(&provider, &upstream))
+                        .await
+                        .map_err(|error| Error::Initialization(error.to_string()))??;
                     Some(relay)
                 }
                 unsupported => {
@@ -335,6 +370,7 @@ impl CodexResources {
 pub(crate) struct Relay {
     pub endpoint: String,
     task: JoinHandle<()>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl Relay {
@@ -346,27 +382,43 @@ impl Relay {
             .local_addr()
             .map_err(|error| Error::Initialization(error.to_string()))?
             .to_string();
-        let client = reqwest::Client::builder().build().map_err(|error| {
-            Error::Initialization(format!("failed to create relay client: {error}"))
-        })?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|error| {
+                Error::Initialization(format!("failed to create relay client: {error}"))
+            })?;
         let provider = Arc::new(provider.clone());
+        let connections = Arc::new(Mutex::new(Vec::new()));
+        let permits = Arc::new(Semaphore::new(32));
+        let accept_connections = connections.clone();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let client = client.clone();
                 let provider = provider.clone();
-                tokio::spawn(
+                let connections = accept_connections.clone();
+                let permits = permits.clone();
+                let connection = tokio::spawn(
                     RelayConnection {
                         stream,
                         client,
                         provider,
+                        permits,
                     }
                     .serve(),
                 );
+                connections
+                    .lock()
+                    .expect("relay connections")
+                    .push(connection);
             }
         });
         Ok(Self {
             endpoint: format!("http://{address}"),
             task,
+            connections,
         })
     }
 }
@@ -374,6 +426,11 @@ impl Relay {
 impl Drop for Relay {
     fn drop(&mut self) {
         self.task.abort();
+        let mut connections = self.connections.lock().expect("relay connections");
+        let connections = connections.drain(..);
+        for connection in connections {
+            connection.abort();
+        }
     }
 }
 
@@ -381,24 +438,41 @@ struct RelayConnection {
     stream: TcpStream,
     client: reqwest::Client,
     provider: Arc<ResolvedProvider>,
+    permits: Arc<Semaphore>,
 }
 
 impl RelayConnection {
     async fn serve(mut self) {
-        let body = match self.stream.read_request().await {
-            Ok(body) => body,
+        let _permit = match self.permits.acquire().await {
+            Ok(permit) => permit,
             Err(_) => return,
         };
-        let request: Value = match serde_json::from_slice(&body) {
-            Ok(request) => request,
-            Err(_) => {
-                let _ = self
+        let request: Result<Value, String> =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let body = self
                     .stream
-                    .write_json_response(400, "invalid Responses request")
-                    .await;
+                    .read_request("/responses")
+                    .await
+                    .map_err(|error| error.to_string())?;
+                serde_json::from_slice(&body)
+                    .map_err(|error| format!("invalid Responses request: {error}"))
+            })
+            .await
+            .unwrap_or_else(|_| Err("relay request timed out".to_owned()));
+        let request = match request {
+            Ok(request) => request,
+            Err(message) => {
+                let _ = self.stream.write_json_response(400, &message).await;
                 return;
             }
         };
+        let mut request = request;
+        if request.get("model").is_none() {
+            request["model"] = Value::String(self.provider.model.clone());
+        }
+        // Fields the chat/anthropic conversions cannot represent are simply
+        // dropped; newer Codex clients always send reasoning settings.
+        request.strip_unsupported_responses_fields();
         let result = if self.provider.api_format == "openai_chat" {
             self.provider.forward_chat(&self.client, request).await
         } else {
@@ -417,15 +491,17 @@ impl RelayConnection {
 }
 
 trait HttpConnection {
-    async fn read_request(&mut self) -> Result<Vec<u8>, std::io::Error>;
+    async fn read_request(&mut self, path: &str) -> Result<Vec<u8>, std::io::Error>;
     async fn write_json_response(&mut self, status: u16, body: &str) -> Result<(), std::io::Error>;
     async fn write_sse_response(&mut self, status: u16, body: &str) -> Result<(), std::io::Error>;
 }
 
 impl HttpConnection for TcpStream {
-    async fn read_request(&mut self) -> Result<Vec<u8>, std::io::Error> {
+    async fn read_request(&mut self, path: &str) -> Result<Vec<u8>, std::io::Error> {
         let mut buffer = Vec::new();
         let mut chunk = [0_u8; 8192];
+        const MAX_HEADER_BYTES: usize = 16 * 1024;
+        const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
         let header_end = loop {
             let count = self.read(&mut chunk).await?;
             if count == 0 {
@@ -435,16 +511,66 @@ impl HttpConnection for TcpStream {
                 ));
             }
             buffer.extend_from_slice(&chunk[..count]);
+            if buffer.len() > MAX_HEADER_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "relay request headers are too large",
+                ));
+            }
             if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
                 break position;
             }
         };
-        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_ascii_lowercase();
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let mut header_lines = headers.lines();
+        let request_line = header_lines.next().unwrap_or_default();
+        let (method, request_path) = {
+            let mut parts = request_line.split_whitespace();
+            (
+                parts.next().unwrap_or_default(),
+                parts.next().unwrap_or_default(),
+            )
+        };
+        // Codex appends /responses to the configured base_url, which already
+        // carries the /v1 prefix written into config.toml.
+        if method != "POST" || !(request_path == path || request_path.ends_with(path)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "relay accepts only POST /responses",
+            ));
+        }
+        if headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("transfer-encoding:"))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "chunked relay requests are not accepted",
+            ));
+        }
         let content_length = headers
             .lines()
-            .find_map(|line| line.strip_prefix("content-length:"))
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or_default();
+            .find_map(|line| {
+                if line.len() >= "content-length:".len()
+                    && line[.."content-length:".len()].eq_ignore_ascii_case("content-length:")
+                {
+                    line["content-length:".len()..].trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "relay requests require content-length",
+                )
+            })?;
+        if content_length == 0 || content_length > MAX_BODY_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "relay request body size is invalid",
+            ));
+        }
         let mut body = buffer.split_off(header_end + 4);
         if body.len() < content_length {
             let mut remainder = vec![0_u8; content_length - body.len()];
@@ -548,8 +674,12 @@ impl RelayResponse {
 }
 
 trait ResponsesProtocol {
+    fn strip_unsupported_responses_fields(&mut self);
     fn responses_sse(&self) -> String;
     fn responses_usage(&self) -> Value;
+    fn responses_status(&self) -> &'static str;
+    fn responses_cached_input_tokens(&self) -> Value;
+    fn responses_reasoning_tokens(&self) -> Value;
     fn chat_completion_request(&self) -> Value;
     fn responses_messages(&self) -> Vec<Value>;
     fn response_message_to_chat(&self) -> Option<Value>;
@@ -561,6 +691,19 @@ trait ResponsesProtocol {
 }
 
 impl ResponsesProtocol for Value {
+    fn strip_unsupported_responses_fields(&mut self) {
+        if let Some(object) = self.as_object_mut() {
+            for field in [
+                "previous_response_id",
+                "reasoning",
+                "metadata",
+                "parallel_tool_calls",
+            ] {
+                object.remove(field);
+            }
+        }
+    }
+
     fn responses_sse(&self) -> String {
         let output = if self.get("object").and_then(Value::as_str) == Some("chat.completion") {
             self.chat_completion_output()
@@ -570,20 +713,87 @@ impl ResponsesProtocol for Value {
         let response = json!({
             "id": RelayResponse::id(),
             "object": "response",
-            "status": "completed",
+            "status": self.responses_status(),
             "output": output,
             "usage": self.responses_usage(),
         });
-        let events = [
-            (
-                "response.created",
-                json!({ "type": "response.created", "response": response.clone() }),
-            ),
-            (
-                "response.completed",
-                json!({ "type": "response.completed", "response": response }),
-            ),
-        ];
+        // Codex only surfaces agent messages and tool calls from the
+        // item-level events, so a bare created+completed pair yields an
+        // empty turn even when the final response carries output.
+        let mut events = vec![(
+            "response.created",
+            json!({ "type": "response.created", "response": response.clone() }),
+        )];
+        for (index, item) in output.iter().enumerate() {
+            events.push((
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": index,
+                    "item": item,
+                }),
+            ));
+            let text = item
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if item.get("type").and_then(Value::as_str) == Some("message") {
+                let part = json!({ "type": "output_text", "text": text, "annotations": [] });
+                let item_id = item.get("id").cloned().unwrap_or(Value::Null);
+                events.push((
+                    "response.content_part.added",
+                    json!({
+                        "type": "response.content_part.added",
+                        "item_id": item_id,
+                        "output_index": index,
+                        "content_index": 0,
+                        "part": part,
+                    }),
+                ));
+                events.push((
+                    "response.output_text.delta",
+                    json!({
+                        "type": "response.output_text.delta",
+                        "item_id": item_id,
+                        "output_index": index,
+                        "content_index": 0,
+                        "delta": text,
+                    }),
+                ));
+                events.push((
+                    "response.output_text.done",
+                    json!({
+                        "type": "response.output_text.done",
+                        "item_id": item_id,
+                        "output_index": index,
+                        "content_index": 0,
+                        "text": text,
+                    }),
+                ));
+                events.push((
+                    "response.content_part.done",
+                    json!({
+                        "type": "response.content_part.done",
+                        "item_id": item_id,
+                        "output_index": index,
+                        "content_index": 0,
+                        "part": part,
+                    }),
+                ));
+            }
+            events.push((
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": index,
+                    "item": item,
+                }),
+            ));
+        }
+        events.push((
+            "response.completed",
+            json!({ "type": "response.completed", "response": response }),
+        ));
         events
             .into_iter()
             .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
@@ -591,17 +801,74 @@ impl ResponsesProtocol for Value {
     }
 
     fn responses_usage(&self) -> Value {
-        if self.get("object").and_then(Value::as_str) == Some("chat.completion") {
-            json!({
-                "input_tokens": self.pointer("/usage/prompt_tokens"),
-                "output_tokens": self.pointer("/usage/completion_tokens"),
-            })
-        } else {
-            json!({
-                "input_tokens": self.pointer("/usage/input_tokens"),
-                "output_tokens": self.pointer("/usage/output_tokens"),
-            })
+        let (input, output) =
+            if self.get("object").and_then(Value::as_str) == Some("chat.completion") {
+                (
+                    self.pointer("/usage/prompt_tokens")
+                        .cloned()
+                        .unwrap_or(json!(0)),
+                    self.pointer("/usage/completion_tokens")
+                        .cloned()
+                        .unwrap_or(json!(0)),
+                )
+            } else {
+                (
+                    self.pointer("/usage/input_tokens")
+                        .cloned()
+                        .unwrap_or(json!(0)),
+                    self.pointer("/usage/output_tokens")
+                        .cloned()
+                        .unwrap_or(json!(0)),
+                )
+            };
+        let tokens = match (&input, &output) {
+            (Value::Number(input), Value::Number(output)) => input
+                .as_u64()
+                .zip(output.as_u64())
+                .map(|(input, output)| json!(input + output)),
+            _ => None,
         }
+        .unwrap_or(json!(0));
+        json!({
+            "input_tokens": input,
+            "output_tokens": output,
+            "total_tokens": tokens,
+            "cached_input_tokens": self.responses_cached_input_tokens(),
+            "reasoning_tokens": self.responses_reasoning_tokens(),
+        })
+    }
+
+    fn responses_status(&self) -> &'static str {
+        if self.get("object").and_then(Value::as_str) == Some("chat.completion") {
+            match self
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+            {
+                Some("length") => "incomplete",
+                Some("content_filter") | Some("failure") => "failed",
+                _ => "completed",
+            }
+        } else {
+            match self.get("stop_reason").and_then(Value::as_str) {
+                Some("max_tokens") => "incomplete",
+                Some("refusal") | Some("error") => "failed",
+                _ => "completed",
+            }
+        }
+    }
+
+    fn responses_cached_input_tokens(&self) -> Value {
+        self.pointer("/usage/prompt_tokens_details/cached_tokens")
+            .or_else(|| self.pointer("/usage/cache_read_input_tokens"))
+            .cloned()
+            .unwrap_or(json!(0))
+    }
+
+    fn responses_reasoning_tokens(&self) -> Value {
+        self.pointer("/usage/completion_tokens_details/reasoning_tokens")
+            .or_else(|| self.pointer("/usage/reasoning_tokens"))
+            .cloned()
+            .unwrap_or(json!(0))
     }
 
     fn chat_completion_request(&self) -> Value {
@@ -696,6 +963,9 @@ impl ResponsesProtocol for Value {
                 .join(""),
             _ => String::new(),
         });
+        // The Responses API may label instructions as "developer", which
+        // chat-completions upstreams such as GLM reject outright.
+        let role = if role == "developer" { "system" } else { role };
         Some(json!({ "role": role, "content": content.unwrap_or_default() }))
     }
 
@@ -752,7 +1022,16 @@ impl ResponsesProtocol for Value {
                         }
                         Some("message") | None => {
                             if let Some(message) = item.response_message_to_chat() {
-                                messages.push(message);
+                                // Anthropic only accepts user/assistant turns here;
+                                // system content belongs to the top-level field.
+                                if message.get("role").and_then(Value::as_str) == Some("assistant")
+                                {
+                                    messages.push(message);
+                                } else if let Some(content) =
+                                    message.get("content").and_then(Value::as_str)
+                                {
+                                    messages.push(json!({ "role": "user", "content": content }));
+                                }
                             }
                         }
                         _ => {}
@@ -797,34 +1076,41 @@ impl ResponsesProtocol for Value {
     }
 
     fn chat_completion_output(&self) -> Vec<Value> {
-        let message = self
-            .pointer("/choices/0/message")
-            .cloned()
-            .unwrap_or(Value::Null);
         let mut output = Vec::new();
-        if let Some(text) = message
-            .get("content")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-        {
-            output.push(json!({
-                "id": format!("msg_{}", RelayResponse::id()),
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [{ "type": "output_text", "text": text, "annotations": [] }],
-            }));
-        }
-        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-            for tool in tool_calls {
-                output.push(json!({
-                    "id": tool.get("id").cloned().unwrap_or_else(|| json!(format!("fc_{}", RelayResponse::id()))),
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": tool.get("id").cloned().unwrap_or_else(|| json!(format!("fc_{}", RelayResponse::id()))),
-                    "name": tool.pointer("/function/name"),
-                    "arguments": tool.pointer("/function/arguments").cloned().unwrap_or_else(|| json!("{}")),
-                }));
+        if let Some(choices) = self.get("choices").and_then(Value::as_array) {
+            for (choice_index, choice) in choices.iter().enumerate() {
+                let message = choice.get("message").cloned().unwrap_or(Value::Null);
+                let contents = match message.get("content") {
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>(),
+                    Some(Value::String(text)) if !text.is_empty() => vec![text.clone()],
+                    _ => Vec::new(),
+                };
+                for (part_index, text) in contents.into_iter().enumerate() {
+                    output.push(json!({
+                        "id": format!("msg_{}_{}_{}", RelayResponse::id(), choice_index, part_index),
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": text, "annotations": [] }],
+                    }));
+                }
+                if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                    for (tool_index, tool) in tool_calls.iter().enumerate() {
+                        output.push(json!({
+                            "id": tool.get("id").cloned().unwrap_or_else(|| json!(format!("fc_{}_{}_{}", RelayResponse::id(), choice_index, tool_index))),
+                            "type": "function_call",
+                            "status": "completed",
+                            "call_id": tool.get("id").cloned().unwrap_or_else(|| json!(format!("fc_{}_{}_{}", RelayResponse::id(), choice_index, tool_index))),
+                            "name": tool.pointer("/function/name"),
+                            "arguments": tool.pointer("/function/arguments").cloned().unwrap_or_else(|| json!("{}")),
+                        }));
+                    }
+                }
             }
         }
         output
@@ -1005,13 +1291,54 @@ mod tests {
         assert_eq!(upstream.responses_usage()["input_tokens"], 2);
     }
 
+    #[test]
+    fn sse_stream_carries_item_level_events_codex_requires() {
+        let upstream = json!({
+            "object": "chat.completion",
+            "choices": [{"message": {"content": "done"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+        });
+        let sse = upstream.responses_sse();
+        for event in [
+            "event: response.created",
+            "event: response.output_item.added",
+            "event: response.content_part.added",
+            "event: response.output_text.delta",
+            "event: response.output_text.done",
+            "event: response.content_part.done",
+            "event: response.output_item.done",
+            "event: response.completed",
+        ] {
+            assert!(sse.contains(event), "missing {event} in SSE stream");
+        }
+        assert!(sse.contains("\"delta\":\"done\""));
+    }
+
+    #[test]
+    fn normalizes_developer_role_for_chat_upstreams() {
+        let request = json!({
+            "model": "demo",
+            "instructions": "be brief",
+            "input": [
+                { "type": "message", "role": "developer", "content": "system prompt" },
+                { "type": "message", "role": "user", "content": "hello" }
+            ]
+        });
+        let messages = request.responses_messages();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "be brief");
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages[1]["content"], "system prompt");
+        assert_eq!(messages[2]["role"], "user");
+    }
+
     #[tokio::test]
     async fn relays_responses_requests_as_session_scoped_chat_completions() {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_address = upstream.local_addr().unwrap().to_string();
         tokio::spawn(async move {
             let (mut stream, _) = upstream.accept().await.unwrap();
-            let body = stream.read_request().await.unwrap();
+            let body = stream.read_request("/chat/completions").await.unwrap();
             let request: Value = serde_json::from_slice(&body).unwrap();
             let response = json!({
                 "object": "chat.completion",

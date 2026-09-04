@@ -67,7 +67,7 @@ impl HarnessDiscovery {
     }
 
     pub(crate) fn discover(
-        _kind: &HarnessKind,
+        kind: &HarnessKind,
         backend_kind: BackendKind,
         command: &str,
         args: &[String],
@@ -98,7 +98,7 @@ impl HarnessDiscovery {
             source,
             ..RuntimeInfo::default()
         };
-        let declared = backend_kind.supported_capabilities();
+        let declared = backend_kind.supported_capabilities(kind);
         HarnessDiscovery {
             capabilities: CapabilityReport::discovered(declared, source),
             backend,
