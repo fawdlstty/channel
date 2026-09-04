@@ -270,7 +270,7 @@ impl TempCodexHome {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o700))
+            std::fs::set_permissions(&*self.path, std::fs::Permissions::from_mode(0o700))
                 .map_err(|error| Error::Initialization(error.to_string()))?;
             std::fs::set_permissions(
                 self.path.join("auth.json"),
