@@ -307,8 +307,10 @@ impl CodexBackend {
             .pending_permissions
             .remove(id)
             .ok_or_else(|| Error::Backend(format!("unknown permission request id: {id}")))?;
+        // codex 0.153.2 的审批应答枚举是 accept/acceptForSession/decline/cancel
+        // 等（与请求里的 availableDecisions 对应），不是 approve/decline。
         let decision = match response {
-            PermissionResponse::Approve => "approve",
+            PermissionResponse::Approve => "accept",
             PermissionResponse::Deny => "decline",
         };
         self.transport
@@ -411,14 +413,31 @@ impl crate::protocol::SessionConfig {
         if self.observability == Some(false) {
             params["ephemeral"] = Value::Bool(true);
         }
+        if let Some(sandbox) = self.full_access_sandbox() {
+            params["sandbox"] = Value::String(sandbox.to_owned());
+        }
         params
     }
 
     fn thread_resume_params(&self, thread_id: &str) -> Value {
-        json!({
+        let mut params = json!({
             "threadId": thread_id,
             "cwd": self.workspace_cwd().to_string_lossy(),
-        })
+        });
+        if let Some(sandbox) = self.full_access_sandbox() {
+            params["sandbox"] = Value::String(sandbox.to_owned());
+        }
+        params
+    }
+
+    /// Full access is expressed as an unsandboxed thread while keeping the
+    /// provider's default approval policy: with sandbox `never` approvals are
+    /// also disabled, but escalated tool calls are then rejected outright
+    /// instead of surfacing as answerable permission requests (verified
+    /// against codex 0.153.2). An unsandboxed thread already grants escalated
+    /// commands without asking, and any residual request stays auto-answerable.
+    fn full_access_sandbox(&self) -> Option<&'static str> {
+        self.is_full_access().then_some("danger-full-access")
     }
 
     fn conversation_thread_id(&self) -> Result<Option<&str>, Error> {
@@ -529,13 +548,18 @@ impl CodexBackend {
         let executable = resolve_executable(init.executable.as_deref(), &command, Some(&cwd))?;
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let executable_path = executable.to_string_lossy().into_owned();
-        let models = CodexTransport::list_models(
-            &executable_path,
-            &arg_refs,
-            Some(&cwd),
-            endpoint.as_deref(),
-        )
-        .await?;
+        let models = match init.model.as_deref() {
+            Some(_) => {
+                CodexTransport::list_models(
+                    &executable_path,
+                    &arg_refs,
+                    Some(&cwd),
+                    endpoint.as_deref(),
+                )
+                .await?
+            }
+            None => Vec::new(),
+        };
 
         Ok(CodexInitialization {
             command,
@@ -594,8 +618,11 @@ impl CodexTransport {
         cwd: Option<&std::path::Path>,
         endpoint: Option<&str>,
     ) -> Result<Vec<String>, Error> {
+        // codex app-server 启动时会同步 curated 插件目录（git → GitHub HTTP →
+        // archive 多级回退），并阻塞到同步结束后才响应请求；受限网络下该同步
+        // 可能远超 5 秒，超时过短会把可用渠道误判为初始化失败。
         let models = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             Self::list_models_once(command, args, cwd, endpoint),
         )
         .await
@@ -1099,6 +1126,38 @@ mod tests {
                 "ephemeral": true,
             })
         );
+    }
+
+    #[test]
+    fn full_access_threads_run_without_sandbox() {
+        let mut config = crate::protocol::SessionConfig::default_for(HarnessKind::Codex);
+        config.set_workspace(Some("/tmp/channel".into()));
+        config.set_observability(false);
+        config.set_full_access(true);
+
+        assert_eq!(
+            config.thread_start_params(),
+            json!({
+                "cwd": "/tmp/channel",
+                "ephemeral": true,
+                "sandbox": "danger-full-access",
+            })
+        );
+        assert_eq!(
+            config.thread_resume_params("th-1"),
+            json!({
+                "threadId": "th-1",
+                "cwd": "/tmp/channel",
+                "sandbox": "danger-full-access",
+            })
+        );
+    }
+
+    #[test]
+    fn default_threads_do_not_override_sandbox() {
+        let mut config = crate::protocol::SessionConfig::default_for(HarnessKind::Codex);
+        config.set_workspace(Some("/tmp/channel".into()));
+        assert!(config.thread_start_params().get("sandbox").is_none());
     }
 
     #[test]

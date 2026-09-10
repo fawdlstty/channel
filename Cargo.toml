@@ -1,6 +1,6 @@
 [package]
 name = "channel"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -14,14 +14,61 @@ readme = "README.md"
 exclude = ["src/main.rs"]
 
 [dependencies]
+candle-core = { version = "0.11.0", optional = true }
+candle-nn = { version = "0.11.0", optional = true }
+candle-transformers = { version = "0.11.0", optional = true }
 futures-util = "0.3"
+llama-cpp-2 = { version = "0.1.156", optional = true }
+minijinja = { version = "2", optional = true }
+# Python-compat string/list methods (`split`, `strip`, ...) used by many
+# Hugging Face chat templates.
+minijinja-contrib = { version = "2", optional = true, default-features = false, features = ["pycompat"] }
+potato = { version = "0.4.0", optional = true, default-features = false, features = [
+    "std",
+    "tls",
+], path = "../potato/potato" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
+tokenizers = { version = "0.23.2", optional = true, default-features = false, features = ["fancy-regex"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = "0.28"
 toml = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+llm = ["dep:potato"]
+local = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:minijinja",
+    "dep:minijinja-contrib",
+]
+local-gguf = ["local", "dep:llama-cpp-2"]
+local-server = ["local", "dep:potato"]
+local-cuda = ["local-gguf", "llama-cpp-2/cuda"]
+local-metal = ["local-gguf", "llama-cpp-2/metal"]
+local-vulkan = ["local-gguf", "llama-cpp-2/vulkan"]
+local-candle-cuda = ["local", "candle-core/cuda"]
+local-candle-metal = ["local", "candle-core/metal"]
+
+[[example]]
+name = "llm_chat"
+required-features = ["llm"]
+
+[[example]]
+name = "local_chat"
+required-features = ["local"]
+
+[[example]]
+name = "local_server"
+required-features = ["local-server"]
 
 # cargo publish -p channel --allow-dirty --registry crates-io
 # cd docs && npm run docs:build && cd ..

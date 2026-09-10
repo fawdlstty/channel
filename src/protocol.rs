@@ -49,6 +49,7 @@ pub struct HarnessInit {
     pub executable: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub port: Option<u16>,
+    pub model: Option<String>,
 }
 
 impl Default for HarnessInit {
@@ -58,6 +59,7 @@ impl Default for HarnessInit {
             executable: None,
             cwd: None,
             port: None,
+            model: None,
         }
     }
 }
@@ -69,6 +71,7 @@ impl HarnessInit {
             executable: config.runtime.process.executable.clone(),
             cwd: Some(config.workspace_cwd().to_path_buf()),
             port: config.port,
+            model: config.model.requested.clone(),
         }
     }
 }

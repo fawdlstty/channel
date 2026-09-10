@@ -1,4 +1,6 @@
 mod harness;
+#[cfg(any(feature = "llm", feature = "local", feature = "local-server"))]
+mod llm;
 mod process;
 mod protocol;
 mod runtime;
@@ -29,6 +31,24 @@ pub use session::{
     ActivityView, InterruptAction, InterruptResult, MessageEvent, PermissionEvent,
     PermissionResponse, SendMode, SendResult, Session, SessionEvent,
 };
+
+// Types shared by the HTTP protocol clients (`llm`) and the local-model
+// client (`local`).
+#[cfg(any(feature = "llm", feature = "local"))]
+pub use llm::{ChatMessage, LlmModelInfo, MessageRole, StreamChunk};
+// The four HTTP protocol clients; pure potato transports.
+#[cfg(feature = "llm")]
+pub use llm::{ChatCompletionsClient, MessagesClient, OllamaClient, ResponsesClient};
+// Server-side stream emitters; usable by `local-server` without `llm`.
+#[cfg(any(feature = "llm", feature = "local-server"))]
+pub use llm::{AnthropicSender, OllamaSender, OpenAISender};
+// Local-model inference (`local`).
+#[cfg(feature = "local")]
+pub use llm::{GenerationParams, LoadOptions, LocalBackendKind, LocalClient, LocalModelMeta};
+// One-click HTTP endpoints for local models (`local-server`, implies
+// `local`).
+#[cfg(feature = "local-server")]
+pub use llm::LocalLlmServer;
 
 /// An initialized harness handle. The resolved runtime remains private.
 #[derive(Clone, Debug)]

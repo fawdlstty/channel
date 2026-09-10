@@ -198,58 +198,66 @@ impl ResolvedProvider {
 }
 
 #[derive(Clone)]
-struct TempCodexHome {
+struct CodexHome {
     path: std::sync::Arc<PathBuf>,
 }
 
-impl TempCodexHome {
-    fn create() -> Result<Self, Error> {
-        let root = std::env::temp_dir();
-        for attempt in 0..32 {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|error| Error::Initialization(error.to_string()))?
-                .as_nanos();
-            let entropy = &root as *const _ as usize ^ &attempt as *const _ as usize;
-            let path = root.join(format!(
-                "channel-codex-{}-{nanos}-{entropy:x}-{attempt}",
-                std::process::id()
-            ));
-            #[cfg_attr(not(unix), allow(unused_mut))]
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(&path) {
-                Ok(()) => {
-                    // Codex rejects CODEX_HOME values containing 8.3 short
-                    // path components (e.g. FAWDLS~1), so hand it the
-                    // canonical long path with the verbatim prefix removed.
-                    let canonical = std::fs::canonicalize(&path)
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .into_owned();
-                    let canonical = canonical
-                        .strip_prefix(r"\\?\")
-                        .map(str::to_owned)
-                        .unwrap_or(canonical);
-                    return Ok(Self {
-                        path: std::sync::Arc::new(PathBuf::from(canonical)),
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(Error::Initialization(format!(
-                        "failed to create temporary Codex home: {error}"
-                    )))
-                }
-            }
+impl CodexHome {
+    /// Uses a home directory that persists per switch key. Codex app-server
+    /// performs a curated-plugin catalog sync on every startup and gates its
+    /// `initialize` response on it; with an empty home that sync reaches
+    /// github.com over flaky networks and can block for minutes. A persistent
+    /// home keeps the synced catalog cache, so only the first startup pays
+    /// the cost and later sessions start instantly.
+    fn create(provider_name: &str) -> Result<Self, Error> {
+        let database = CodexDatabase::path()?;
+        let base = database
+            .0
+            .parent()
+            .ok_or_else(|| {
+                Error::Initialization("cannot locate the cc-switch data directory".to_owned())
+            })?
+            .join("channel-codex-homes");
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&provider_name, &mut hasher);
+        let path = base.join(format!("{:016x}", std::hash::Hasher::finish(&hasher)));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
-        Err(Error::Initialization(
-            "failed to allocate a temporary Codex home".to_owned(),
-        ))
+        std::fs::create_dir_all(&path).map_err(|error| {
+            Error::Initialization(format!(
+                "failed to create the Codex home {}: {error}",
+                path.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&*path, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    Error::Initialization(format!(
+                        "failed to restrict the Codex home {}: {error}",
+                        path.display()
+                    ))
+                },
+            )?;
+        }
+        // Codex rejects CODEX_HOME values containing 8.3 short path
+        // components (e.g. FAWDLS~1), so hand it the canonical long path.
+        let canonical = std::fs::canonicalize(&path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        let canonical = canonical
+            .strip_prefix(r"\\?\")
+            .map(str::to_owned)
+            .unwrap_or(canonical);
+        Ok(Self {
+            path: std::sync::Arc::new(PathBuf::from(canonical)),
+        })
     }
 
     fn write(&self, provider: &ResolvedProvider, upstream: &str) -> Result<(), Error> {
@@ -282,18 +290,8 @@ impl TempCodexHome {
     }
 }
 
-impl Drop for TempCodexHome {
-    fn drop(&mut self) {
-        // Clones share the directory (e.g. the relay branch moves a clone
-        // into a blocking task); only the last owner removes it.
-        if std::sync::Arc::strong_count(&self.path) == 1 {
-            let _ = std::fs::remove_dir_all(&*self.path);
-        }
-    }
-}
-
 pub(crate) struct CodexResources {
-    codex_home: TempCodexHome,
+    codex_home: CodexHome,
     #[allow(dead_code)]
     provider: ResolvedProvider,
     #[allow(dead_code)]
@@ -321,11 +319,11 @@ impl CodexResources {
         }
         let database = CodexDatabase::path()?;
         let provider_name = provider_name.to_owned();
-        let provider =
-            tokio::task::spawn_blocking(move || database.resolve_provider(&provider_name))
-                .await
-                .map_err(|error| Error::Initialization(error.to_string()))??;
-        let codex_home = TempCodexHome::create()?;
+        let key_for_db = provider_name.clone();
+        let provider = tokio::task::spawn_blocking(move || database.resolve_provider(&key_for_db))
+            .await
+            .map_err(|error| Error::Initialization(error.to_string()))??;
+        let codex_home = CodexHome::create(&provider_name)?;
         let relay = if provider.api_format == DEFAULT_API_FORMAT {
             codex_home.write(&provider, &provider.base_url)?;
             None
@@ -385,7 +383,9 @@ impl Relay {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(3))
-            .timeout(std::time::Duration::from_secs(60))
+            // 上游按非流式整段生成（推理模型一轮可能超过一分钟），总超时必须覆盖完整生成；
+            // 健康请求被中途掐断后 codex 会全量重试，白烧上游额度。
+            .timeout(std::time::Duration::from_secs(180))
             .build()
             .map_err(|error| {
                 Error::Initialization(format!("failed to create relay client: {error}"))

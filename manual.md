@@ -89,3 +89,31 @@ CLI 每回合启动一次进程，从 stdout 读取按行分隔的输出。普�
 ## 8. 错误处理
 
 初始化失败通常是可执行文件、工作目录、endpoint 或协议握手问题。会话期错误集中在 `Error`：`InvalidConfig` 表示配置不可执行，`Busy` 表示上一回合未结束，`NoActiveTurn` 表示尚未开始回合，`ProtocolError`、`ProcessExited`、`Backend` 表示后端通信或进程异常。调用方应把回合失败和会话失败区分开：单个回合失败后可重建或换配置，回合结果用 `result()` 查询；`Closed` 后不能再发送，`wait_event()` 返回 `Ok(None)`。
+
+## 9. 大模型调用（可选 feature）
+
+除接入 coding harness 外，channel 还提供直接调用大模型 HTTP 协议的客户端。这部分由 cargo feature `llm` 按需启用，启用后会引入 `potato` 作为 HTTP 传输层：
+
+- `llm`：启用全部四个直连大模型协议客户端——`ChatCompletionsClient` 与 `OpenAISender`（OpenAI Chat Completions，`POST {base_url}/chat/completions`）、`ResponsesClient`（OpenAI Responses，`POST {base_url}/responses`）、`MessagesClient` 与 `AnthropicSender`（Anthropic Messages，`POST {base_url}/messages`）、`OllamaClient` 与 `OllamaSender`（Ollama chat，`POST {base_url}/api/chat`，模型列表 `GET {base_url}/api/tags`）。
+
+四种客户端共享同一套会话模型：`new(base_url, api_key)` 创建（内部复用一条 potato 连接），`set_system_prompt` 注入系统提示词，`set_model` 在端点列出模型并校验（anthropic 无模型列表接口，直接记录），`set_reasoning_effort` 设置推理强度（复用 `ReasoningEffort`），`messages`/`set_messages` 读写历史（覆盖时保留已有 System 条目）。发送消息有两种方式：
+
+- `chat(message)` 非流式：请求一次、解析完整回复并追加到历史。
+- `chat_stream(message)` 流式：发起流式请求并返回 `mpsc::Receiver<StreamChunk>`；后台任务按协议解析增量，实时更新历史末尾的 assistant 消息。`StreamChunk` 为 `Content`（增量文本）、`Error`（协议报错，随后仍会收到 `Done`）与 `Done`（流结束）。
+
+序列化：`serialize()`/`deserialize()` 把协议标识、`base_url`、`api_key`、模型、历史与推理强度保存为 JSON 并恢复；反序列化会校验协议标识是否匹配当前客户端类型。
+
+Ollama 与其余三种协议的差异：请求头只有 `Content-Type: application/json`（Ollama 不做鉴权，`api_key` 参数仅为接口统一保留、不发送）；system 提示词不平摊到顶层字段，而是作为普通 `system` 消息留在 `messages` 数组内；`set_reasoning_effort` 只保存在客户端状态里、不写入请求。流式响应是 NDJSON（每行一个 JSON、以 `\n` 分隔，而非 SSE 的空行分隔事件块）：每行取 `message.content` 作为增量，`done == true` 的行结束流，含 `error` 字段的行报 `StreamChunk::Error`；后台任务按行切分，一行被网络分块截断时会先拼接再解析。
+
+服务端方向：`OpenAISender` 与 `AnthropicSender` 用与协议一致的 SSE 帧格式发射服务端流（`new` 返回发送器与 `potato::HttpResponse`，`send` 发增量，`send_finish` 发收尾帧），适合在 potato 服务器上把自有数据伪装成 OpenAI/Anthropic 流式接口。`OllamaSender` 与之同理但发射 NDJSON：响应的 `Content-Type` 为 `application/x-ndjson`，`send` 发 `done: false` 帧（`created_at` 为 RFC 3339 UTC 时间戳），`send_finish` 发 `done: true` 且 `done_reason: "stop"` 的收尾帧，每帧以换行结束。
+
+错误映射沿用统一的 `Error`：非 200 响应为 `ProviderRejected("HTTP {code}: {body}")`，JSON 或线格式解析失败为 `ProtocolError`，连接与传输失败为 `Backend`，未设置模型为 `InvalidConfig`，anthropic 模型列表为 `UnsupportedCapability`。
+
+启用方式示例：
+
+```toml
+[dependencies]
+channel = { version = "0.3", features = ["llm"] }
+```
+
+未启用 `llm` feature 时，channel 完全不依赖 potato，`llm` 模块不参与编译。
