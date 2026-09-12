@@ -17,8 +17,11 @@
   并附带四种大模型直连 HTTP 协议客户端（可选本地推理/本地服务端）与
   桌面感知 harness（原 charness crate 并入）。库形态供宿主内嵌，服务
   形态经 `harness` bin（JSON-lines 协议）子进程拉起。
-- 【AI 演绎】crate 元数据：`channel` 0.3.4（edition 2021，rust 1.85），
-  MIT，仓库 github.com/fawdlstty/channel。
+- 【AI 演绎】crate 元数据：`channel` 0.3.5（edition 2021，rust 1.88），
+  MIT，仓库 github.com/fawdlstty/channel。【用户要求，2026-09-13】
+  rust-version 1.85 → 1.88：potato 0.4.1 硬依赖 time ^0.3.55 /
+  jsonwebtoken ^11（MSRV 1.88），且用户明确不降 potato 版本，CI 的
+  Linux MSRV 档同步升至 1.88。
 
 ## 2. 总体结构
 
@@ -101,10 +104,11 @@
   覆盖内置 llama.cpp（llama-cpp-2 0.1.156）支持的全部架构（约 140 种：
   llama/llama4、qwen2/qwen3 含 MoE/VL 变体、gemma 系、phi2/phi3、
   deepseek 系、GLM 系、mistral3/mistral4、gpt-oss 等）。
-- 【用户要求 F，2026-09-12】新增聚合 feature：`local-safetensors-all`
-  启用 safetensors 系全部标签（cpu/cuda/metal），`local-gguf-all` 启用
-  gguf 系全部标签（cpu/cuda/metal/vulkan），`all` 启用本 crate 全部
-  features（llm、switch、两个 `-all` 聚合、harness）。
+- 【用户要求 F，2026-09-12；2026-09-13 用户要求改名为 full】聚合
+  feature：`local-safetensors-full` 启用 safetensors 系全部标签
+  （cpu/cuda/metal），`local-gguf-full` 启用 gguf 系全部标签
+  （cpu/cuda/metal/vulkan），`full` 启用本 crate 全部 features
+  （llm、switch、两个 `-full` 聚合、harness）。
 
 ### 3.6 桌面感知 harness（feature `harness`；v1.15 瘦身，用户要求 U）
 

@@ -2,7 +2,7 @@
 name = "channel"
 version = "0.3.5"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/fawdlstty/channel"
 homepage = "https://github.com/fawdlstty/channel"
@@ -129,11 +129,11 @@ local-gguf-cpu = ["local-safetensors-cpu", "dep:llama-cpp-2"]
 local-gguf-cuda = ["local-gguf-cpu", "llama-cpp-2/cuda"]
 local-gguf-metal = ["local-gguf-cpu", "llama-cpp-2/metal"]
 local-gguf-vulkan = ["local-gguf-cpu", "llama-cpp-2/vulkan"]
-# Aggregates: `local-<format>-all` turns on every backend of that weight
-# format (CPU baseline included); `all` turns on every feature of this crate.
-local-safetensors-all = ["local-safetensors-cpu", "local-safetensors-cuda", "local-safetensors-metal"]
-local-gguf-all = ["local-gguf-cpu", "local-gguf-cuda", "local-gguf-metal", "local-gguf-vulkan"]
-all = ["llm", "ccswitch", "local-safetensors-all", "local-gguf-all", "harness"]
+# Aggregates: `local-<format>-full` turns on every backend of that weight
+# format (CPU baseline included); `full` turns on every feature of this crate.
+local-safetensors-full = ["local-safetensors-cpu", "local-safetensors-cuda", "local-safetensors-metal"]
+local-gguf-full = ["local-gguf-cpu", "local-gguf-cuda", "local-gguf-metal", "local-gguf-vulkan"]
+full = ["llm", "ccswitch", "local-safetensors-full", "local-gguf-full", "harness"]
 # Desktop-sensing harness (folded in from the former `charness` crate):
 # UIA/AT-SPI control-tree awareness, association graph, read-only atomic
 # tools, JSON-lines service, store with redaction hooks. v1.15 (user request

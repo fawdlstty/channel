@@ -86,8 +86,8 @@ server.serve().await?;
 | `local-safetensors-cuda` / `local-safetensors-metal` | GPU support for the candle backend |
 | `local-gguf-cpu` | llama.cpp backend for GGUF models (implies `local-safetensors-cpu`) |
 | `local-gguf-cuda` / `local-gguf-metal` / `local-gguf-vulkan` | CUDA / Metal / Vulkan offload for the llama.cpp backend |
-| `local-safetensors-all` / `local-gguf-all` | Every backend of the safetensors / GGUF family respectively |
-| `all` | Every feature of this crate |
+| `local-safetensors-full` / `local-gguf-full` | Every backend of the safetensors / GGUF family respectively |
+| `full` | Every feature of this crate |
 | `harness` | Desktop-sensing harness: UIA/AT-SPI control-tree awareness, screen capture, actuation tools, JSON-lines service — every platform integration compiles in; the runtime environment picks the active one |
 
 ## Examples

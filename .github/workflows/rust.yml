@@ -20,7 +20,9 @@ env:
 #   switch + harness（X11/AT-SPI/portal/uinput 随 harness 全量编译）；
 #   dbus-run-session 提供 session bus 供 AT-SPI 集成测试自举（无 DISPLAY
 #   时 GTK 演示窗起不来，测试优雅 skip）。
-# - Linux MSRV 档（1.85）：最小语言版本守护（crate rust-version）。
+# - Linux MSRV 档（1.88）：最小语言版本守护（crate rust-version）。1.85 →
+#   1.88：potato 0.4.1 硬依赖 time ^0.3.55 / jsonwebtoken ^11（MSRV 1.88），
+#   1.85 无法满足，1.88 成为实际编译下限。
 # - Windows 档：cfg(windows) 全模块（uia/sendinput/screen + 事件直录
 #   win_event_hook/uia_events）真实 MSVC 编译与单测；真实桌面冒烟保持
 #   #[ignore]；并用 x86_64-unknown-linux-gnu 交叉 check 做平台隔离哨兵
@@ -48,8 +50,8 @@ jobs:
           - name: no-default-features
             toolchain: stable
             flags: --no-default-features
-          - name: msrv-1.85-default
-            toolchain: "1.85"
+          - name: msrv-1.88-default
+            toolchain: "1.88"
             flags: ""
     steps:
     - uses: actions/checkout@v4
