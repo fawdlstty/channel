@@ -1,16 +1,16 @@
 //! Integration tests for the local-model client. They only run when the
-//! `local` feature is compiled in and `CHANNEL_LOCAL_TEST_MODEL` points at
-//! a model file or directory on disk (CI never downloads models):
+//! `local-safetensors-cpu` feature is compiled in and `CHANNEL_LOCAL_TEST_MODEL`
+//! points at a model file or directory on disk (CI never downloads models):
 //!
 //! ```text
-//! CHANNEL_LOCAL_TEST_MODEL=./Qwen3-0.6B cargo test --features local --test local_model
-//! CHANNEL_LOCAL_TEST_MODEL=model-q4_k_m.gguf cargo test --features local,local-gguf --test local_model
+//! CHANNEL_LOCAL_TEST_MODEL=./Qwen3-0.6B cargo test --features local-safetensors-cpu --test local_model
+//! CHANNEL_LOCAL_TEST_MODEL=model-q4_k_m.gguf cargo test --features local-gguf-cpu --test local_model
 //! ```
 //!
-//! GGUF paths without the `local-gguf` feature assert the feature-missing
+//! GGUF paths without the `local-gguf-cpu` feature assert the feature-missing
 //! error instead of running inference.
 
-#![cfg(feature = "local")]
+#![cfg(feature = "local-safetensors-cpu")]
 
 use channel::{Error, GenerationParams, LocalBackendKind, LocalClient};
 
@@ -48,7 +48,7 @@ async fn loads_generates_and_survives_cancel_and_reload() {
     };
 
     // GGUF without the llama.cpp backend must fail with a feature hint.
-    if is_gguf(&path) && !cfg!(feature = "local-gguf") {
+    if is_gguf(&path) && !cfg!(feature = "local-gguf-cpu") {
         let error = LocalClient::load(&path).await.unwrap_err();
         assert!(
             matches!(error, Error::UnsupportedCapability(ref message) if message.contains("local-gguf")),
@@ -146,7 +146,7 @@ async fn streaming_emits_content_then_done() {
         eprintln!("skipped: CHANNEL_LOCAL_TEST_MODEL is not set");
         return;
     };
-    if is_gguf(&path) && !cfg!(feature = "local-gguf") {
+    if is_gguf(&path) && !cfg!(feature = "local-gguf-cpu") {
         return;
     }
     let mut client = loaded_client(&path).await;
@@ -179,7 +179,7 @@ async fn concurrent_generation_reports_busy() {
         eprintln!("skipped: CHANNEL_LOCAL_TEST_MODEL is not set");
         return;
     };
-    if is_gguf(&path) && !cfg!(feature = "local-gguf") {
+    if is_gguf(&path) && !cfg!(feature = "local-gguf-cpu") {
         return;
     }
     let mut client = loaded_client(&path).await;
@@ -215,3 +215,4 @@ async fn concurrent_generation_reports_busy() {
     }
     panic!("the busy flag was never released");
 }
+

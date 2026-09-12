@@ -50,9 +50,14 @@ while let Some(chunk) = receiver.recv().await {
 }
 ```
 
-## Run models locally in-process (`local`, `local-gguf`)
+## Run models locally in-process (`local-safetensors-cpu`, `local-gguf-cpu`)
 
-`LocalClient::load` runs a model straight from disk with no server in between: a **safetensors** model directory goes through the pure-Rust candle backend, and a **GGUF** file goes through the llama.cpp backend (opt-in `local-gguf`, needs cmake and a C++ toolchain). Load options cover context size, thread count, GPU layer offload and chat-template overrides; generation parameters cover temperature, top-p/top-k, repetition penalty, stop sequences and more. The conversation API is identical to the HTTP clients.
+`LocalClient::load` runs a model straight from disk with no server in between: a **safetensors** model directory goes through the pure-Rust candle backend, and a **GGUF** file goes through the llama.cpp backend (opt-in `local-gguf-cpu`, needs cmake and a C++ toolchain). Load options cover context size, thread count, GPU layer offload and chat-template overrides; generation parameters cover temperature, top-p/top-k, repetition penalty, stop sequences and more. The conversation API is identical to the HTTP clients.
+
+**Supported model architectures**
+
+- **safetensors** (candle backend): a fixed whitelist — `config.json` `model_type` must be `llama`, `qwen2`, `qwen3`, `phi3`, or `gemma` (via candle-transformers 0.11); other architectures are rejected with a hint to use GGUF instead.
+- **GGUF** (llama.cpp backend): no whitelist of its own — every architecture the bundled llama.cpp (llama-cpp-2 0.1.156) supports loads directly, around 140 in total: llama/llama4, qwen2/qwen3 (incl. MoE and VL variants), gemma/gemma2/gemma3/gemma3n, phi2/phi3, the deepseek and GLM families, mistral3/mistral4, gpt-oss, smollm3, nemotron, and more.
 
 ```rust
 let mut client = channel::LocalClient::load("./Qwen3-0.6B").await?;
@@ -60,7 +65,7 @@ client.set_system_prompt("You are a concise assistant.");
 let reply = client.chat("Explain what an SSE stream is.").await?;
 ```
 
-## Serve local models over HTTP (`local-server`)
+## Serve local models over HTTP (ships with `local-safetensors-cpu`)
 
 `LocalLlmServer` mounts one or more local models and exposes them on the standard protocol endpoints — `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`, `POST /api/chat`, `GET /api/tags` — so **any OpenAI-, Anthropic- or Ollama-compatible client**, including channel's own protocol clients, can talk to a local model. Bearer-token auth is optional.
 
@@ -75,12 +80,15 @@ server.serve().await?;
 | Feature | Enables |
 |---|---|
 | *(default)* | Harness sessions only |
-| `llm` | Four direct LLM protocol clients plus server-side stream emitters (adds the `potato` HTTP stack) |
-| `local` | In-process local inference via the candle backend (safetensors, pure Rust) |
-| `local-gguf` | llama.cpp backend for GGUF models (implies `local`) |
-| `local-server` | HTTP protocol endpoints for local models (implies `local`) |
-| `local-cuda` / `local-metal` / `local-vulkan` | GPU offload for the llama.cpp backend |
-| `local-candle-cuda` / `local-candle-metal` | GPU support for the candle backend |
+| `llm` | Four direct LLM protocol clients plus server-side stream emitters |
+| `ccswitch` | cc-switch provider switching (SQLite config db + TOML config + local upstream proxy) |
+| `local-safetensors-cpu` | In-process local inference via the candle backend (safetensors, pure Rust), plus the local-model HTTP server |
+| `local-safetensors-cuda` / `local-safetensors-metal` | GPU support for the candle backend |
+| `local-gguf-cpu` | llama.cpp backend for GGUF models (implies `local-safetensors-cpu`) |
+| `local-gguf-cuda` / `local-gguf-metal` / `local-gguf-vulkan` | CUDA / Metal / Vulkan offload for the llama.cpp backend |
+| `local-safetensors-all` / `local-gguf-all` | Every backend of the safetensors / GGUF family respectively |
+| `all` | Every feature of this crate |
+| `harness` | Desktop-sensing harness: UIA/AT-SPI control-tree awareness, screen capture, actuation tools, JSON-lines service — every platform integration compiles in; the runtime environment picks the active one |
 
 ## Examples
 
@@ -88,8 +96,8 @@ server.serve().await?;
 |---|---|---|
 | [basic.rs](examples/basic.rs) | `cargo run --example basic` | harness session |
 | [llm_chat.rs](examples/llm_chat.rs) | `cargo run --features llm --example llm_chat` | direct LLM call |
-| [local_chat.rs](examples/local_chat.rs) | `cargo run --features local --example local_chat -- ./Qwen3-0.6B` | local model |
-| [local_server.rs](examples/local_server.rs) | `cargo run --features local-server,local-gguf --example local_server -- ./Qwen3-0.6B` | local model server |
+| [local_chat.rs](examples/local_chat.rs) | `cargo run --features local-safetensors-cpu --example local_chat -- ./Qwen3-0.6B` | local model |
+| [local_server.rs](examples/local_server.rs) | `cargo run --features local-safetensors-cpu --example local_server -- ./Qwen3-0.6B` | local model server |
 
 The detailed harness API walkthrough (in Chinese) lives in [manual.md](manual.md).
 

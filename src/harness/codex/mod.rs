@@ -4,12 +4,12 @@ use crate::protocol::{
 };
 use crate::runtime::HarnessDiscovery;
 use crate::session::{Backend, BackendFuture, PermissionResponse, SendMode};
-use crate::utils::websocket::LocalWebSocket;
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+
+// ws 传输由常驻编译的 potato 承载（HTTP + ws 客户端栈，无独立传输 feature）。
+use crate::utils::websocket::LocalWebSocket;
 
 #[cfg(windows)]
 mod windows;
@@ -19,7 +19,7 @@ const ARGS: &[&str] = &["app-server", "--stdio"];
 
 enum CodexTransport {
     Process(Box<JsonlProcess>),
-    WebSocket(Box<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>),
+    WebSocket(Box<potato::Websocket>),
 }
 
 impl CodexTransport {
@@ -31,7 +31,7 @@ impl CodexTransport {
                     Error::Backend(format!("failed to encode Codex message: {error}"))
                 })?;
                 stream
-                    .send(Message::Text(payload.into()))
+                    .send_text(&payload)
                     .await
                     .map_err(|error| {
                         Error::Backend(format!("failed to write Codex WebSocket message: {error}"))
@@ -44,23 +44,22 @@ impl CodexTransport {
         match self {
             Self::Process(process) => process.read().await,
             Self::WebSocket(stream) => loop {
-                match stream.next().await {
-                    Some(Ok(Message::Text(message))) => return message.parse_message(),
-                    Some(Ok(Message::Binary(message))) => {
+                match stream.recv().await {
+                    Ok(potato::WsFrame::Text(message)) => return message.parse_message(),
+                    Ok(potato::WsFrame::Binary(message)) => {
                         let message = std::str::from_utf8(&message).map_err(|error| {
                             Error::ProtocolError(format!("Codex WebSocket was not UTF-8: {error}"))
                         })?;
                         return message.parse_message();
                     }
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) => return Ok(None),
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => {
+                    // potato 把 Ping 自动应答、Pong 吞掉；对端 Close 帧折叠
+                    // 成固定文案的错误（自家库约定），据此归一为「会话结束」。
+                    Err(error) if error.to_string().contains("close frame") => return Ok(None),
+                    Err(error) => {
                         return Err(Error::Backend(format!(
                             "failed to read Codex WebSocket message: {error}"
                         )));
                     }
-                    None => return Ok(None),
                 }
             },
         }
@@ -70,12 +69,26 @@ impl CodexTransport {
         match self {
             Self::Process(process) => process.close(grace).await,
             Self::WebSocket(stream) => {
-                let _ = stream.send(Message::Close(None)).await;
-                stream.flush().await.map_err(|error| {
-                    Error::Backend(format!("failed to close Codex WebSocket: {error}"))
-                })
+                // send_close 内部写完即落 socket；连接已断时的错误无意义，忽略。
+                let _ = stream.send_close().await;
+                Ok(())
             }
         }
+    }
+
+    /// ws endpoint 连接（potato 客户端自带握手与 Sec-WebSocket-Key 生成；
+    /// 归一化后的端点恒为本地 loopback ws://，明文即可）。
+    async fn connect_websocket(endpoint: &str) -> Result<CodexTransport, Error> {
+        let endpoint = endpoint
+            .normalize_local_websocket()
+            .map_err(Error::InvalidConfig)?;
+        let ws = tokio::time::timeout(Duration::from_secs(3), potato::Websocket::connect(&endpoint, vec![]))
+            .await
+            .map_err(|_| {
+                Error::Initialization("timed out connecting to the local Codex endpoint".to_owned())
+            })?
+            .map_err(|error| Error::Initialization(format!("failed to connect to Codex: {error}")))?;
+        Ok(CodexTransport::WebSocket(Box::new(ws)))
     }
 }
 
@@ -140,9 +153,7 @@ impl CodexBackend {
             .as_ref()
             .map(crate::switch::PreparedResources::env);
         let transport = if let Some(endpoint) = endpoint {
-            CodexTransport::WebSocket(Box::new(
-                CodexTransport::connect_websocket(&endpoint).await?,
-            ))
+            CodexTransport::connect_websocket(&endpoint).await?
         } else {
             CodexTransport::Process(Box::new(
                 JsonlProcess::spawn_with_cwd_and_env(
@@ -678,29 +689,11 @@ impl CodexTransport {
         endpoint: Option<&str>,
     ) -> Result<Self, Error> {
         if let Some(endpoint) = endpoint {
-            return Ok(Self::WebSocket(Box::new(
-                Self::connect_websocket(endpoint).await?,
-            )));
+            return Ok(Self::connect_websocket(endpoint).await?);
         }
         Ok(Self::Process(Box::new(
             JsonlProcess::spawn_with_cwd(command, args, cwd).await?,
         )))
-    }
-
-    async fn connect_websocket(
-        endpoint: &str,
-    ) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Error> {
-        let endpoint = endpoint
-            .normalize_local_websocket()
-            .map_err(Error::InvalidConfig)?;
-        let stream = tokio::time::timeout(Duration::from_secs(3), connect_async(endpoint))
-            .await
-            .map_err(|_| {
-                Error::Initialization("timed out connecting to the local Codex endpoint".to_owned())
-            })?
-            .map_err(|error| Error::Initialization(format!("failed to connect to Codex: {error}")))?
-            .0;
-        Ok(stream)
     }
 
     async fn read_response(&mut self, request_id: u64, method: &str) -> Result<Value, Error> {

@@ -1,5 +1,5 @@
-//! Exposes local models through the four protocol HTTP endpoints
-//! (`local-server` feature).
+//! Exposes local models through the four protocol HTTP endpoints (ships
+//! with the `local-safetensors-cpu` feature family).
 //!
 //! [`LocalLlmServer`] mounts one or more [`LocalClient`] models and serves
 //! OpenAI Chat Completions, OpenAI Responses, Anthropic Messages and Ollama

@@ -1,0 +1,206 @@
+{
+  "notes": [
+    "harness 契约 golden fixtures（design.md §14/§22.5；双轨对齐）：",
+    "harness 侧 cargo test 断言 serde 往返（harness/tests/golden_contract.rs），",
+    "app 侧 vitest 断言 zod 解析（app/common/harness.test.ts 读取本文件）。",
+    "双侧字段名/字面量漂移即测试红。修改本文件必须同步两侧测试与契约。",
+    "节点 id 形态：proc:<name> / win:<handle> / ctrl:<指纹hex> / step:<stepId>。",
+    "recordEventUi/recordEventBrowser（upgrade.md §4.2 统一录制事件模型）：",
+    "camelCase 键；firstText/edits 仅合帧后出现（§4.4）；source 字面量",
+    "cdp|uia|atspi；事件行外层键 cdp→browser、uia/atspi→ui。",
+    "errorCodeSample：serve 错误响应的 code 键形态（仅平台/能力级错误携带）。",
+    "relocation（upgrade.md §9.3）：relocate_control 出参 Relocation 形态——",
+    "control 为 SceneNode→ControlRef 形态（句柄/窗口/矩形未知记 0/空/默认，",
+    "path 缺席）；LLM 响应经结构化解析后出参，响应原文不进契约。"
+  ],
+  "controlRef": {
+    "handle": 197296,
+    "controlType": "Button",
+    "name": "提交",
+    "automationId": "SubmitBtn",
+    "className": "Button",
+    "windowTitle": "报销单.xlsx - Excel",
+    "processName": "excel.exe",
+    "rect": { "x": 480.0, "y": 360.0, "width": 88.0, "height": 28.0 },
+    "enabled": true,
+    "path": "Window[报销单.xlsx - Excel]/Pane[表单]/Button[提交]"
+  },
+  "controlRefMinimal": {
+    "handle": 0,
+    "controlType": "Edit",
+    "name": "",
+    "automationId": "",
+    "className": "",
+    "windowTitle": "",
+    "processName": "",
+    "rect": { "x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0 }
+  },
+  "uiAssociations": [
+    { "from": "ctrl:2d494e29185491d2", "to": "win:197296", "kind": "child-of" },
+    { "from": "ctrl:19fb1c68b7a44002", "to": "ctrl:2d494e29185491d2", "kind": "label-for" },
+    { "from": "win:197296", "to": "win:197297", "kind": "dialog-of" },
+    { "from": "ctrl:2d494e29185491d2", "to": "ctrl:19fb1c68b7a44003", "kind": "focus-chain" },
+    { "from": "step:step-1", "to": "ctrl:2d494e29185491d2", "kind": "step-acted-on" }
+  ],
+  "sceneSnapshot": {
+    "at": 1786000000000,
+    "window": {
+      "handle": 197296,
+      "controlType": "Window",
+      "name": "报销单.xlsx - Excel",
+      "automationId": "Excel7",
+      "className": "XLMAIN",
+      "windowTitle": "报销单.xlsx - Excel",
+      "processName": "excel.exe",
+      "rect": { "x": 0.0, "y": 0.0, "width": 1280.0, "height": 720.0 },
+      "enabled": true
+    },
+    "targetControl": {
+      "handle": 197296,
+      "controlType": "Button",
+      "name": "提交",
+      "automationId": "SubmitBtn",
+      "className": "Button",
+      "windowTitle": "报销单.xlsx - Excel",
+      "processName": "excel.exe",
+      "rect": { "x": 480.0, "y": 360.0, "width": 88.0, "height": 28.0 },
+      "enabled": false,
+      "path": "Window[报销单.xlsx - Excel]/Pane[表单]/Button[提交]"
+    },
+    "treePruned": [
+      { "path": "0", "controlType": "Pane", "name": "表单", "className": "Pane", "enabled": true },
+      {
+        "path": "0/2",
+        "controlType": "Button",
+        "name": "提交",
+        "automationId": "SubmitBtn",
+        "className": "Button",
+        "enabled": false
+      }
+    ],
+    "dialogs": [
+      {
+        "handle": 197297,
+        "controlType": "Window",
+        "name": "提交失败",
+        "automationId": "",
+        "className": "#32770",
+        "windowTitle": "提交失败",
+        "processName": "excel.exe",
+        "rect": { "x": 400.0, "y": 300.0, "width": 320.0, "height": 160.0 }
+      }
+    ],
+    "screenshots": ["frames/scene-0001.png"]
+  },
+  "controlGraph": {
+    "version": 1,
+    "sessionId": "20260907-000000-deadbeef",
+    "processes": [{ "id": "proc:excel.exe", "name": "excel.exe" }],
+    "windows": [
+      {
+        "id": "win:197296",
+        "handle": 197296,
+        "title": "报销单.xlsx - Excel",
+        "processId": "proc:excel.exe"
+      }
+    ],
+    "controls": [
+      {
+        "id": "ctrl:2d494e29185491d2",
+        "control": {
+          "handle": 197296,
+          "controlType": "Button",
+          "name": "提交",
+          "automationId": "SubmitBtn",
+          "className": "Button",
+          "windowTitle": "报销单.xlsx - Excel",
+          "processName": "excel.exe",
+          "rect": { "x": 480.0, "y": 360.0, "width": 88.0, "height": 28.0 },
+          "enabled": true,
+          "path": "Window[报销单.xlsx - Excel]/Pane[表单]/Button[提交]"
+        },
+        "eventSeqs": [8]
+      }
+    ],
+    "associations": [
+      { "from": "ctrl:2d494e29185491d2", "to": "win:197296", "kind": "child-of" },
+      { "from": "win:197296", "to": "proc:excel.exe", "kind": "child-of" },
+      { "from": "step:step-1", "to": "ctrl:2d494e29185491d2", "kind": "step-acted-on" }
+    ]
+  },
+  "recordEventUi": {
+    "ts": 1786000000420,
+    "seq": 42,
+    "source": "uia",
+    "kind": "value-change",
+    "window": {
+      "handle": 197296,
+      "controlType": "Window",
+      "name": "报销单 - 记事本",
+      "automationId": "",
+      "className": "Notepad",
+      "windowTitle": "报销单 - 记事本",
+      "processName": "notepad.exe",
+      "rect": { "x": 0.0, "y": 0.0, "width": 1280.0, "height": 720.0 },
+      "enabled": true
+    },
+    "element": {
+      "handle": 197301,
+      "controlType": "Edit",
+      "name": "备注",
+      "automationId": "edit.1001",
+      "className": "Edit",
+      "windowTitle": "报销单 - 记事本",
+      "processName": "notepad.exe",
+      "rect": { "x": 10.0, "y": 100.0, "width": 300.0, "height": 24.0 },
+      "enabled": true,
+      "path": "Window[报销单 - 记事本]/Pane[表单]/Edit[备注]"
+    },
+    "text": "报销单-2026-09 已提交",
+    "firstText": "报销",
+    "edits": 3
+  },
+  "recordEventBrowser": {
+    "ts": 1786000000512,
+    "seq": 43,
+    "source": "cdp",
+    "kind": "click",
+    "url": "https://example.com/expense/submit",
+    "frame": "main",
+    "element": {
+      "handle": 0,
+      "controlType": "Button",
+      "name": "提交",
+      "automationId": "submit-btn",
+      "className": "btn primary",
+      "windowTitle": "报销系统",
+      "processName": "chrome",
+      "rect": { "x": 120.5, "y": 88.0, "width": 72.0, "height": 28.0 },
+      "path": "html>body>div#app>form>button:nth-of-type(2)"
+    },
+    "selector": { "css": "#submit-btn", "text": "提交" }
+  },
+  "errorCodeSample": {
+    "id": 9,
+    "ok": false,
+    "error": "操作类工具未授权：需以 harness --actuation 启动（或环境变量 HARNESS_ACTUATION=1）",
+    "code": "actuation-locked"
+  },
+  "relocation": {
+    "control": {
+      "handle": 0,
+      "controlType": "Button",
+      "name": "提交",
+      "automationId": "SubmitBtn",
+      "className": "Button",
+      "windowTitle": "",
+      "processName": "",
+      "rect": { "x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0 },
+      "enabled": false
+    },
+    "confidence": 0.875,
+    "reason": "名称与 automationId 双匹配"
+  }
+}
+
+

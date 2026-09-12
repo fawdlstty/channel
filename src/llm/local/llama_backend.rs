@@ -1,10 +1,10 @@
-//! The GGUF backend: llama.cpp via llama-cpp-2 (opt-in `local-gguf`).
+//! The GGUF backend: llama.cpp via llama-cpp-2 (opt-in `local-gguf-cpu`).
 //!
 //! `LlamaContext` is `!Send`, so the engine lives exclusively on the actor
 //! thread. Loading happens on a blocking thread and the loaded engine is
 //! then moved to the actor.
 
-#[cfg(feature = "local-gguf")]
+#[cfg(feature = "local-gguf-cpu")]
 mod enabled {
     use super::super::engine::{GenerateFinish, LocalEngine};
     use super::super::{
@@ -397,10 +397,10 @@ mod enabled {
     }
 }
 
-#[cfg(feature = "local-gguf")]
+#[cfg(feature = "local-gguf-cpu")]
 pub(crate) use enabled::{load_boot, LlamaEngine};
 
-#[cfg(all(test, feature = "local-gguf"))]
+#[cfg(all(test, feature = "local-gguf-cpu"))]
 mod tests {
     use super::enabled::quantization_from_filename;
     use std::path::Path;
@@ -427,19 +427,19 @@ mod tests {
     }
 }
 
-#[cfg(not(feature = "local-gguf"))]
+#[cfg(not(feature = "local-gguf-cpu"))]
 use super::{EngineBoot, LoadOptions};
 
 /// Placeholder backend: produces the feature-missing error when GGUF
 /// support was compiled out.
-#[cfg(not(feature = "local-gguf"))]
+#[cfg(not(feature = "local-gguf-cpu"))]
 pub(crate) fn load_boot(
     _gguf_path: &std::path::Path,
     _original_path: &std::path::Path,
     _options: &LoadOptions,
 ) -> Result<EngineBoot, crate::protocol::Error> {
     Err(crate::protocol::Error::UnsupportedCapability(
-        "GGUF models run on llama.cpp, which is not compiled in: enable the `local-gguf` \
+        "GGUF models run on llama.cpp, which is not compiled in: enable the `local-gguf-cpu` \
          feature (requires cmake and a C++ toolchain)"
             .to_owned(),
     ))

@@ -1,6 +1,6 @@
 [package]
 name = "channel"
-version = "0.3.3"
+version = "0.3.5"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -23,26 +23,99 @@ minijinja = { version = "2", optional = true }
 # Python-compat string/list methods (`split`, `strip`, ...) used by many
 # Hugging Face chat templates.
 minijinja-contrib = { version = "2", optional = true, default-features = false, features = ["pycompat"] }
-potato = { version = "0.4.0", optional = true, default-features = false, features = [
-    "std",
-    "tls",
-], path = "../potato/potato" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+# cc-switch switching only (`ccswitch` feature): provider config stored in a
+# SQLite database, read through the ormer ORM (turso backend, pure Rust —
+# default builds stay free of any C toolchain requirement).
+ormer = { version = "0.2.12", optional = true, default-features = false, features = ["sqlite"] }
+# std: base HTTP stack; tls: upstream HTTPS (rustls); websocket: RFC 6455
+# client handshake + frames (anyhow/sha1 already pulled by std, near-zero cost).
+# 0.4.1: exposes the lite WebsocketIo client (wslite) on std builds.
+# Always compiled: the HTTP/ws transport underpins `llm`/`switch`/the local
+# model server and the Codex ws endpoint alike (no separate transport feature).
+potato = { version = "0.4.1", default-features = false, features = ["std", "tls", "websocket"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = { version = "2", optional = true }
 tokenizers = { version = "0.23.2", optional = true, default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
-tokio-tungstenite = "0.28"
-toml = "1"
+# cc-switch switching only (`ccswitch` feature): TOML config file parsing.
+toml = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
+# Only consumed by the `harness` bin (src/bin/harness.rs): logs go to stderr
+# (stdout is the JSON-lines protocol channel); no ansi or other extras.
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
 
+# --- harness feature: Linux target dependencies (all pure Rust, no libX11
+# --- / libdbus hard links; all compiled in with `harness`, which one is used
+# --- is decided by runtime environment probing) -------------------------------
+[target.'cfg(target_os = "linux")'.dependencies]
+# Direct X11 protocol connection (screen capture GetImage / XTest injection;
+# XWayland/WSLg/VcXsrv all take the same path). features=["xtest"]: x11rb
+# trims extension protocol modules by feature; XTEST injection needs it on
+# explicitly (still pure Rust; default features carry no extensions).
+x11rb = { version = "0.13", optional = true, features = ["xtest"] }
+# PNG encoding (X11 screen capture output; Windows uses WIC, neither crate is
+# introduced on the other platform).
+png = { version = "0.17", optional = true }
+# AT-SPI2 awareness/events (zbus pure-Rust D-Bus). Feature surface:
+# - proxies: interface proxies (Accessible/Component/EditableText/Text/Value);
+# - connection: AccessibilityConnection (a11y bus discovery + event stream);
+# - zbus: zbus type re-exports (CacheProperties etc. used by proxy builders).
+atspi = { version = "0.28", optional = true, default-features = false, features = ["proxies", "connection", "zbus"] }
+# futures-lite: block_on/poll_once sync wrappers (AT-SPI probe; sync calls /
+# dedicated event thread block_on, no tokio pulled in).
+futures-lite = { version = "2", optional = true, default-features = false, features = ["std"] }
+# xdg-desktop-portal client (Wayland screen-cast authorization). Uses ashpd's
+# default tokio backend (zbus/tokio + minimal tokio fs/io-util surface).
+ashpd = { version = "0.12", optional = true, default-features = false, features = ["tokio"] }
+
+# UIA awareness (harness snapshot/uia.rs): same windows crate version family
+# as the Tauri app to avoid duplicate compilation of the same version range.
+# Windows targets only (non-Windows bins degrade to an unavailable probe;
+# the serve protocol layer stays testable as usual).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    # Actuation tools: SendInput keyboard/mouse injection + VK constants +
+    # clipboard paste fallback.
+    "Win32_System_DataExchange",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    # Read-only screen capture (snapshot/screen.rs): GDI BitBlt/memory DIB +
+    # WIC PNG encoding + CreateStreamOnHGlobal memory stream.
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com_StructuredStorage",
+    # bin startup declares DPI awareness: Per-Monitor V2 three-level
+    # fallback so click points / screenshot sizes are not virtualized.
+    "Win32_UI_HiDpi",
+] }
+
 [features]
 default = []
-llm = ["dep:potato"]
-local = [
+# Four direct LLM protocol clients (OpenAI Chat Completions / OpenAI Responses
+# / Anthropic Messages / Ollama) plus the server-side stream emitters. The
+# HTTP/ws transport is the always-compiled potato stack.
+llm = []
+# cc-switch provider switching: SQLite config db (via ormer) + TOML config
+# parsing; the local upstream proxy rides the always-compiled potato stack.
+# Off by default; without it `SwitchProvider` degrades to an
+# unsupported-capability error at the session layer.
+ccswitch = ["dep:ormer", "dep:toml"]
+# In-process local inference, `local-<weight format>-<backend>`: the weight
+# format implies the engine — safetensors runs on the pure-Rust candle engine,
+# GGUF on llama.cpp (needs cmake and a C++ toolchain). The candle baseline (CPU) carries the
+# shared LocalClient surface, the chat-template engine and the local-model
+# HTTP server (LocalLlmServer); the `cuda`/`metal`/`vulkan` backends only
+# switch the GPU offload of the respective inference crate.
+local-safetensors-cpu = [
     "dep:candle-core",
     "dep:candle-nn",
     "dep:candle-transformers",
@@ -50,25 +123,43 @@ local = [
     "dep:minijinja",
     "dep:minijinja-contrib",
 ]
-local-gguf = ["local", "dep:llama-cpp-2"]
-local-server = ["local", "dep:potato"]
-local-cuda = ["local-gguf", "llama-cpp-2/cuda"]
-local-metal = ["local-gguf", "llama-cpp-2/metal"]
-local-vulkan = ["local-gguf", "llama-cpp-2/vulkan"]
-local-candle-cuda = ["local", "candle-core/cuda"]
-local-candle-metal = ["local", "candle-core/metal"]
+local-safetensors-cuda = ["local-safetensors-cpu", "candle-core/cuda"]
+local-safetensors-metal = ["local-safetensors-cpu", "candle-core/metal"]
+local-gguf-cpu = ["local-safetensors-cpu", "dep:llama-cpp-2"]
+local-gguf-cuda = ["local-gguf-cpu", "llama-cpp-2/cuda"]
+local-gguf-metal = ["local-gguf-cpu", "llama-cpp-2/metal"]
+local-gguf-vulkan = ["local-gguf-cpu", "llama-cpp-2/vulkan"]
+# Aggregates: `local-<format>-all` turns on every backend of that weight
+# format (CPU baseline included); `all` turns on every feature of this crate.
+local-safetensors-all = ["local-safetensors-cpu", "local-safetensors-cuda", "local-safetensors-metal"]
+local-gguf-all = ["local-gguf-cpu", "local-gguf-cuda", "local-gguf-metal", "local-gguf-vulkan"]
+all = ["llm", "ccswitch", "local-safetensors-all", "local-gguf-all", "harness"]
+# Desktop-sensing harness (folded in from the former `charness` crate):
+# UIA/AT-SPI control-tree awareness, association graph, read-only atomic
+# tools, JSON-lines service, store with redaction hooks. v1.15 (user request
+# U): the recorder-facing capabilities (event recording `record`, CDP browser
+# `browser`, BYOK LLM bridge `llm_bridge`) moved back to the WorkRecorder
+# repo (`wr-harness-ext` crate). Every platform integration compiles in —
+# Windows UIA/SendInput/GDI+WIC, Linux X11/AT-SPI/portal/uinput — and which
+# one is used is decided by the target OS plus runtime environment probing
+# (no per-platform sub-features).
+harness = [
+    "dep:thiserror",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:windows",
+    "dep:x11rb",
+    "dep:png",
+    "dep:atspi",
+    "dep:futures-lite",
+    "dep:ashpd",
+]
 
-[[example]]
-name = "llm_chat"
-required-features = ["llm"]
+# Bins and examples rely on cargo's default discovery (`src/bin/*.rs`,
+# `examples/*.rs`). Feature-gated targets carry their gate inside the file
+# (`#[cfg(feature = ...)] fn main`), so plain `cargo build` / `cargo test`
+# with default features still compiles every target; the gated mains print
+# the enabling `--features` flag when run.
 
-[[example]]
-name = "local_chat"
-required-features = ["local"]
-
-[[example]]
-name = "local_server"
-required-features = ["local-server"]
-
-# cargo publish -p channel --allow-dirty --registry crates-io
+# cargo publish --allow-dirty --registry crates-io
 # cd docs && npm run docs:build && cd ..

@@ -153,11 +153,11 @@ fn special_token(value: &serde_json::Value) -> Option<String> {
 
 fn select_device() -> Result<Device, Error> {
     // GPU is only wired up when the corresponding forwarding feature is on.
-    #[cfg(feature = "local-candle-cuda")]
+    #[cfg(feature = "local-safetensors-cuda")]
     return Device::new_cuda(0).map_err(candle_error);
-    #[cfg(all(feature = "local-candle-metal", not(feature = "local-candle-cuda")))]
+    #[cfg(all(feature = "local-safetensors-metal", not(feature = "local-safetensors-cuda")))]
     return Device::new_metal(0).map_err(candle_error);
-    #[cfg(not(any(feature = "local-candle-cuda", feature = "local-candle-metal")))]
+    #[cfg(not(any(feature = "local-safetensors-cuda", feature = "local-safetensors-metal")))]
     Ok(Device::Cpu)
 }
 
@@ -312,7 +312,7 @@ pub(crate) fn load_boot(
             return Err(Error::UnsupportedCapability(format!(
                 "architecture '{other}' is not supported by the candle backend \
                  (supported: {SUPPORTED_ARCHITECTURES}); convert the model to GGUF and \
-                 enable the `local-gguf` feature instead"
+                 enable the `local-gguf-cpu` feature instead"
             )));
         }
     };

@@ -1,6 +1,6 @@
-//! Requires the `local-server` feature (GGUF models additionally need
-//! `local-gguf`):
-//! `cargo run --features local-server,local-gguf --example local_server -- ./Qwen3-0.6B`
+//! Requires the `local-safetensors-cpu` feature (GGUF models additionally need
+//! `local-gguf-cpu`):
+//! `cargo run --features local-safetensors-cpu --example local_server -- ./Qwen3-0.6B`
 //!
 //! Mounts every model path given on the command line (or `LOCAL_MODEL`) and
 //! serves the four protocol endpoints:
@@ -18,6 +18,15 @@
 //! - `LOCAL_SERVER_ADDR` (default `127.0.0.1:8817`)
 //! - `LOCAL_SERVER_TOKEN` (optional bearer token)
 
+#[cfg(not(feature = "local-safetensors-cpu"))]
+fn main() {
+    eprintln!(
+        "this example requires the `local-safetensors-cpu` feature: \
+         cargo run --features local-safetensors-cpu --example local_server -- ./Qwen3-0.6B"
+    );
+}
+
+#[cfg(feature = "local-safetensors-cpu")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("LOCAL_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:8817".to_owned());
@@ -41,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(_) => println!("mounted {path}"),
             Err(channel::Error::UnsupportedCapability(message)) => {
                 eprintln!("{message}");
-                eprintln!("hint: GGUF models need `--features local-gguf` (cmake + C++ toolchain)");
+                eprintln!("hint: GGUF models need `--features local-gguf-cpu` (cmake + C++ toolchain)");
                 return Ok(());
             }
             Err(error) => return Err(error.into()),

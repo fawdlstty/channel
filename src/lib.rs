@@ -1,5 +1,7 @@
-mod harness;
-#[cfg(any(feature = "llm", feature = "local", feature = "local-server"))]
+// Harness adapters (Codex/ACP/CLI) plus the opt-in desktop-sensing harness
+// (feature `harness`, former `charness` crate); see the module docs there.
+pub mod harness;
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 mod llm;
 mod process;
 mod protocol;
@@ -33,21 +35,20 @@ pub use session::{
 };
 
 // Types shared by the HTTP protocol clients (`llm`) and the local-model
-// client (`local`).
-#[cfg(any(feature = "llm", feature = "local"))]
+// client (`local-safetensors-cpu`).
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 pub use llm::{ChatMessage, LlmModelInfo, MessageRole, StreamChunk};
 // The four HTTP protocol clients; pure potato transports.
 #[cfg(feature = "llm")]
 pub use llm::{ChatCompletionsClient, MessagesClient, OllamaClient, ResponsesClient};
-// Server-side stream emitters; usable by `local-server` without `llm`.
-#[cfg(any(feature = "llm", feature = "local-server"))]
+// Server-side stream emitters; usable by the local-model server without `llm`.
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 pub use llm::{AnthropicSender, OllamaSender, OpenAISender};
-// Local-model inference (`local`).
-#[cfg(feature = "local")]
+// Local-model inference (`local-safetensors-cpu` family).
+#[cfg(feature = "local-safetensors-cpu")]
 pub use llm::{GenerationParams, LoadOptions, LocalBackendKind, LocalClient, LocalModelMeta};
-// One-click HTTP endpoints for local models (`local-server`, implies
-// `local`).
-#[cfg(feature = "local-server")]
+// One-click HTTP endpoints for local models (ships with `local-safetensors-cpu`).
+#[cfg(feature = "local-safetensors-cpu")]
 pub use llm::LocalLlmServer;
 
 /// An initialized harness handle. The resolved runtime remains private.
@@ -93,8 +94,11 @@ impl Harness {
         &self.0.available_models
     }
 
-    pub fn available_switch_providers(&self, source: SwitchProvider) -> Result<Vec<String>, Error> {
-        source.available_keys()
+    pub async fn available_switch_providers(
+        &self,
+        source: SwitchProvider,
+    ) -> Result<Vec<String>, Error> {
+        source.available_keys().await
     }
 }
 

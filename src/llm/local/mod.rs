@@ -1,7 +1,7 @@
 //! Local model loading and in-process inference.
 //!
 //! [`LocalClient`] loads a safetensors model directory (candle backend,
-//! pure Rust) or a GGUF file (llama.cpp backend, opt-in `local-gguf`)
+//! pure Rust) or a GGUF file (llama.cpp backend, opt-in `local-gguf-cpu`)
 //! straight from disk and speaks the same conversation interface as the
 //! four HTTP protocol clients: [`LocalClient::set_system_prompt`],
 //! [`LocalClient::chat`], [`LocalClient::chat_stream`],
@@ -20,8 +20,6 @@ pub(crate) mod candle_backend;
 pub(crate) mod engine;
 pub(crate) mod llama_backend;
 mod template;
-
-#[cfg(feature = "local-server")]
 pub mod server;
 
 use crate::llm::{
@@ -49,7 +47,7 @@ const GENERATION_RESERVE: u32 = 64;
 /// Which inference backend a model was dispatched to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LocalBackendKind {
-    /// llama.cpp (GGUF weights; `local-gguf` feature).
+    /// llama.cpp (GGUF weights; `local-gguf-cpu` feature family).
     #[serde(rename = "llama_cpp")]
     LlamaCpp,
     /// candle (safetensors weights; pure-Rust `local` baseline).
@@ -243,7 +241,7 @@ pub(crate) struct EngineBoot {
 
 /// The engine variant selected by the path dispatch.
 pub(crate) enum BackendEngine {
-    #[cfg(feature = "local-gguf")]
+    #[cfg(feature = "local-gguf-cpu")]
     LlamaCpp(llama_backend::LlamaEngine),
     /// Boxed: the candle engines are far larger than the llama.cpp one.
     Candle(Box<candle_backend::CandleEngine>),
@@ -255,13 +253,14 @@ impl LocalEngine for BackendEngine {
         Self: Sized,
     {
         // `dispatch_and_load` owns the feature gating for GGUF paths (it
-        // reports `UnsupportedCapability` when `local-gguf` is compiled out).
+        // reports `UnsupportedCapability` when `local-gguf-cpu` is compiled
+        // out).
         Ok(dispatch_and_load(path, options)?.engine)
     }
 
     fn meta(&self) -> LocalModelMeta {
         match self {
-            #[cfg(feature = "local-gguf")]
+            #[cfg(feature = "local-gguf-cpu")]
             BackendEngine::LlamaCpp(engine) => engine.meta(),
             BackendEngine::Candle(engine) => engine.meta(),
         }
@@ -269,7 +268,7 @@ impl LocalEngine for BackendEngine {
 
     fn tokenize(&self, text: &str) -> Result<Vec<u32>, Error> {
         match self {
-            #[cfg(feature = "local-gguf")]
+            #[cfg(feature = "local-gguf-cpu")]
             BackendEngine::LlamaCpp(engine) => engine.tokenize(text),
             BackendEngine::Candle(engine) => engine.tokenize(text),
         }
@@ -282,7 +281,7 @@ impl LocalEngine for BackendEngine {
         emit: &mut dyn FnMut(&str) -> bool,
     ) -> Result<engine::GenerateFinish, Error> {
         match self {
-            #[cfg(feature = "local-gguf")]
+            #[cfg(feature = "local-gguf-cpu")]
             BackendEngine::LlamaCpp(engine) => engine.generate(prompt_tokens, params, emit),
             BackendEngine::Candle(engine) => engine.generate(prompt_tokens, params, emit),
         }
@@ -290,7 +289,7 @@ impl LocalEngine for BackendEngine {
 
     fn reset(&mut self) -> Result<(), Error> {
         match self {
-            #[cfg(feature = "local-gguf")]
+            #[cfg(feature = "local-gguf-cpu")]
             BackendEngine::LlamaCpp(engine) => engine.reset(),
             BackendEngine::Candle(engine) => engine.reset(),
         }
@@ -430,8 +429,8 @@ fn model_name_from(path: &Path) -> String {
 impl LocalClient {
     /// Loads a model and infers with it in-process.
     ///
-    /// `path` may be a `*.gguf` file (requires the `local-gguf` feature),
-    /// a `*.safetensors` file, or a model directory containing
+    /// `path` may be a `*.gguf` file (requires the `local-gguf-cpu`
+    /// feature), a `*.safetensors` file, or a model directory containing
     /// `config.json` plus weights; see the dispatch rules in the crate
     /// documentation. Loading is heavy and runs on a blocking thread, so
     /// the async entry points never stall the runtime.

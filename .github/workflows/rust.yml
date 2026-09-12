@@ -9,14 +9,95 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# 合并为单 crate（channel，含 harness feature）后的 CI 矩阵：
+# - Linux default 档：零 feature 最小构建（纯 channel 会话层；传输栈
+#   potato 常驻编译，ormer/toml 等重型依赖只随对应 feature 进入依赖图）。
+# - Linux harness 档：桌面感知 harness（Windows/Linux 平台集成全量编译，
+#   运行环境探测决定实际用哪个）；无头 runner 上 X11 截屏等集成测试按
+#   测试内建的「环境缺失优雅 skip」跳过（skip 会打印原因，不算失败）。
+# - Linux extended 档（显式特性面，不用 --all-features：local-gguf-cuda
+#   等GPU 后端在无 GPU runner 上必然失败）：+local-safetensors-cpu +llm +
+#   switch + harness（X11/AT-SPI/portal/uinput 随 harness 全量编译）；
+#   dbus-run-session 提供 session bus 供 AT-SPI 集成测试自举（无 DISPLAY
+#   时 GTK 演示窗起不来，测试优雅 skip）。
+# - Linux MSRV 档（1.85）：最小语言版本守护（crate rust-version）。
+# - Windows 档：cfg(windows) 全模块（uia/sendinput/screen + 事件直录
+#   win_event_hook/uia_events）真实 MSVC 编译与单测；真实桌面冒烟保持
+#   #[ignore]；并用 x86_64-unknown-linux-gnu 交叉 check 做平台隔离哨兵
+#   （windows/windows-core 等平台依赖必须留在 Linux 编译图之外）。
 jobs:
-  build:
-
+  linux:
     runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            toolchain: stable
+            flags: ""
+          - name: harness
+            toolchain: stable
+            flags: --features harness
+          - name: switch
+            toolchain: stable
+            flags: --features ccswitch
+          - name: extended
+            toolchain: stable
+            flags: --features local-safetensors-cpu,llm,ccswitch,harness
+            session: dbus-run-session --
+          - name: no-default-features
+            toolchain: stable
+            flags: --no-default-features
+          - name: msrv-1.85-default
+            toolchain: "1.85"
+            flags: ""
     steps:
     - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.toolchain }}
+    # extended 档的 AT-SPI 集成测试需要 session bus（dbus-run-session
+    # 自举）与 at-spi2 注册器组件。
+    - name: Install AT-SPI/D-Bus (extended only)
+      if: matrix.name == 'extended'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends dbus at-spi2-core
     - name: Build
-      run: cargo build --verbose
+      run: ${{ matrix.session }} cargo build ${{ matrix.flags }} --verbose
     - name: Run tests
-      run: cargo test --verbose
+      run: ${{ matrix.session }} cargo test ${{ matrix.flags }} --verbose
+
+  # Windows 编译与单测：UIA / SendInput / GDI+WIC 抓屏与事件直录在真实
+  # MSVC 工具链下参与编译与单测。bin_protocol 的操作类断言仅验证授权门与
+  # version 回执，不做真实键鼠注入；真实桌面冒烟（uia/screen/actuate/
+  # win_record_smoke）保持 #[ignore]，由实机人工/定时跑。
+  windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+    - name: Check (all targets, default features)
+      run: cargo check --all-targets --verbose
+    - name: Check harness feature (all targets)
+      run: cargo check --all-targets --features harness,llm --verbose
+    - name: Test
+      run: cargo test --features harness,llm,ccswitch --verbose
+    # 平台隔离哨兵：harness 依赖图的 Linux 侧必须不含 windows/windows-core
+    # 等 cfg(windows) 依赖（cargo tree -i 反查输出非空即失败）；纯 Rust
+    # 交叉 check 验证 Linux 侧模块（x11rb/png/atspi/ashpd）在无 C 工具链
+    # 下可编译。
+    - name: Cross-check Linux graph (platform isolation)
+      shell: bash
+      run: |
+        rustup target add x86_64-unknown-linux-gnu
+        for pkg in windows windows-core; do
+          leaked=$(cargo tree -e normal --target x86_64-unknown-linux-gnu --features harness -i "$pkg" 2>/dev/null | grep -c "$pkg" || true)
+          if [ "$leaked" != "0" ]; then
+            echo "ERROR: $pkg leaked into the Linux dependency graph"
+            exit 1
+          fi
+        done
+        cargo check --target x86_64-unknown-linux-gnu --features harness --verbose

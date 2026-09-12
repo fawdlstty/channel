@@ -50,9 +50,14 @@ while let Some(chunk) = receiver.recv().await {
 }
 ```
 
-## 进程内运行本地模型（`local` / `local-gguf` feature）
+## 进程内运行本地模型（`local-safetensors-cpu` / `local-gguf-cpu` feature）
 
-`LocalClient::load` 直接从磁盘加载模型、进程内推理，中间不需要任何服务端：**safetensors** 模型目录走纯 Rust 的 candle 后端；**GGUF** 文件走 llama.cpp 后端（opt-in `local-gguf`，需 cmake 与 C++ 工具链）。加载参数涵盖上下文长度、线程数、GPU 层数卸载与聊天模板覆盖；生成参数涵盖 temperature、top-p/top-k、重复惩罚、停止序列等。会话接口与 HTTP 客户端完全一致。
+`LocalClient::load` 直接从磁盘加载模型、进程内推理，中间不需要任何服务端：**safetensors** 模型目录走纯 Rust 的 candle 后端；**GGUF** 文件走 llama.cpp 后端（opt-in `local-gguf-cpu`，需 cmake 与 C++ 工具链）。加载参数涵盖上下文长度、线程数、GPU 层数卸载与聊天模板覆盖；生成参数涵盖 temperature、top-p/top-k、重复惩罚、停止序列等。会话接口与 HTTP 客户端完全一致。
+
+**支持的模型架构**
+
+- **safetensors**（candle 后端）：固定白名单——`config.json` 的 `model_type` 须为 `llama`、`qwen2`、`qwen3`、`phi3`、`gemma` 之一（来自 candle-transformers 0.11）；其他架构会报错并提示改用 GGUF。
+- **GGUF**（llama.cpp 后端）：无自有白名单——内置 llama.cpp（llama-cpp-2 0.1.156）支持的架构均可直接加载，共约 140 种：llama/llama4、qwen2/qwen3（含 MoE、VL 变体）、gemma/gemma2/gemma3/gemma3n、phi2/phi3、deepseek 与 GLM 系列、mistral3/mistral4、gpt-oss、smollm3、nemotron 等。
 
 ```rust
 let mut client = channel::LocalClient::load("./Qwen3-0.6B").await?;
@@ -60,7 +65,7 @@ client.set_system_prompt("You are a concise assistant.");
 let reply = client.chat("用一句话解释什么是 SSE 流。").await?;
 ```
 
-## 把本地模型挂成 HTTP 服务（`local-server` feature）
+## 把本地模型挂成 HTTP 服务（随 `local-safetensors-cpu` 提供）
 
 `LocalLlmServer` 挂载一个或多个本地模型，以标准协议端点对外提供服务——`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`、`POST /api/chat`、`GET /api/tags`——**任何 OpenAI、Anthropic 或 Ollama 兼容客户端**（包括 channel 自带的四种协议客户端）都能直接对话本地模型。可选 Bearer Token 鉴权。
 
@@ -75,12 +80,15 @@ server.serve().await?;
 | Feature | 启用内容 |
 |---|---|
 | （默认） | 仅 Harness 会话 |
-| `llm` | 四种大模型直连协议客户端 + 服务端流发射器（引入 potato HTTP 栈） |
-| `local` | 进程内本地推理，candle 后端（safetensors，纯 Rust） |
-| `local-gguf` | llama.cpp 后端，支持 GGUF 模型（隐含 `local`） |
-| `local-server` | 本地模型的 HTTP 协议端点（隐含 `local`） |
-| `local-cuda` / `local-metal` / `local-vulkan` | llama.cpp 后端 GPU 加速 |
-| `local-candle-cuda` / `local-candle-metal` | candle 后端 GPU 加速 |
+| `llm` | 四种大模型直连协议客户端 + 服务端流发射器 |
+| `ccswitch` | cc-switch 供应商切换（SQLite 配置库 + TOML 配置 + 本地上游代理） |
+| `local-safetensors-cpu` | 进程内本地推理，candle 后端（safetensors，纯 Rust），含本地模型 HTTP 服务 |
+| `local-safetensors-cuda` / `local-safetensors-metal` | candle 后端 GPU 加速 |
+| `local-gguf-cpu` | llama.cpp 后端，支持 GGUF 模型（隐含 `local-safetensors-cpu`） |
+| `local-gguf-cuda` / `local-gguf-metal` / `local-gguf-vulkan` | llama.cpp 后端的 CUDA / Metal / Vulkan 加速 |
+| `local-safetensors-all` / `local-gguf-all` | 分别启用 safetensors / GGUF 家族的全部后端标签 |
+| `all` | 启用本 crate 全部 features |
+| `harness` | 桌面感知 harness：UIA/AT-SPI 控件树感知、截屏、操作工具面、JSON-lines 服务——各平台集成全部编入，由运行环境探测决定实际用哪个 |
 
 ## 示例
 
@@ -88,8 +96,8 @@ server.serve().await?;
 |---|---|---|
 | [basic.rs](examples/basic.rs) | `cargo run --example basic` | Harness 会话 |
 | [llm_chat.rs](examples/llm_chat.rs) | `cargo run --features llm --example llm_chat` | 直连大模型 |
-| [local_chat.rs](examples/local_chat.rs) | `cargo run --features local --example local_chat -- ./Qwen3-0.6B` | 本地模型 |
-| [local_server.rs](examples/local_server.rs) | `cargo run --features local-server,local-gguf --example local_server -- ./Qwen3-0.6B` | 本地模型服务 |
+| [local_chat.rs](examples/local_chat.rs) | `cargo run --features local-safetensors-cpu --example local_chat -- ./Qwen3-0.6B` | 本地模型 |
+| [local_server.rs](examples/local_server.rs) | `cargo run --features local-safetensors-cpu --example local_server -- ./Qwen3-0.6B` | 本地模型服务 |
 
 详细的对外接口手册（中文）见 [manual.md](manual.md)。
 

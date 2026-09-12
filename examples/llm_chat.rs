@@ -6,6 +6,12 @@
 //! - `LLM_API_KEY`  (optional for keyless gateways)
 //! - `LLM_MODEL`    (default `gpt-4o-mini`)
 
+#[cfg(not(feature = "llm"))]
+fn main() {
+    eprintln!("this example requires the `llm` feature: cargo run --features llm --example llm_chat");
+}
+
+#[cfg(feature = "llm")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_url =

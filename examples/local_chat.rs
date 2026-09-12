@@ -1,11 +1,20 @@
-//! Requires the `local` feature (GGUF models additionally need
-//! `local-gguf`):
-//! `cargo run --features local --example local_chat -- ./Qwen3-0.6B`
+//! Requires the `local-safetensors-cpu` feature (GGUF models additionally need
+//! `local-gguf-cpu`):
+//! `cargo run --features local-safetensors-cpu --example local_chat -- ./Qwen3-0.6B`
 //!
 //! Arguments:
 //! - model path: a `*.gguf` file, a `*.safetensors` file or a model
 //!   directory with `config.json` + weights (default from `LOCAL_MODEL`)
 
+#[cfg(not(feature = "local-safetensors-cpu"))]
+fn main() {
+    eprintln!(
+        "this example requires the `local-safetensors-cpu` feature: \
+         cargo run --features local-safetensors-cpu --example local_chat -- ./Qwen3-0.6B"
+    );
+}
+
+#[cfg(feature = "local-safetensors-cpu")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_path = std::env::args()
@@ -17,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(client) => client,
         Err(channel::Error::UnsupportedCapability(message)) => {
             eprintln!("{message}");
-            eprintln!("hint: GGUF models need `--features local-gguf` (cmake + C++ toolchain)");
+            eprintln!("hint: GGUF models need `--features local-gguf-cpu` (cmake + C++ toolchain)");
             return Ok(());
         }
         Err(error) => return Err(error.into()),

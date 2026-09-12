@@ -1,5 +1,4 @@
 use crate::protocol::Error;
-use rusqlite::OpenFlags;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -9,6 +8,27 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 const DEFAULT_API_FORMAT: &str = "openai_responses";
+
+/// cc-switch stores every supported app in one table; channel only reads the
+/// Codex entries.
+const APP_TYPE: &str = "codex";
+
+/// Read-only mirror of the cc-switch `providers` table. Column names must
+/// match the external schema exactly; columns the relay never reads
+/// (`is_current`) are omitted so the generated SELECT stays minimal.
+#[derive(Debug, Clone, ormer::Model)]
+#[table = "providers"]
+struct ProviderRow {
+    #[primary]
+    id: String,
+    #[primary]
+    app_type: String,
+    name: String,
+    settings_config: String,
+    meta: String,
+    created_at: Option<i64>,
+    sort_index: Option<i64>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedProvider {
@@ -41,85 +61,65 @@ impl CodexDatabase {
         ))
     }
 
-    pub(crate) fn available_keys(&self) -> Result<Vec<String>, Error> {
-        let connection = self.0.open_read_only()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT name FROM providers WHERE app_type = 'codex' \
-                 ORDER BY sort_index, created_at DESC, id",
-            )
-            .db_error("failed to read cc-switch providers")?;
-        let keys = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .db_error("failed to read cc-switch providers")?
-            .collect::<Result<Vec<_>, _>>()
-            .db_error("failed to read cc-switch providers")?;
-        Ok(keys)
-    }
-
-    pub(crate) fn resolve_provider(&self, name: &str) -> Result<ResolvedProvider, Error> {
-        let connection = self.0.open_read_only()?;
-        let count = connection
-            .query_row(
-                "SELECT count(*) FROM providers WHERE app_type = 'codex' AND name = ?1",
-                [name],
-                |row| row.get::<_, i64>(0),
-            )
-            .db_error("failed to resolve cc-switch provider")?;
-        if count == 0 {
-            return Err(Error::InvalidConfig(format!(
-                "cc-switch provider was not found: {name}"
+    /// Connects to the cc-switch database. turso creates missing database
+    /// files on open, but the cc-switch database is an external artifact, so
+    /// a missing file is surfaced here instead of querying an empty store.
+    async fn connect(&self) -> Result<ormer::Database, Error> {
+        if !self.0.is_file() {
+            return Err(Error::Initialization(format!(
+                "failed to open cc-switch database {}: database file does not exist",
+                self.0.display()
             )));
         }
-        if count > 1 {
-            return Err(Error::InvalidConfig(format!(
-                "cc-switch provider name is ambiguous: {name}"
-            )));
-        }
+        ormer::Database::connect(ormer::DbType::Sqlite, &self.0.to_string_lossy())
+            .await
+            .map_err(|error| {
+                Error::Initialization(format!(
+                    "failed to open cc-switch database {}: {error}",
+                    self.0.display()
+                ))
+            })
+    }
 
-        let (id, name, settings, meta) = connection
-            .query_row(
-                "SELECT id, name, settings_config, meta FROM providers \
-                 WHERE app_type = 'codex' AND name = ?1",
-                [name],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
+    pub(crate) async fn available_keys(&self) -> Result<Vec<String>, Error> {
+        let connection = self.connect().await?;
+        let rows = connection
+            .select::<ProviderRow>()
+            .filter(|provider| provider.app_type.eq(APP_TYPE))
+            .order_by(|provider| provider.sort_index.asc())
+            .order_by(|provider| provider.created_at.desc())
+            .order_by(|provider| provider.id.asc())
+            .collect::<Vec<_>>()
+            .await
+            .db_error("failed to read cc-switch providers")?;
+        Ok(rows.into_iter().map(|row| row.name).collect())
+    }
+
+    pub(crate) async fn resolve_provider(&self, name: &str) -> Result<ResolvedProvider, Error> {
+        let connection = self.connect().await?;
+        let rows = connection
+            .select::<ProviderRow>()
+            .filter(|provider| provider.app_type.eq(APP_TYPE))
+            .filter(|provider| provider.name.eq(name))
+            .collect::<Vec<_>>()
+            .await
             .db_error("failed to resolve cc-switch provider")?;
-        ResolvedProvider::parse(&id, &name, &settings, &meta)
+        let [row] = rows.as_slice() else {
+            return Err(Error::InvalidConfig(if rows.is_empty() {
+                format!("cc-switch provider was not found: {name}")
+            } else {
+                format!("cc-switch provider name is ambiguous: {name}")
+            }));
+        };
+        ResolvedProvider::parse(&row.id, &row.name, &row.settings_config, &row.meta)
     }
 }
 
-trait SqliteDatabase {
-    fn open_read_only(&self) -> Result<rusqlite::Connection, Error>;
-}
-
-impl SqliteDatabase for Path {
-    fn open_read_only(&self) -> Result<rusqlite::Connection, Error> {
-        rusqlite::Connection::open_with_flags(
-            self,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|error| {
-            Error::Initialization(format!(
-                "failed to open cc-switch database {}: {error}",
-                self.display()
-            ))
-        })
-    }
-}
-
-trait CodexDatabaseResult<T> {
+trait DatabaseResultExt<T> {
     fn db_error(self, message: &'static str) -> Result<T, Error>;
 }
 
-impl<T> CodexDatabaseResult<T> for Result<T, rusqlite::Error> {
+impl<T> DatabaseResultExt<T> for ormer::Result<T> {
     fn db_error(self, message: &'static str) -> Result<T, Error> {
         self.map_err(|error| Error::InvalidConfig(format!("{message}: {error}")))
     }
@@ -221,12 +221,20 @@ impl CodexHome {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&provider_name, &mut hasher);
         let path = base.join(format!("{:016x}", std::hash::Hasher::finish(&hasher)));
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create_dir_all(&path)
+                .map_err(|error| {
+                    Error::Initialization(format!(
+                        "failed to create the Codex home {}: {error}",
+                        path.display()
+                    ))
+                })?;
         }
+        #[cfg(not(unix))]
         std::fs::create_dir_all(&path).map_err(|error| {
             Error::Initialization(format!(
                 "failed to create the Codex home {}: {error}",
@@ -319,10 +327,7 @@ impl CodexResources {
         }
         let database = CodexDatabase::path()?;
         let provider_name = provider_name.to_owned();
-        let key_for_db = provider_name.clone();
-        let provider = tokio::task::spawn_blocking(move || database.resolve_provider(&key_for_db))
-            .await
-            .map_err(|error| Error::Initialization(error.to_string()))??;
+        let provider = database.resolve_provider(&provider_name).await?;
         let codex_home = CodexHome::create(&provider_name)?;
         let relay = if provider.api_format == DEFAULT_API_FORMAT {
             codex_home.write(&provider, &provider.base_url)?;
@@ -380,30 +385,18 @@ impl Relay {
             .local_addr()
             .map_err(|error| Error::Initialization(error.to_string()))?
             .to_string();
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(3))
-            // 上游按非流式整段生成（推理模型一轮可能超过一分钟），总超时必须覆盖完整生成；
-            // 健康请求被中途掐断后 codex 会全量重试，白烧上游额度。
-            .timeout(std::time::Duration::from_secs(180))
-            .build()
-            .map_err(|error| {
-                Error::Initialization(format!("failed to create relay client: {error}"))
-            })?;
         let provider = Arc::new(provider.clone());
         let connections = Arc::new(Mutex::new(Vec::new()));
         let permits = Arc::new(Semaphore::new(32));
         let accept_connections = connections.clone();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let client = client.clone();
                 let provider = provider.clone();
                 let connections = accept_connections.clone();
                 let permits = permits.clone();
                 let connection = tokio::spawn(
                     RelayConnection {
                         stream,
-                        client,
                         provider,
                         permits,
                     }
@@ -434,9 +427,12 @@ impl Drop for Relay {
     }
 }
 
+/// 上游按非流式整段生成（推理模型一轮可能超过一分钟），总超时必须覆盖
+/// 完整生成；健康请求被中途掐断后 codex 会全量重试，白烧上游额度。
+const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 struct RelayConnection {
     stream: TcpStream,
-    client: reqwest::Client,
     provider: Arc<ResolvedProvider>,
     permits: Arc<Semaphore>,
 }
@@ -473,11 +469,15 @@ impl RelayConnection {
         // Fields the chat/anthropic conversions cannot represent are simply
         // dropped; newer Codex clients always send reasoning settings.
         request.strip_unsupported_responses_fields();
-        let result = if self.provider.api_format == "openai_chat" {
-            self.provider.forward_chat(&self.client, request).await
-        } else {
-            self.provider.forward_anthropic(&self.client, request).await
-        };
+        let result = tokio::time::timeout(UPSTREAM_TIMEOUT, async {
+            if self.provider.api_format == "openai_chat" {
+                self.provider.forward_chat(request).await
+            } else {
+                self.provider.forward_anthropic(request).await
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err((502, "upstream request timed out".to_owned())));
         match result {
             Ok(upstream) => {
                 let response = upstream.responses_sse();
@@ -596,10 +596,18 @@ impl HttpConnection for TcpStream {
 
     async fn write_sse_response(&mut self, status: u16, body: &str) -> Result<(), std::io::Error> {
         let headers = format!(
-            "HTTP/1.1 {status} OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n"
+            "HTTP/1.1 {status} OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
         );
         self.write_all(headers.as_bytes()).await?;
-        self.write_all(body.as_bytes()).await?;
+        // Chunked framing instead of a bare close-delimited body: HTTP/1.1
+        // clients then know where the stream ends without relying on the
+        // connection teardown (potato, unlike reqwest, refuses to guess).
+        // The payload is rendered in one pass (non-streaming upstream), so a
+        // single chunk plus the zero-chunk terminator carries it all.
+        let mut chunk = format!("{:x}\r\n", body.len());
+        chunk.push_str(body);
+        chunk.push_str("\r\n0\r\n\r\n");
+        self.write_all(chunk.as_bytes()).await?;
         self.flush().await?;
         self.shutdown().await
     }
@@ -608,48 +616,54 @@ impl HttpConnection for TcpStream {
 type UpstreamResult = Result<Value, (u16, String)>;
 
 impl ResolvedProvider {
-    async fn forward_chat(&self, client: &reqwest::Client, request: Value) -> UpstreamResult {
+    async fn forward_chat(&self, request: Value) -> UpstreamResult {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let response = client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&request.chat_completion_request())
-            .send()
-            .await
-            .map_err(|error| (502, error.to_string()))?;
+        let mut response = potato::post_json(
+            &url,
+            request.chat_completion_request(),
+            vec![potato::Headers::Custom((
+                "Authorization".to_owned(),
+                format!("Bearer {}", self.api_key),
+            ))],
+        )
+        .await
+        .map_err(|error| (502, error.to_string()))?;
         response.read_upstream().await
     }
 
-    async fn forward_anthropic(&self, client: &reqwest::Client, request: Value) -> UpstreamResult {
+    async fn forward_anthropic(&self, request: Value) -> UpstreamResult {
         let base = self.base_url.trim_end_matches('/');
         let url = if base.ends_with("/v1") {
             format!("{base}/messages")
         } else {
             format!("{base}/v1/messages")
         };
-        let response = client
-            .post(url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request.anthropic_request())
-            .send()
-            .await
-            .map_err(|error| (502, error.to_string()))?;
+        let mut response = potato::post_json(
+            &url,
+            request.anthropic_request(),
+            vec![
+                potato::Headers::Custom(("x-api-key".to_owned(), self.api_key.clone())),
+                potato::Headers::Custom((
+                    "anthropic-version".to_owned(),
+                    "2023-06-01".to_owned(),
+                )),
+            ],
+        )
+        .await
+        .map_err(|error| (502, error.to_string()))?;
         response.read_upstream().await
     }
 }
 
 trait UpstreamResponse {
-    async fn read_upstream(self) -> UpstreamResult;
+    async fn read_upstream(&mut self) -> UpstreamResult;
 }
 
-impl UpstreamResponse for reqwest::Response {
-    async fn read_upstream(self) -> UpstreamResult {
-        let status = self.status().as_u16();
-        let text = self
-            .text()
-            .await
-            .map_err(|error| (502, error.to_string()))?;
+impl UpstreamResponse for potato::HttpResponse {
+    async fn read_upstream(&mut self) -> UpstreamResult {
+        let status = self.http_code;
+        let data = self.body.data().await;
+        let text = String::from_utf8_lossy(data).into_owned();
         if !(200..300).contains(&status) {
             return Err((
                 if status == 401 || status == 403 {
@@ -1163,7 +1177,7 @@ mod tests {
     struct TestDatabase(PathBuf);
 
     impl TestDatabase {
-        fn new() -> Self {
+        async fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
                 "channel-ccswitch-test-{}-{}",
                 std::process::id(),
@@ -1172,40 +1186,31 @@ mod tests {
                     .unwrap()
                     .as_nanos()
             ));
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            connection
-                .execute(
-                    "CREATE TABLE providers (
-                        id TEXT NOT NULL,
-                        app_type TEXT NOT NULL,
-                        name TEXT NOT NULL,
-                        settings_config TEXT NOT NULL,
-                        meta TEXT NOT NULL DEFAULT '{}',
-                        is_current BOOLEAN NOT NULL DEFAULT 0,
-                        created_at INTEGER,
-                        sort_index INTEGER,
-                        PRIMARY KEY (id, app_type)
-                    )",
-                    [],
-                )
-                .unwrap();
+            let connection =
+                ormer::Database::connect(ormer::DbType::Sqlite, &path.to_string_lossy())
+                    .await
+                    .unwrap();
+            connection.create_table::<ProviderRow>().execute().await.unwrap();
             Self(path)
         }
 
-        fn insert(&self, id: &str, name: &str, sort_index: i64, meta: &str) {
-            let connection = rusqlite::Connection::open(&self.0).unwrap();
+        async fn insert(&self, id: &str, name: &str, sort_index: i64, meta: &str) {
+            let connection =
+                ormer::Database::connect(ormer::DbType::Sqlite, &self.0.to_string_lossy())
+                    .await
+                    .unwrap();
             connection
-                .execute(
-                    "INSERT INTO providers (id, app_type, name, settings_config, meta, sort_index) \
-                     VALUES (?1, 'codex', ?2, ?3, ?4, ?5)",
-                    rusqlite::params![
-                        id,
-                        name,
-                        r#"{"auth":{"OPENAI_API_KEY":"secret"},"config":"model = \"demo\"\n[model_providers.custom]\nbase_url = \"https://example.invalid/v1\"\n"}"#,
-                        meta,
-                        sort_index
-                    ],
-                )
+                .insert(&ProviderRow {
+                    id: id.to_owned(),
+                    app_type: APP_TYPE.to_owned(),
+                    name: name.to_owned(),
+                    settings_config: r#"{"auth":{"OPENAI_API_KEY":"secret"},"config":"model = \"demo\"\n[model_providers.custom]\nbase_url = \"https://example.invalid/v1\"\n"}"#.to_owned(),
+                    meta: meta.to_owned(),
+                    created_at: None,
+                    sort_index: Some(sort_index),
+                })
+                .execute()
+                .await
                 .unwrap();
         }
     }
@@ -1216,35 +1221,41 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lists_codex_keys_in_database_order() {
-        let database = TestDatabase::new();
-        database.insert("second", "beta", 2, "{}");
-        database.insert("first", "alpha", 1, "{}");
+    #[tokio::test]
+    async fn lists_codex_keys_in_database_order() {
+        let database = TestDatabase::new().await;
+        database.insert("second", "beta", 2, "{}").await;
+        database.insert("first", "alpha", 1, "{}").await;
         assert_eq!(
-            CodexDatabase(database.0.clone()).available_keys().unwrap(),
+            CodexDatabase(database.0.clone())
+                .available_keys()
+                .await
+                .unwrap(),
             ["alpha", "beta"]
         );
     }
 
-    #[test]
-    fn resolves_exact_unique_names_only() {
-        let database = TestDatabase::new();
-        database.insert("one", "team", 1, r#"{"apiFormat":"openai_chat"}"#);
+    #[tokio::test]
+    async fn resolves_exact_unique_names_only() {
+        let database = TestDatabase::new().await;
+        database.insert("one", "team", 1, r#"{"apiFormat":"openai_chat"}"#).await;
         assert_eq!(
             CodexDatabase(database.0.clone())
                 .resolve_provider("team")
+                .await
                 .unwrap()
                 .id,
             "one"
         );
         assert!(matches!(
-            CodexDatabase(database.0.clone()).resolve_provider("missing"),
+            CodexDatabase(database.0.clone())
+                .resolve_provider("missing")
+                .await,
             Err(Error::InvalidConfig(message)) if message.contains("not found")
         ));
-        database.insert("two", "team", 2, "{}");
+        database.insert("two", "team", 2, "{}").await;
         assert!(matches!(
-            CodexDatabase(database.0.clone()).resolve_provider("team"),
+            CodexDatabase(database.0.clone()).resolve_provider("team").await,
             Err(Error::InvalidConfig(message)) if message.contains("ambiguous")
         ));
     }
@@ -1361,18 +1372,20 @@ mod tests {
             base_url: format!("http://{upstream_address}"),
         };
         let relay = Relay::start(&provider).await.unwrap();
-        let response = reqwest::Client::new()
-            .post(format!("{}/responses", relay.endpoint))
-            .json(&json!({
+        let mut response = potato::post_json(
+            &format!("{}/responses", relay.endpoint),
+            json!({
                 "model": "demo",
                 "input": "hello",
                 "stream": true
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert!(response.status().is_success());
-        let body = response.text().await.unwrap();
+            }),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!((200..300).contains(&response.http_code));
+        let data = response.body.data().await;
+        let body = String::from_utf8_lossy(data);
         assert!(body.contains("response.completed"));
         assert!(body.contains("relayed"));
     }

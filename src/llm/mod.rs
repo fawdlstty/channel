@@ -7,39 +7,40 @@
 //! single [`potato::Session`] for their HTTP transport and surface
 //! [`crate::Error`] instead of leaking transport error types.
 //!
-//! With the `local` feature the [`local`] submodule adds in-process model
-//! inference ([`crate::LocalClient`]) without pulling in any HTTP transport.
+//! With the `local-safetensors-cpu` feature family the [`local`] submodule adds
+//! in-process model inference ([`crate::LocalClient`]) and the local-model
+//! HTTP server without further opt-ins.
 
-#[cfg(any(feature = "llm", feature = "local-server"))]
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 mod chat_completions;
-#[cfg(any(feature = "llm", feature = "local-server"))]
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 mod messages;
-#[cfg(any(feature = "llm", feature = "local-server"))]
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 mod ollama;
-#[cfg(any(feature = "llm", feature = "local-server"))]
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 mod responses;
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-safetensors-cpu")]
 mod local;
 
 #[cfg(feature = "llm")]
 pub use chat_completions::ChatCompletionsClient;
-#[cfg(any(feature = "llm", feature = "local-server"))]
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 pub use chat_completions::OpenAISender;
-#[cfg(any(feature = "llm", feature = "local-server"))]
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 pub use messages::AnthropicSender;
 #[cfg(feature = "llm")]
 pub use messages::MessagesClient;
 #[cfg(feature = "llm")]
 pub use ollama::OllamaClient;
-#[cfg(any(feature = "llm", feature = "local-server"))]
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 pub use ollama::OllamaSender;
 #[cfg(feature = "llm")]
 pub use responses::ResponsesClient;
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-safetensors-cpu")]
 pub use local::{GenerationParams, LoadOptions, LocalBackendKind, LocalClient, LocalModelMeta};
-#[cfg(feature = "local-server")]
+#[cfg(feature = "local-safetensors-cpu")]
 pub use local::server::LocalLlmServer;
 
 #[cfg(feature = "llm")]
@@ -150,7 +151,7 @@ pub(crate) fn unix_micros() -> i64 {
 
 /// Current wall-clock time as seconds since the Unix epoch; used by
 /// [`crate::OpenAISender`].
-#[cfg(any(feature = "llm", feature = "local-server"))]
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 pub(crate) fn unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -457,7 +458,7 @@ pub(crate) fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, Err
 
 /// Records a streaming increment on the message log: the trailing assistant
 /// message is updated in place, or a fresh one is appended.
-#[cfg(any(feature = "llm", feature = "local"))]
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 pub(crate) fn record_assistant_delta(messages: &MessageLog, content: &str) {
     let mut history = messages
         .write()
@@ -475,7 +476,7 @@ pub(crate) fn record_assistant_delta(messages: &MessageLog, content: &str) {
 }
 
 /// Ensures a trailing assistant message exists once the stream is complete.
-#[cfg(any(feature = "llm", feature = "local"))]
+#[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 pub(crate) fn finalize_assistant_message(messages: &MessageLog, content: String) {
     let mut history = messages
         .write()

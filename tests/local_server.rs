@@ -1,14 +1,14 @@
 //! Protocol loopback tests for the local-model HTTP server (design §7.2):
 //! the local server is exercised with channel's own protocol clients in the
-//! same process. Only runs with the `local-server` feature (plus `llm` for
-//! the client side) and a real model via `CHANNEL_LOCAL_TEST_MODEL`:
+//! same process. Only runs with the `local-safetensors-cpu` feature (plus `llm`
+//! for the client side) and a real model via `CHANNEL_LOCAL_TEST_MODEL`:
 //!
 //! ```text
 //! CHANNEL_LOCAL_TEST_MODEL=./Qwen3-0.6B \
-//!   cargo test --features local-server,llm --test local_server
+//!   cargo test --features local-safetensors-cpu,llm --test local_server
 //! ```
 
-#![cfg(all(feature = "local-server", feature = "llm"))]
+#![cfg(all(feature = "local-safetensors-cpu", feature = "llm"))]
 
 use std::time::Duration;
 
@@ -110,7 +110,7 @@ async fn ollama_chat_round_trip() {
     }
     let (base, server) = start_server().await;
 
-    let mut client = channel::OllamaClient::new(base.clone());
+    let mut client = channel::OllamaClient::new(base.clone(), None);
     client.set_model("m").await.expect("model set");
     let reply = client.chat("Say hi.").await.expect("ollama chat works");
     assert!(!reply.trim().is_empty());
@@ -145,7 +145,7 @@ async fn model_list_endpoints() {
     let models = openai.list_models().await.expect("openai model list");
     assert_eq!(models.len(), 1);
 
-    let mut ollama = channel::OllamaClient::new(base.clone());
+    let mut ollama = channel::OllamaClient::new(base.clone(), None);
     let tags = ollama.list_models().await.expect("ollama tags");
     assert_eq!(tags.len(), 1);
     assert_eq!(models[0].id, tags[0].id);
