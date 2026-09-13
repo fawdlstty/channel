@@ -3,7 +3,8 @@
 > 维护规则见 [AGENTS.md](AGENTS.md)。每一项内容都标注来源：
 > 【用户要求】= 用户明确提出的改动/约束（含原始诉求语义）；
 > 【AI 演绎】= AI 为落实用户要求而自行推导补全的细节，尚未逐项确认。
-> 最近更新：2026-09-13（`full` 聚合可编译性收敛：GPU 卸载后端退出聚合、
+> 最近更新：2026-09-13（CI Windows job 的 Linux 平台隔离哨兵收敛为纯
+> `cargo tree` 反查；同日 `full` 聚合可编译性收敛：GPU 卸载后端退出聚合、
 > metal 变体按 Apple 目标 gating，用户要求修复
 > `cargo clippy --features full --all-targets -- -D warnings`；
 > 同日 feature 体系改名 `-all` → `-full`；此前 2026-09-12 记录见 git
@@ -203,7 +204,14 @@
   CUDA Toolkit（candle-kernels 构建期跑 nvcc），`local-gguf-vulkan`
   需 Vulkan SDK（Windows 构建期强制 `VULKAN_SDK` 环境变量）。
 - 【AI 演绎】CI：`.github/workflows/rust.yml`（多平台矩阵，具体策略以
-  workflow 文件为准）。
+  workflow 文件为准）。【用户要求，2026-09-13】修复 Windows job 的 CI
+  编译报错（cc-rs 找不到 `x86_64-linux-gnu-gcc`）；【AI 演绎，
+  2026-09-13，落实上一条】平台隔离哨兵收敛为纯 `cargo tree -i` 反查，
+  不再做 x86_64-unknown-linux-gnu 交叉 cargo check：常驻 potato TLS 栈
+  经 rustls 引入 ring，其 build script 经 cc-rs 编译 C 代码（cargo check
+  也会执行 build script），Windows runner 上无 Linux 交叉 C 工具链必然
+  失败；Linux 依赖图的编译正确性由 linux job 的 harness/extended 档
+  原生编译覆盖。
 - 【AI 演绎】发布顺序约束（2026-09-12 起）：先 `cargo publish` potato
   0.4.1，channel 的 `[patch.crates-io]`（本地桥接）随后移除。
 

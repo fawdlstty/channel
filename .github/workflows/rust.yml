@@ -25,8 +25,8 @@ env:
 #   1.85 无法满足，1.88 成为实际编译下限。
 # - Windows 档：cfg(windows) 全模块（uia/sendinput/screen + 事件直录
 #   win_event_hook/uia_events）真实 MSVC 编译与单测；真实桌面冒烟保持
-#   #[ignore]；并用 x86_64-unknown-linux-gnu 交叉 check 做平台隔离哨兵
-#   （windows/windows-core 等平台依赖必须留在 Linux 编译图之外）。
+#   #[ignore]；并用 cargo tree 反查做平台隔离哨兵（windows/windows-core
+#   等平台依赖必须留在 Linux 编译图之外）。
 jobs:
   linux:
     runs-on: ubuntu-latest
@@ -88,13 +88,14 @@ jobs:
     - name: Test
       run: cargo test --features harness,llm,ccswitch --verbose
     # 平台隔离哨兵：harness 依赖图的 Linux 侧必须不含 windows/windows-core
-    # 等 cfg(windows) 依赖（cargo tree -i 反查输出非空即失败）；纯 Rust
-    # 交叉 check 验证 Linux 侧模块（x11rb/png/atspi/ashpd）在无 C 工具链
-    # 下可编译。
-    - name: Cross-check Linux graph (platform isolation)
+    # 等 cfg(windows) 依赖（cargo tree -i 反查输出非空即失败）。不再做
+    # x86_64-unknown-linux-gnu 交叉 cargo check：常驻 potato TLS 栈经
+    # rustls 引入 ring，其 build script 用 cc-rs 编译 C 代码，Windows
+    # runner 上必然找不到 x86_64-linux-gnu-gcc；Linux 图的编译正确性由
+    # linux job 的 harness/extended 档原生编译覆盖。
+    - name: Check Linux graph (platform isolation)
       shell: bash
       run: |
-        rustup target add x86_64-unknown-linux-gnu
         for pkg in windows windows-core; do
           leaked=$(cargo tree -e normal --target x86_64-unknown-linux-gnu --features harness -i "$pkg" 2>/dev/null | grep -c "$pkg" || true)
           if [ "$leaked" != "0" ]; then
@@ -102,4 +103,3 @@ jobs:
             exit 1
           fi
         done
-        cargo check --target x86_64-unknown-linux-gnu --features harness --verbose
