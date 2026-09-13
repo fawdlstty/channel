@@ -221,20 +221,6 @@ impl CodexHome {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&provider_name, &mut hasher);
         let path = base.join(format!("{:016x}", std::hash::Hasher::finish(&hasher)));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create_dir_all(&path)
-                .map_err(|error| {
-                    Error::Initialization(format!(
-                        "failed to create the Codex home {}: {error}",
-                        path.display()
-                    ))
-                })?;
-        }
-        #[cfg(not(unix))]
         std::fs::create_dir_all(&path).map_err(|error| {
             Error::Initialization(format!(
                 "failed to create the Codex home {}: {error}",
@@ -244,6 +230,8 @@ impl CodexHome {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // create_dir_all has no mode parameter on stable; enforce 0o700
+            // on the leaf afterwards so the home stays private.
             std::fs::set_permissions(&*path, std::fs::Permissions::from_mode(0o700)).map_err(
                 |error| {
                     Error::Initialization(format!(
