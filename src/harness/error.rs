@@ -602,14 +602,14 @@ mod tests {
         );
         assert_eq!(
             Error::UnknownMouseButton("mid".into()).to_string(),
-            format!("未知按键: mid（可用: left/right）")
+            "未知按键: mid（可用: left/right）"
         );
         assert_eq!(Error::DragFromMissing.to_string(), r#"drag 需要 {"fromX":number,"fromY":number}"#);
         assert_eq!(Error::DragToMissing.to_string(), r#"drag 需要 {"toX":number,"toY":number}"#);
         assert_eq!(Error::ViaNotArray.to_string(), "drag 的 via 须为 [[x,y],...]（二元数值数组）");
         assert_eq!(
             Error::ViaPointInvalid { index: 3 }.to_string(),
-            format!("drag 的 via[3] 须为 [x,y] 二元数值数组")
+            "drag 的 via[3] 须为 [x,y] 二元数值数组"
         );
         assert_eq!(Error::TypeTextMissing.to_string(), r#"type_text 需要 {"text":"…"}"#);
         assert_eq!(Error::TypeTextEmpty.to_string(), "type_text 的 text 不得为空");
@@ -623,9 +623,9 @@ mod tests {
         assert_eq!(Error::ComboEmpty.to_string(), "组合键为空（示例: ctrl+s）");
         assert_eq!(
             Error::NotAModifier("nope".into()).to_string(),
-            format!("「nope」不是修饰键（可用: ctrl/alt/shift/win）")
+            "「nope」不是修饰键（可用: ctrl/alt/shift/win）"
         );
-        assert_eq!(Error::UnknownKeyName("f25".into()).to_string(), format!("未知键名: f25"));
+        assert_eq!(Error::UnknownKeyName("f25".into()).to_string(), "未知键名: f25");
         assert_eq!(Error::ModifierAsMainKey.to_string(), "组合键主键不能是修饰键");
 
         // store 落盘（io/json 错误非 Clone：各错误独立构造，Display 与
@@ -639,19 +639,17 @@ mod tests {
         let json_err = serde_json::from_str::<serde_json::Value>("{oops").unwrap_err();
         let expected = format!("序列化失败: {json_err}");
         assert_eq!(Error::SerializeFailed(json_err).to_string(), expected);
-        assert_eq!(
+        assert!(
             Error::ControlGraphRead { path: "/tmp/x/ui/control-graph.json".into(), source: std::io::Error::other("boom") }
                 .to_string()
-                .starts_with("control-graph.json 读取失败（/tmp/x/ui/control-graph.json）: "),
-            true
+                .starts_with("control-graph.json 读取失败（/tmp/x/ui/control-graph.json）: ")
         );
-        assert_eq!(
+        assert!(
             Error::CreateDirFailed { dir: "/tmp/x/ui".into(), source: std::io::Error::other("boom") }
                 .to_string()
-                .starts_with("建目录失败（/tmp/x/ui）: "),
-            true
+                .starts_with("建目录失败（/tmp/x/ui）: ")
         );
-        assert_eq!(Error::RenameFailed(std::io::Error::other("boom")).to_string().starts_with("原子替换失败: "), true);
+        assert!(Error::RenameFailed(std::io::Error::other("boom")).to_string().starts_with("原子替换失败: "));
         // 非 Windows 抓屏降级。
         assert_eq!(
             Error::ScreenNonWindows.to_string(),

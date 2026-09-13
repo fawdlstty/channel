@@ -3,12 +3,11 @@
 > 维护规则见 [AGENTS.md](AGENTS.md)。每一项内容都标注来源：
 > 【用户要求】= 用户明确提出的改动/约束（含原始诉求语义）；
 > 【AI 演绎】= AI 为落实用户要求而自行推导补全的细节，尚未逐项确认。
-> 最近更新：2026-09-12（feature `switch` 改名 `ccswitch`；新增聚合
-> feature：`local-safetensors-all`、`local-gguf-all`、`all`，用户要求 F；
-> 同日 feature 体系精简重组：potato 常驻、local-\* 规范命名、harness
-> 平台集成全量编译、bins/examples 回归 cargo 默认发现；同日 safetensors
-> 系两改定名——先 `local-safetensors-candle-*`、后按用户要求去引擎段定为
-> `local-safetensors-*`）。
+> 最近更新：2026-09-13（`full` 聚合可编译性收敛：GPU 卸载后端退出聚合、
+> metal 变体按 Apple 目标 gating，用户要求修复
+> `cargo clippy --features full --all-targets -- -D warnings`；
+> 同日 feature 体系改名 `-all` → `-full`；此前 2026-09-12 记录见 git
+> 历史：potato 常驻、local-* 规范命名、harness 平台集成全量编译）。
 
 ## 1. 项目定位
 
@@ -105,10 +104,24 @@
   llama/llama4、qwen2/qwen3 含 MoE/VL 变体、gemma 系、phi2/phi3、
   deepseek 系、GLM 系、mistral3/mistral4、gpt-oss 等）。
 - 【用户要求 F，2026-09-12；2026-09-13 用户要求改名为 full】聚合
-  feature：`local-safetensors-full` 启用 safetensors 系全部标签
-  （cpu/cuda/metal），`local-gguf-full` 启用 gguf 系全部标签
-  （cpu/cuda/metal/vulkan），`full` 启用本 crate 全部 features
-  （llm、switch、两个 `-full` 聚合、harness）。
+  feature：`local-safetensors-full` 与 `local-gguf-full` 启用各权重
+  格式的后端集，`full` 启用本 crate 的 llm、ccswitch、两个 `-full`
+  聚合与 harness。
+- 【用户要求，2026-09-13】`cargo clippy --features full --all-targets
+  -- -D warnings` 须能在无 GPU SDK 的开发机（Windows）上执行成功
+  （本次修复请求的原始诉求）。
+- 【AI 演绎，2026-09-13，落实上一条】聚合 feature 的边界收敛为
+  「**无外部 GPU SDK 且无目标平台硬限制即可编译**的后端全集」：
+  `local-safetensors-full = cpu`、`local-gguf-full = cpu + metal`；
+  cuda（candle-kernels 构建期需要 nvcc，llama.cpp 构建期需要 CUDA
+  Toolkit）与 vulkan（Windows 构建期强制 `VULKAN_SDK`）有编译期 SDK
+  硬依赖，保持独立 feature 供具备 SDK 的环境显式启用。candle 的
+  metal 变体仅 Apple 目标可编译（candle 上游把 objc2 系 metal 依赖
+  声明为无平台 gating 的普通 optional 依赖，非 Apple 目标启用直接
+  compile_error；cargo 的 resolve 不按目标段过滤，同包同名依赖亦无法
+  双名并存做平台化 feature），故不进入任何聚合；llama 侧 metal 为
+  无副作用标记 feature（GGML_METAL 由 CMake 在 Apple 目标自动开启），
+  随 `local-gguf-full` 保留。Cargo.toml 内有同语义注释。
 
 ### 3.6 桌面感知 harness（feature `harness`；v1.15 瘦身，用户要求 U）
 
@@ -179,9 +192,16 @@
   `local`/`local-gguf`/`local-server`/`local-cuda`/`local-metal`/
   `local-vulkan`/`harness-linux-*` 均已撤销。
 - 【AI 演绎】常用命令：`cargo check --features harness`、
-  `cargo test --features harness`、
+  `cargo test --features harness`、【用户要求，2026-09-13】
+  `cargo clippy --features full --all-targets -- -D warnings`（全量
+  lint 门禁，Cargo.toml 尾注）、
   `cargo publish --allow-dirty --registry crates-io`（Cargo.toml 尾注）；
   文档站 `cd docs && npm run docs:build`。
+- 【AI 演绎，2026-09-13】本地构建工具链要求：`local-gguf-*` 系需要
+  cmake + C++ 工具链，bindgen 需 libclang（本机约定
+  `LIBCLANG_PATH=D:\Software\Program\LLVM\bin`）；`local-*-cuda` 需
+  CUDA Toolkit（candle-kernels 构建期跑 nvcc），`local-gguf-vulkan`
+  需 Vulkan SDK（Windows 构建期强制 `VULKAN_SDK` 环境变量）。
 - 【AI 演绎】CI：`.github/workflows/rust.yml`（多平台矩阵，具体策略以
   workflow 文件为准）。
 - 【AI 演绎】发布顺序约束（2026-09-12 起）：先 `cargo publish` potato

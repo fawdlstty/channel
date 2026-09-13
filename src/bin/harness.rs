@@ -326,7 +326,7 @@ fn spawn_focus_poller(
                 Ok(None) => continue,
                 Err(_) => {
                     consecutive_stalls += 1;
-                    if consecutive_stalls == 1 || consecutive_stalls % STALL_WARN_STEP == 0 {
+                    if consecutive_stalls == 1 || consecutive_stalls.is_multiple_of(STALL_WARN_STEP) {
                         tracing::warn!(
                             consecutive = consecutive_stalls,
                             poll_ms = ms,
@@ -344,7 +344,7 @@ fn spawn_focus_poller(
                 Ok(()) => {}
                 Err(mpsc::TrySendError::Full(_)) => {
                     dropped_events += 1;
-                    if dropped_events == 1 || dropped_events % 256 == 0 {
+                    if dropped_events == 1 || dropped_events.is_multiple_of(256) {
                         // P3-13：丢弃现场走结构化日志（原 eprintln 文案语义
                         // 保留，字段带累计数与通道容量）。
                         tracing::warn!(

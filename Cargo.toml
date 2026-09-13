@@ -124,15 +124,26 @@ local-safetensors-cpu = [
     "dep:minijinja-contrib",
 ]
 local-safetensors-cuda = ["local-safetensors-cpu", "candle-core/cuda"]
+# metal 变体仅 Apple 目标可编译：candle 上游把 objc2 系 metal 依赖声明为
+# 普通 optional 依赖（无目标平台 gating），非 Apple 目标启用
+# `candle-core/metal` 直接 compile_error（objc2 仅 Apple 平台可编译）；
+# cargo 又不支持按目标平台激活 feature（同包同名依赖无法双名并存），
+# 因此该变体不进入任何聚合 feature。
 local-safetensors-metal = ["local-safetensors-cpu", "candle-core/metal"]
 local-gguf-cpu = ["local-safetensors-cpu", "dep:llama-cpp-2"]
 local-gguf-cuda = ["local-gguf-cpu", "llama-cpp-2/cuda"]
 local-gguf-metal = ["local-gguf-cpu", "llama-cpp-2/metal"]
 local-gguf-vulkan = ["local-gguf-cpu", "llama-cpp-2/vulkan"]
 # Aggregates: `local-<format>-full` turns on every backend of that weight
-# format (CPU baseline included); `full` turns on every feature of this crate.
-local-safetensors-full = ["local-safetensors-cpu", "local-safetensors-cuda", "local-safetensors-metal"]
-local-gguf-full = ["local-gguf-cpu", "local-gguf-cuda", "local-gguf-metal", "local-gguf-vulkan"]
+# format that builds WITHOUT external GPU SDK requirements (CPU baseline
+# included). cuda（candle-kernels 构建期需要 nvcc；llama.cpp 构建期需要
+# CUDA Toolkit）与 vulkan（Windows 构建期强制要求 VULKAN_SDK）有编译期
+# SDK 硬依赖，candle 的 metal 有目标平台硬限制，均不进入聚合——否则
+# `full` 在任何无对应 SDK/平台的机器上都无法编译。GPU 后端保持独立
+# feature，由具备条件的构建环境显式启用（llama 侧 GGML_METAL 由 CMake
+# 在 Apple 目标自动开启，metal 标记 feature 无副作用，随聚合保留）。
+local-safetensors-full = ["local-safetensors-cpu"]
+local-gguf-full = ["local-gguf-cpu", "local-gguf-metal"]
 full = ["llm", "ccswitch", "local-safetensors-full", "local-gguf-full", "harness"]
 # Desktop-sensing harness (folded in from the former `charness` crate):
 # UIA/AT-SPI control-tree awareness, association graph, read-only atomic
@@ -161,5 +172,6 @@ harness = [
 # with default features still compiles every target; the gated mains print
 # the enabling `--features` flag when run.
 
+# cargo clippy --features full --all-targets -- -D warnings
 # cargo publish --allow-dirty --registry crates-io
 # cd docs && npm run docs:build && cd ..

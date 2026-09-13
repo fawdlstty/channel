@@ -43,24 +43,20 @@ impl CodexTransport {
     async fn read(&mut self) -> Result<Option<Value>, Error> {
         match self {
             Self::Process(process) => process.read().await,
-            Self::WebSocket(stream) => loop {
-                match stream.recv().await {
-                    Ok(potato::WsFrame::Text(message)) => return message.parse_message(),
-                    Ok(potato::WsFrame::Binary(message)) => {
-                        let message = std::str::from_utf8(&message).map_err(|error| {
-                            Error::ProtocolError(format!("Codex WebSocket was not UTF-8: {error}"))
-                        })?;
-                        return message.parse_message();
-                    }
-                    // potato 把 Ping 自动应答、Pong 吞掉；对端 Close 帧折叠
-                    // 成固定文案的错误（自家库约定），据此归一为「会话结束」。
-                    Err(error) if error.to_string().contains("close frame") => return Ok(None),
-                    Err(error) => {
-                        return Err(Error::Backend(format!(
-                            "failed to read Codex WebSocket message: {error}"
-                        )));
-                    }
+            Self::WebSocket(stream) => match stream.recv().await {
+                Ok(potato::WsFrame::Text(message)) => message.parse_message(),
+                Ok(potato::WsFrame::Binary(message)) => {
+                    let message = std::str::from_utf8(&message).map_err(|error| {
+                        Error::ProtocolError(format!("Codex WebSocket was not UTF-8: {error}"))
+                    })?;
+                    message.parse_message()
                 }
+                // potato 把 Ping 自动应答、Pong 吞掉；对端 Close 帧折叠
+                // 成固定文案的错误（自家库约定），据此归一为「会话结束」。
+                Err(error) if error.to_string().contains("close frame") => Ok(None),
+                Err(error) => Err(Error::Backend(format!(
+                    "failed to read Codex WebSocket message: {error}"
+                ))),
             },
         }
     }
@@ -689,7 +685,7 @@ impl CodexTransport {
         endpoint: Option<&str>,
     ) -> Result<Self, Error> {
         if let Some(endpoint) = endpoint {
-            return Ok(Self::connect_websocket(endpoint).await?);
+            return Self::connect_websocket(endpoint).await;
         }
         Ok(Self::Process(Box::new(
             JsonlProcess::spawn_with_cwd(command, args, cwd).await?,

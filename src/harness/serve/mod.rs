@@ -277,7 +277,7 @@ pub fn run_with_timeout<W: Write>(
                         Err(_) => {
                             // result_rx 在此丢弃：迟到的工作线程 send 失败，响应不留痕。
                             abandoned_workers += 1;
-                            if abandoned_workers % ABANDONED_WARN_STEP == 0 {
+                            if abandoned_workers.is_multiple_of(ABANDONED_WARN_STEP) {
                                 // 超时线程累积（P3-4 慢性病）：warn 级结构化
                                 // 字段带累计数/op/超时上限，去 stderr。
                                 tracing::warn!(

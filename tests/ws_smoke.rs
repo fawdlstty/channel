@@ -41,7 +41,9 @@ impl WebsocketIo for SyncSocket {
 }
 
 /// 测试用掩码随机源（协议只要求客户端帧带掩码；内容不必密码学强度）。
-fn test_rng() -> Box<dyn FnMut(&mut [u8]) + Send> {
+type TestRng = Box<dyn FnMut(&mut [u8]) + Send>;
+
+fn test_rng() -> TestRng {
     use std::hash::{BuildHasher, Hasher};
     let state = std::collections::hash_map::RandomState::new();
     let mut seq: u64 = 0;

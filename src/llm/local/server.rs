@@ -130,21 +130,21 @@ impl LocalLlmServer {
 
 /// Synchronous request triage: authentication, routing and protocol
 /// extraction. Returns a plan carrying the parsed request, or a ready-made
-/// error response.
+/// error response (boxed to keep the `Result` small on the hot path).
 fn route(
     request: &mut potato::HttpRequest,
     token: &Option<String>,
-) -> Result<Plan, potato::HttpResponse> {
+) -> Result<Plan, Box<potato::HttpResponse>> {
     if let Some(token) = token {
         let expected = format!("Bearer {token}");
         let matches = request
             .get_header("authorization")
             .is_some_and(|value| value == expected);
         if !matches {
-            return Err(json_response(
+            return Err(Box::new(json_response(
                 401,
                 &serde_json::json!({"error": {"message": "invalid or missing bearer token"}}),
-            ));
+            )));
         }
     }
     let path = request.url_path.as_str().to_owned();
@@ -152,27 +152,27 @@ fn route(
         return match path.as_str() {
             "/v1/models" => Ok(Plan::OpenAiModels),
             "/api/tags" => Ok(Plan::OllamaTags),
-            _ => Err(potato::HttpResponse::not_found()),
+            _ => Err(Box::new(potato::HttpResponse::not_found())),
         };
     }
     if request.method != potato::HttpMethod::POST {
-        return Err(potato::HttpResponse::not_found());
+        return Err(Box::new(potato::HttpResponse::not_found()));
     }
     let flavor = match path.as_str() {
         "/v1/chat/completions" => Flavor::OpenAi,
         "/v1/responses" => Flavor::Responses,
         "/v1/messages" => Flavor::Anthropic,
         "/api/chat" => Flavor::Ollama,
-        _ => return Err(potato::HttpResponse::not_found()),
+        _ => return Err(Box::new(potato::HttpResponse::not_found())),
     };
     let body: serde_json::Value = match serde_json::from_slice(&request.body) {
         Ok(body) => body,
         Err(error) => {
-            return Err(error_response(
+            return Err(Box::new(error_response(
                 flavor,
                 400,
                 &Error::ProtocolError(format!("invalid request body: {error}")),
-            ))
+            )))
         }
     };
     Ok(match flavor {
@@ -277,7 +277,7 @@ fn apply_params(body: &serde_json::Value, params: &mut crate::llm::GenerationPar
 fn parse_chat_request(
     body: &serde_json::Value,
     flavor: Flavor,
-) -> Result<ChatRequest, potato::HttpResponse> {
+) -> Result<ChatRequest, Box<potato::HttpResponse>> {
     let mut messages = Vec::new();
     if let Some(entries) = body["messages"].as_array() {
         for entry in entries {
@@ -319,7 +319,9 @@ fn parse_chat_request(
 
 /// OpenAI Responses: `instructions` becomes the system message and `input`
 /// is either a plain string or an array of `{role, content}` items.
-fn parse_responses_request(body: &serde_json::Value) -> Result<ChatRequest, potato::HttpResponse> {
+fn parse_responses_request(
+    body: &serde_json::Value,
+) -> Result<ChatRequest, Box<potato::HttpResponse>> {
     let mut messages = Vec::new();
     if let Some(instructions) = body["instructions"].as_str() {
         messages.push(ChatMessage::system(instructions));
@@ -348,7 +350,9 @@ fn parse_responses_request(body: &serde_json::Value) -> Result<ChatRequest, pota
 
 /// Anthropic Messages: the top-level `system` field is lifted into a system
 /// message, mirroring [`crate::MessagesClient`].
-fn parse_anthropic_request(body: &serde_json::Value) -> Result<ChatRequest, potato::HttpResponse> {
+fn parse_anthropic_request(
+    body: &serde_json::Value,
+) -> Result<ChatRequest, Box<potato::HttpResponse>> {
     let mut messages = Vec::new();
     if let Some(system) = body["system"].as_str() {
         messages.push(ChatMessage::system(system));
@@ -373,35 +377,35 @@ fn parse_anthropic_request(body: &serde_json::Value) -> Result<ChatRequest, pota
 fn resolve<'m>(
     models: &'m HashMap<String, LocalClient>,
     name: Option<&str>,
-) -> Result<&'m LocalClient, potato::HttpResponse> {
+) -> Result<&'m LocalClient, Box<potato::HttpResponse>> {
     match name {
         Some(name) => models.get(name).ok_or_else(|| {
-            error_response(
+            Box::new(error_response(
                 Flavor::OpenAi,
                 400,
                 &Error::InvalidConfig(format!(
                     "model '{name}' is not mounted; mounted: {:?}",
                     models.keys().collect::<Vec<_>>()
                 )),
-            )
+            ))
         }),
         None => {
             let mut iter = models.values();
             let first = iter.next().ok_or_else(|| {
-                error_response(
+                Box::new(error_response(
                     Flavor::OpenAi,
                     500,
                     &Error::InvalidConfig("no model is mounted".to_owned()),
-                )
+                ))
             })?;
             if iter.next().is_some() {
-                return Err(error_response(
+                return Err(Box::new(error_response(
                     Flavor::OpenAi,
                     400,
                     &Error::InvalidConfig(
                         "several models are mounted; the request must name one".to_owned(),
                     ),
-                ));
+                )));
             }
             Ok(first)
         }
@@ -462,12 +466,12 @@ where
 }
 
 async fn execute(
-    plan: Result<Plan, potato::HttpResponse>,
+    plan: Result<Plan, Box<potato::HttpResponse>>,
     models: &HashMap<String, LocalClient>,
 ) -> Option<potato::HttpResponse> {
     let plan = match plan {
         Ok(plan) => plan,
-        Err(response) => return Some(response),
+        Err(response) => return Some(*response),
     };
     match plan {
         Plan::OpenAiModels => {
@@ -514,7 +518,7 @@ async fn openai_chat(
     let flavor = Flavor::OpenAi;
     let client = match resolve(models, request.model.as_deref()) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let mut session = match prepare_session(client, &request) {
         Ok(session) => session,
@@ -567,7 +571,7 @@ async fn openai_responses(
     let flavor = Flavor::Responses;
     let client = match resolve(models, request.model.as_deref()) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let mut session = match prepare_session(client, &request) {
         Ok(session) => session,
@@ -640,7 +644,7 @@ async fn anthropic_messages(
     let flavor = Flavor::Anthropic;
     let client = match resolve(models, request.model.as_deref()) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let mut session = match prepare_session(client, &request) {
         Ok(session) => session,
@@ -688,7 +692,7 @@ async fn ollama_chat(
     let flavor = Flavor::Ollama;
     let client = match resolve(models, request.model.as_deref()) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let mut session = match prepare_session(client, &request) {
         Ok(session) => session,

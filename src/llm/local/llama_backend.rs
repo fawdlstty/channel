@@ -165,7 +165,7 @@ mod enabled {
             model_params = model_params.with_n_gpu_layers(layers);
         }
         let model =
-            LlamaModel::load_from_file(&backend, gguf_path, &model_params).map_err(|error| {
+            LlamaModel::load_from_file(backend, gguf_path, &model_params).map_err(|error| {
                 // llama.cpp rejects unsupported architectures and corrupted
                 // weights here.
                 map_load_error(error, gguf_path)
@@ -179,7 +179,7 @@ mod enabled {
                 .with_n_threads_batch(threads as i32);
         }
         let context = model
-            .new_context(&backend, context_params)
+            .new_context(backend, context_params)
             .map_err(|error| map_load_error(error, gguf_path))?;
 
         let n_ctx = context.n_ctx();
