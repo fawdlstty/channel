@@ -8,10 +8,7 @@
     "recordEventUi/recordEventBrowser（upgrade.md §4.2 统一录制事件模型）：",
     "camelCase 键；firstText/edits 仅合帧后出现（§4.4）；source 字面量",
     "cdp|uia|atspi；事件行外层键 cdp→browser、uia/atspi→ui。",
-    "errorCodeSample：serve 错误响应的 code 键形态（仅平台/能力级错误携带）。",
-    "relocation（upgrade.md §9.3）：relocate_control 出参 Relocation 形态——",
-    "control 为 SceneNode→ControlRef 形态（句柄/窗口/矩形未知记 0/空/默认，",
-    "path 缺席）；LLM 响应经结构化解析后出参，响应原文不进契约。"
+    "errorCodeSample：serve 错误响应的 code 键形态（仅平台/能力级错误携带）。"
   ],
   "controlRef": {
     "handle": 197296,
@@ -185,21 +182,6 @@
     "ok": false,
     "error": "操作类工具未授权：需以 harness --actuation 启动（或环境变量 HARNESS_ACTUATION=1）",
     "code": "actuation-locked"
-  },
-  "relocation": {
-    "control": {
-      "handle": 0,
-      "controlType": "Button",
-      "name": "提交",
-      "automationId": "SubmitBtn",
-      "className": "Button",
-      "windowTitle": "",
-      "processName": "",
-      "rect": { "x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0 },
-      "enabled": false
-    },
-    "confidence": 0.875,
-    "reason": "名称与 automationId 双匹配"
   }
 }
 

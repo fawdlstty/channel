@@ -47,6 +47,8 @@ tracing-subscriber = { version = "0.3", optional = true, default-features = fals
 
 [dev-dependencies]
 tempfile = "3"
+# test-util: start_paused virtual time for deterministic idle-clock tests.
+tokio = { version = "1", features = ["test-util"] }
 
 # --- harness feature: Linux target dependencies (all pure Rust, no libX11
 # --- / libdbus hard links; all compiled in with `harness`, which one is used

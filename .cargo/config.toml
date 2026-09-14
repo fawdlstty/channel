@@ -1,0 +1,6 @@
+# simsimd (via ormer -> turso) 的 AVX512-BF16 "GENOA" 后端在 MSVC (cl 14.44) 下
+# 编译失败（dot.h 中 __m512bh 转换报 C2440/C2168），其 build.rs 的逐个降级
+# fallback 也不可靠，导致链接期找不到 simsimd.lib（LNK1181）。
+# 通过官方环境变量直接禁用该后端；SIMSIMD 运行时动态派发会使用其余后端。
+[env]
+SIMSIMD_TARGET_GENOA = "0"

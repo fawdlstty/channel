@@ -773,7 +773,10 @@ impl<'a> CodexNotification<'a> {
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                 {
-                    Vec::new()
+                    // Retryable errors must stay non-fatal, but still surface as
+                    // raw activity: idle watchers rely on them to see that codex
+                    // is alive between upstream retries.
+                    vec![Event::Raw(self.0.clone())]
                 } else {
                     vec![Event::Error(CodexNotification::error_message(&params))]
                 }
@@ -1272,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_retryable_errors_and_surfaces_final_errors() {
+    fn retryable_errors_stay_raw_and_final_errors_surface() {
         let retryable = notification(
             "error",
             json!({
@@ -1280,7 +1283,10 @@ mod tests {
                 "willRetry": true
             }),
         );
-        assert!(CodexNotification(&retryable).events().is_empty());
+        assert_eq!(
+            CodexNotification(&retryable).events(),
+            vec![Event::Raw(retryable.clone())]
+        );
 
         let failed = notification(
             "error",

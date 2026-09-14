@@ -87,14 +87,16 @@ impl EventCache {
     }
 
     /// 记录焦点变化（None = 失焦/清除；锁毒化按缺席降级，不 panic）。
-    pub(crate) fn note_focus(&self, focus: Option<ObjectRef>) {
+    /// pub：recorder 已外移至 app（v1.15），写入面为 app 事件泵的跨仓公开 API。
+    pub fn note_focus(&self, focus: Option<ObjectRef>) {
         if let Ok(mut guard) = self.focus.lock() {
             *guard = focus;
         }
     }
 
     /// 记录前台窗口激活。
-    pub(crate) fn note_active_window(&self, window: ObjectRef) {
+    /// pub：recorder 已外移至 app（v1.15），写入面为 app 事件泵的跨仓公开 API。
+    pub fn note_active_window(&self, window: ObjectRef) {
         if let Ok(mut guard) = self.active_window.lock() {
             *guard = Some(window);
         }
@@ -293,7 +295,7 @@ pub(crate) fn build_tree_path(segments: &[(String, String)]) -> Option<String> {
 /// 窗口稳定句柄：app 名 + 标题的 FNV-1a 64 位哈希（§7.1「纯 Wayland 用
 /// app name+标题稳定哈希」；X11 XID 在 AT-SPI 接口面无通道，暂同策略，
 /// 见模块文档）。确定性、会话间稳定；i64 承载（HWND 语义位）。
-pub(crate) fn stable_window_handle(app: &str, title: &str) -> i64 {
+pub fn stable_window_handle(app: &str, title: &str) -> i64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET_BASIS;
@@ -655,7 +657,7 @@ async fn label_of_previous_text_sibling(
 /// ObjectRef 的感知标注（recorder 事件行的元素锚点；probe 的缓存焦点/
 /// 窗口回建也走它）。
 #[derive(Debug, Clone)]
-pub(crate) struct ElementAnnotation {
+pub struct ElementAnnotation {
     /// 映射后的 UIA ControlType 字符串。
     pub control_type: String,
     /// 可访问名（密码已掩码）。
@@ -674,7 +676,7 @@ pub(crate) struct ElementAnnotation {
 
 /// ObjectRef → [`ElementAnnotation`]（祖先上溯 ≤ PATH_MAX_DEPTH 步；
 /// 异步本体——recorder 事件泵与 probe 的 block_on 调用方共用）。
-pub(crate) async fn annotate_object_async(
+pub async fn annotate_object_async(
     conn: &AccessibilityConnection,
     obj: &ObjectRef,
 ) -> Option<ElementAnnotation> {
@@ -730,7 +732,7 @@ pub(crate) async fn annotate_object_async(
 }
 
 /// 标注 → 元素级 ControlRef（handle=0；recorder/probe 共用）。
-pub(crate) fn annotation_to_control_ref(ann: &ElementAnnotation) -> ControlRef {
+pub fn annotation_to_control_ref(ann: &ElementAnnotation) -> ControlRef {
     ControlRef {
         handle: 0,
         control_type: ann.control_type.clone(),

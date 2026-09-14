@@ -9,7 +9,8 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+use tokio::time::Instant;
 
 pub(crate) type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 
@@ -152,6 +153,10 @@ pub struct Session {
     pending_permissions: HashSet<String>,
     resources: crate::protocol::ResourcePolicy,
     last_error: Option<String>,
+    /// Moment the backend last delivered an event, refreshed by every event
+    /// received in [`Session::wait_event`], including ones that never surface
+    /// as a [`SessionEvent`]. Seeded at session creation.
+    last_event_at: Instant,
 }
 
 trait ActivityName {
@@ -474,6 +479,7 @@ impl Session {
             pending_permissions: HashSet::new(),
             resources: config.runtime.resources,
             last_error: None,
+            last_event_at: Instant::now(),
         }
     }
 
@@ -563,7 +569,10 @@ impl Session {
 
         loop {
             let event = match self.backend.next_event().await {
-                Ok(Some(event)) => event,
+                Ok(Some(event)) => {
+                    self.last_event_at = Instant::now();
+                    event
+                }
                 Ok(None) => {
                     if !self.active_turn {
                         return Ok(None);
@@ -648,6 +657,15 @@ impl Session {
 
     pub fn state(&self) -> Status {
         self.status
+    }
+
+    /// Time elapsed since the backend last delivered an event to this session.
+    /// Every backend event counts, including ones that never surface as a
+    /// [`SessionEvent`] (raw payloads, non-terminal status changes), so
+    /// callers can tell a silently-stuck backend from one progressing through
+    /// phases invisible at the session-event level.
+    pub fn idle_for(&self) -> Duration {
+        self.last_event_at.elapsed()
     }
 
     pub fn activity(&self) -> ActivitySummary {
@@ -1320,6 +1338,56 @@ mod tests {
             session.info().visibility.resumability,
             Resumability::InMemoryOnly
         );
+    }
+
+    /// Emits one raw event, then stays silent forever without ending the turn.
+    struct RawThenSilentBackend {
+        emitted: bool,
+    }
+
+    impl Backend for RawThenSilentBackend {
+        fn send<'a>(&'a mut self, _message: String) -> BackendFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn next_event<'a>(&'a mut self) -> BackendFuture<'a, Option<Event>> {
+            Box::pin(async move {
+                if self.emitted {
+                    std::future::pending::<Result<Option<Event>, Error>>().await
+                } else {
+                    self.emitted = true;
+                    Ok(Some(Event::Raw(serde_json::json!({
+                        "method": "backgroundEvent",
+                        "params": {}
+                    }))))
+                }
+            })
+        }
+
+        fn interrupt<'a>(&'a mut self) -> BackendFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close<'a>(&'a mut self) -> BackendFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_for_counts_events_that_never_surface_as_session_events() {
+        let mut session = Session::with_backend_config(
+            SessionConfig::default_for(HarnessKind::Codex),
+            Some("test-session".to_owned()),
+            Box::new(RawThenSilentBackend { emitted: false }),
+            None,
+        );
+        session.send("请求", SendMode::Immediate).await.unwrap();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        assert_eq!(session.idle_for(), Duration::from_secs(300));
+        // wait_event drains the raw event (which maps to no SessionEvent) and
+        // must refresh the idle clock while it keeps waiting for a real one.
+        let _ = tokio::time::timeout(Duration::from_secs(10), session.wait_event()).await;
+        assert_eq!(session.idle_for(), Duration::from_secs(10));
     }
 
     #[tokio::test]
