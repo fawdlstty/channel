@@ -170,6 +170,9 @@ pub struct SessionConfig {
     pub port: Option<u16>,
     pub provider_options: ProviderOptions,
     pub switch_key: Option<String>,
+    /// 切换渠道场景下，relay 对上游“首字节前失败”的额外重试次数
+    /// （总尝试次数 = 1 + 该值；0 表示不重试，即失败立刻上报）。
+    pub upstream_retries: u32,
     pub backend: BackendSpec,
 }
 
@@ -287,6 +290,15 @@ impl SessionConfig {
         }
     }
 
+    /// relay 对上游首字节前失败的额外重试次数；总尝试 = 1 + 该值。
+    pub fn upstream_retries(&self) -> u32 {
+        self.upstream_retries
+    }
+
+    pub fn set_upstream_retries(&mut self, retries: u32) {
+        self.upstream_retries = retries;
+    }
+
     pub(crate) fn default_for(kind: HarnessKind) -> Self {
         Self {
             kind,
@@ -301,6 +313,7 @@ impl SessionConfig {
             port: None,
             provider_options: ProviderOptions::new(),
             switch_key: None,
+            upstream_retries: 0,
             backend: BackendSpec::Auto,
         }
     }
