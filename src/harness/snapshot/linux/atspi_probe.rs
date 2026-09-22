@@ -15,7 +15,7 @@
 //! - 密码遮蔽 ≈ `Role.PasswordText`（§22.7 四采集点惯例：Name/读值/树转储
 //!   统一 [`crate::harness::snapshot::PASSWORD_PLACEHOLDER`]；注：AT-SPI 的
 //!   password-protected **状态**已在 at-spi2-core 2.51 移除，atspi-common
-//!   0.12 无此变体，角色判定是现存通道——GTK/Qt 密码框均暴露该角色）。
+//!   0.12 起各版均无此变体，角色判定是现存通道——GTK/Qt 密码框均暴露该角色）。
 //!
 //! # Handle 语义（§7.1「Handle 语义」）
 //!
@@ -46,7 +46,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::text::TextProxy;
 use atspi::proxy::value::ValueProxy;
-use atspi::{AccessibilityConnection, CoordType, Interface, ObjectRef, Role, State};
+use atspi::{AccessibilityConnection, CoordType, Interface, ObjectRefOwned, Role, State};
 use futures_lite::future::block_on;
 
 use crate::harness::snapshot::synth::{LABEL_MAX_PREV_SIBLINGS, PATH_MAX_DEPTH};
@@ -55,9 +55,6 @@ use crate::harness::snapshot::{
 };
 use crate::harness::store::{ControlRef, ControlRect, SceneNode};
 use crate::harness::Error;
-
-/// AT-SPI null 对象路径（atk-adaptor 越界索引等场景的占位对象）。
-const NULL_PATH: &str = "/org/a11y/atspi/null";
 
 /// 命中测试单窗口内下钻层数上限（防病态 provider 的环/超深树）。
 const HIT_DRILL_MAX_DEPTH: usize = 64;
@@ -75,9 +72,9 @@ const FOCUSED_SCAN_NODE_BUDGET: usize = 2500;
 #[derive(Debug, Default)]
 pub struct EventCache {
     /// 最近 `state-changed:focused`（true）的元素；失焦即清空。
-    focus: Mutex<Option<ObjectRef>>,
+    focus: Mutex<Option<ObjectRefOwned>>,
     /// 最近 `window:activate` 的窗口对象。
-    active_window: Mutex<Option<ObjectRef>>,
+    active_window: Mutex<Option<ObjectRefOwned>>,
 }
 
 impl EventCache {
@@ -88,7 +85,7 @@ impl EventCache {
 
     /// 记录焦点变化（None = 失焦/清除；锁毒化按缺席降级，不 panic）。
     /// pub：recorder 已外移至 app（v1.15），写入面为 app 事件泵的跨仓公开 API。
-    pub fn note_focus(&self, focus: Option<ObjectRef>) {
+    pub fn note_focus(&self, focus: Option<ObjectRefOwned>) {
         if let Ok(mut guard) = self.focus.lock() {
             *guard = focus;
         }
@@ -96,19 +93,19 @@ impl EventCache {
 
     /// 记录前台窗口激活。
     /// pub：recorder 已外移至 app（v1.15），写入面为 app 事件泵的跨仓公开 API。
-    pub fn note_active_window(&self, window: ObjectRef) {
+    pub fn note_active_window(&self, window: ObjectRefOwned) {
         if let Ok(mut guard) = self.active_window.lock() {
             *guard = Some(window);
         }
     }
 
     /// 当前缓存焦点。
-    pub(crate) fn focus(&self) -> Option<ObjectRef> {
+    pub(crate) fn focus(&self) -> Option<ObjectRefOwned> {
         self.focus.lock().ok().and_then(|g| g.clone())
     }
 
     /// 当前缓存前台窗口。
-    pub(crate) fn active_window(&self) -> Option<ObjectRef> {
+    pub(crate) fn active_window(&self) -> Option<ObjectRefOwned> {
         self.active_window.lock().ok().and_then(|g| g.clone())
     }
 
@@ -311,11 +308,6 @@ fn rect_from_extents(x: i32, y: i32, w: i32, h: i32) -> ControlRect {
     ControlRect { x: x as f64, y: y as f64, width: w as f64, height: h as f64 }
 }
 
-/// null 对象判定（越界/缺席的 AT-SPI 惯例占位）。
-fn is_null(obj: &ObjectRef) -> bool {
-    obj.path.as_str() == NULL_PATH
-}
-
 /* --- 探测主体 ------------------------------------------------------------------ */
 
 /// AT-SPI2 感知探测（[`ControlProbe`] 的 Linux 生产实现）。
@@ -356,19 +348,20 @@ impl AtspiProbe {
 
 /* --- 异步辅助（全部经 block_on 同步消费；D4） ---------------------------------- */
 
-/// ObjectRef → AccessibleProxy（无属性缓存——感知逐调用取新鲜值；内联
-/// builder 避免 ObjectRefExt 不透明 future 把 obj 生命周期漏进返回值）。
+/// ObjectRefOwned → AccessibleProxy（无属性缓存——感知逐调用取新鲜值；内联
+/// builder 收 String 经 TryInto，避免把 obj 生命周期漏进返回值；name 缺席
+/// 即无 destination 可达，`?` 诚实放弃而非空名构造）。
 async fn as_proxy<'a>(
     conn: &'a AccessibilityConnection,
-    obj: &ObjectRef,
+    obj: &ObjectRefOwned,
 ) -> Option<AccessibleProxy<'a>> {
-    if is_null(obj) {
+    if obj.is_null() {
         return None;
     }
     AccessibleProxy::builder(conn.connection())
-        .destination(obj.name.clone())
+        .destination(obj.name_as_str()?.to_string())
         .ok()?
-        .path(obj.path.clone())
+        .path(obj.path_as_str().to_string())
         .ok()?
         .cache_properties(atspi::zbus::proxy::CacheProperties::No)
         .build()
@@ -376,15 +369,15 @@ async fn as_proxy<'a>(
         .ok()
 }
 
-/// ObjectRef → ComponentProxy（屏幕坐标语义的几何接口）。
+/// ObjectRefOwned → ComponentProxy（屏幕坐标语义的几何接口）。
 async fn component_proxy<'a>(
     conn: &'a AccessibilityConnection,
-    obj: &ObjectRef,
+    obj: &ObjectRefOwned,
 ) -> Option<ComponentProxy<'a>> {
     ComponentProxy::builder(conn.connection())
-        .destination(obj.name.clone())
+        .destination(obj.name_as_str()?.to_string())
         .ok()?
-        .path(obj.path.clone())
+        .path(obj.path_as_str().to_string())
         .ok()?
         .cache_properties(atspi::zbus::proxy::CacheProperties::No)
         .build()
@@ -392,23 +385,23 @@ async fn component_proxy<'a>(
         .ok()
 }
 
-/// ObjectRef 的屏幕矩形（Component extents；失败 None）。
-async fn extents_of(conn: &AccessibilityConnection, obj: &ObjectRef) -> Option<ControlRect> {
+/// ObjectRefOwned 的屏幕矩形（Component extents；失败 None）。
+async fn extents_of(conn: &AccessibilityConnection, obj: &ObjectRefOwned) -> Option<ControlRect> {
     let comp = component_proxy(conn, obj).await?;
     let (x, y, w, h) = comp.get_extents(CoordType::Screen).await.ok()?;
     Some(rect_from_extents(x, y, w, h))
 }
 
-/// ObjectRef 是否持有指定状态（get_state 契约失败按 false）。
-async fn has_state(conn: &AccessibilityConnection, obj: &ObjectRef, state: State) -> bool {
+/// ObjectRefOwned 是否持有指定状态（get_state 契约失败按 false）。
+async fn has_state(conn: &AccessibilityConnection, obj: &ObjectRefOwned, state: State) -> bool {
     match as_proxy(conn, obj).await {
         Some(proxy) => proxy.get_state().await.map(|s| s.contains(state)).unwrap_or(false),
         None => false,
     }
 }
 
-/// ObjectRef 的 label 关联（前邻 Text 兄弟；组装代理后走回看）。
-async fn label_of(conn: &AccessibilityConnection, obj: &ObjectRef) -> Option<ControlRef> {
+/// ObjectRefOwned 的 label 关联（前邻 Text 兄弟；组装代理后走回看）。
+async fn label_of(conn: &AccessibilityConnection, obj: &ObjectRefOwned) -> Option<ControlRef> {
     let proxy = as_proxy(conn, obj).await?;
     label_of_previous_text_sibling(conn, &proxy).await
 }
@@ -429,7 +422,7 @@ async fn owning_app_name(
 
 /// registry 根 → 应用根清单（部分桌面在 registry 与应用间垫一层
 /// DesktopFrame，透明下钻）。
-async fn desktop_apps(conn: &AccessibilityConnection) -> Vec<ObjectRef> {
+async fn desktop_apps(conn: &AccessibilityConnection) -> Vec<ObjectRefOwned> {
     let mut apps = Vec::new();
     let Ok(root) = conn.root_accessible_on_registry().await else {
         return apps;
@@ -438,7 +431,7 @@ async fn desktop_apps(conn: &AccessibilityConnection) -> Vec<ObjectRef> {
         return apps;
     };
     for child in children {
-        if is_null(&child) {
+        if child.is_null() {
             continue;
         }
         let Some(proxy) = as_proxy(conn, &child).await else {
@@ -446,7 +439,7 @@ async fn desktop_apps(conn: &AccessibilityConnection) -> Vec<ObjectRef> {
         };
         if proxy.get_role().await.unwrap_or(Role::Unknown) == Role::DesktopFrame {
             if let Ok(inner) = proxy.get_children().await {
-                apps.extend(inner.into_iter().filter(|c| !is_null(c)));
+                apps.extend(inner.into_iter().filter(|c| !c.is_null()));
             }
         } else {
             apps.push(child);
@@ -455,11 +448,11 @@ async fn desktop_apps(conn: &AccessibilityConnection) -> Vec<ObjectRef> {
     apps
 }
 
-/// 应用根 → 顶层窗口 ObjectRef 清单（窗口角色过滤）。
+/// 应用根 → 顶层窗口 ObjectRefOwned 清单（窗口角色过滤）。
 async fn app_windows(
     conn: &AccessibilityConnection,
-    app: &ObjectRef,
-) -> Vec<(ObjectRef, String)> {
+    app: &ObjectRefOwned,
+) -> Vec<(ObjectRefOwned, String)> {
     let mut windows = Vec::new();
     let Some(proxy) = as_proxy(conn, app).await else {
         return windows;
@@ -468,7 +461,7 @@ async fn app_windows(
         return windows;
     };
     for child in children {
-        if is_null(&child) {
+        if child.is_null() {
             continue;
         }
         let Some(child_proxy) = as_proxy(conn, &child).await else {
@@ -487,7 +480,7 @@ async fn app_windows(
 
 /// 命中钻探结果：最深命中对象 + 自窗口层起的路径段 + 所属窗口/应用名。
 struct DrillHit {
-    hit: ObjectRef,
+    hit: ObjectRefOwned,
     /// 自身 + 祖先的（映射类型, 名字）对，**自窗口层起、含自身**。
     segments: Vec<(String, String)>,
     window_title: String,
@@ -499,7 +492,7 @@ struct DrillHit {
 /// 点位不在窗口内 → None。
 async fn drill_from_window(
     conn: &AccessibilityConnection,
-    window: &ObjectRef,
+    window: &ObjectRefOwned,
     window_title: &str,
     app_name: &str,
     x: i32,
@@ -525,7 +518,7 @@ async fn drill_from_window(
         let Ok(next) = comp.get_accessible_at_point(x, y, CoordType::Screen).await else {
             break;
         };
-        if is_null(&next) || next.path.as_str() == current.path.as_str() {
+        if next.is_null() || next.path_as_str() == current.path_as_str() {
             break;
         }
         let Some(next_proxy) = as_proxy(conn, &next).await else {
@@ -624,7 +617,7 @@ async fn label_of_previous_text_sibling(
         let Ok(prev) = pproxy.get_child_at_index(prev_index).await else {
             break;
         };
-        if is_null(&prev) {
+        if prev.is_null() {
             break;
         }
         let Some(prev_proxy) = as_proxy(conn, &prev).await else {
@@ -654,7 +647,7 @@ async fn label_of_previous_text_sibling(
 
 /* --- 元素标注（recorder 复用；祖先上溯版路径构造） ---------------------------- */
 
-/// ObjectRef 的感知标注（recorder 事件行的元素锚点；probe 的缓存焦点/
+/// ObjectRefOwned 的感知标注（recorder 事件行的元素锚点；probe 的缓存焦点/
 /// 窗口回建也走它）。
 #[derive(Debug, Clone)]
 pub struct ElementAnnotation {
@@ -674,11 +667,11 @@ pub struct ElementAnnotation {
     pub rect: ControlRect,
 }
 
-/// ObjectRef → [`ElementAnnotation`]（祖先上溯 ≤ PATH_MAX_DEPTH 步；
+/// ObjectRefOwned → [`ElementAnnotation`]（祖先上溯 ≤ PATH_MAX_DEPTH 步；
 /// 异步本体——recorder 事件泵与 probe 的 block_on 调用方共用）。
 pub async fn annotate_object_async(
     conn: &AccessibilityConnection,
-    obj: &ObjectRef,
+    obj: &ObjectRefOwned,
 ) -> Option<ElementAnnotation> {
     let proxy = as_proxy(conn, obj).await?;
     let role = proxy.get_role().await.ok()?;
@@ -692,7 +685,7 @@ pub async fn annotate_object_async(
     let mut window_title = String::new();
     let mut process_name = String::new();
     for _ in 0..PATH_MAX_DEPTH {
-        if is_null(&current) {
+        if current.is_null() {
             break;
         }
         let Some(parent) = as_proxy(conn, &current).await else {
@@ -747,10 +740,10 @@ pub fn annotation_to_control_ref(ann: &ElementAnnotation) -> ControlRef {
     }
 }
 
-/// 窗口 ObjectRef → WindowRef（hash 句柄 + 标题 + 应用名）。
+/// 窗口 ObjectRefOwned → WindowRef（hash 句柄 + 标题 + 应用名）。
 pub(crate) fn window_ref_of_object(
     conn: &AccessibilityConnection,
-    obj: &ObjectRef,
+    obj: &ObjectRefOwned,
 ) -> Option<WindowRef> {
     block_on(window_ref_of_object_async(conn, obj))
 }
@@ -850,7 +843,7 @@ impl ControlProbe for AtspiProbe {
             }
             // 前序 DFS、path = 子序号链、深度触限只剪子树、节点预算停收集
             //（与 synth dump_tree 语义一致；P3-7 回归锁定其行为）。
-            let mut stack: Vec<(ObjectRef, String, u32)> =
+            let mut stack: Vec<(ObjectRefOwned, String, u32)> =
                 vec![(root, "0".into(), 1)];
             while let Some((obj, path, depth)) = stack.pop() {
                 let Some(proxy) = as_proxy(&self.conn, &obj).await else {
@@ -878,7 +871,7 @@ impl ControlProbe for AtspiProbe {
                 if depth < max_depth {
                     if let Ok(children) = proxy.get_children().await {
                         for (i, child) in children.into_iter().enumerate().rev() {
-                            if is_null(&child) {
+                            if child.is_null() {
                                 continue;
                             }
                             stack.push((child, format!("{path}/{i}"), depth + 1));
@@ -903,9 +896,9 @@ impl ControlProbe for AtspiProbe {
             // Value 接口（滑杆/调节类）→ 数值。
             if interfaces.contains(Interface::Value) {
                 if let Ok(value) = ValueProxy::builder(self.conn.connection())
-                    .destination(hit.hit.name.clone())
+                    .destination(hit.hit.name_as_str().unwrap_or_default().to_string())
                     .ok()?
-                    .path(hit.hit.path.clone())
+                    .path(hit.hit.path_as_str().to_string())
                     .ok()?
                     .cache_properties(atspi::zbus::proxy::CacheProperties::No)
                     .build()
@@ -920,9 +913,9 @@ impl ControlProbe for AtspiProbe {
             // Text 接口（编辑框/文档）→ 全文。
             if interfaces.contains(Interface::Text) {
                 if let Ok(text) = TextProxy::builder(self.conn.connection())
-                    .destination(hit.hit.name.clone())
+                    .destination(hit.hit.name_as_str().unwrap_or_default().to_string())
                     .ok()?
-                    .path(hit.hit.path.clone())
+                    .path(hit.hit.path_as_str().to_string())
                     .ok()?
                     .cache_properties(atspi::zbus::proxy::CacheProperties::No)
                     .build()
@@ -950,8 +943,8 @@ fn format_number(value: f64) -> String {
 }
 
 impl AtspiProbe {
-    /// 缓存/扫描得到的前台窗口 ObjectRef（dump_tree 的树根）。
-    fn foreground_window_node(&self) -> Option<ObjectRef> {
+    /// 缓存/扫描得到的前台窗口 ObjectRefOwned（dump_tree 的树根）。
+    fn foreground_window_node(&self) -> Option<ObjectRefOwned> {
         if let Some(cache) = &self.cache {
             if let Some(window) = cache.active_window() {
                 return Some(window);
@@ -976,8 +969,8 @@ impl AtspiProbe {
         })
     }
 
-    /// 任意 ObjectRef → 完整观测（缓存焦点路径复用）。
-    fn observation_from_object(&self, obj: &ObjectRef) -> Option<ControlObservation> {
+    /// 任意 ObjectRefOwned → 完整观测（缓存焦点路径复用）。
+    fn observation_from_object(&self, obj: &ObjectRefOwned) -> Option<ControlObservation> {
         block_on(async {
             let ann = annotate_object_async(&self.conn, obj).await?;
             let control = annotation_to_control_ref(&ann);
@@ -1008,9 +1001,9 @@ impl AtspiProbe {
 /// async 递归需装箱，树遍历无需付这个代价）。
 async fn scan_focused_dfs(
     conn: &AccessibilityConnection,
-    root: &ObjectRef,
+    root: &ObjectRefOwned,
     budget: &mut usize,
-) -> Option<ObjectRef> {
+) -> Option<ObjectRefOwned> {
     let mut stack = vec![root.clone()];
     while let Some(obj) = stack.pop() {
         if *budget == 0 {
@@ -1029,7 +1022,7 @@ async fn scan_focused_dfs(
             return Some(obj);
         }
         if let Ok(children) = proxy.get_children().await {
-            stack.extend(children.into_iter().filter(|c| !is_null(c)));
+            stack.extend(children.into_iter().filter(|c| !c.is_null()));
         }
     }
     None
@@ -1038,7 +1031,7 @@ async fn scan_focused_dfs(
 /// [`window_ref_of_object`] 的异步本体（foreground_window/list_windows 内联）。
 async fn window_ref_of_object_async(
     conn: &AccessibilityConnection,
-    obj: &ObjectRef,
+    obj: &ObjectRefOwned,
 ) -> Option<WindowRef> {
     let proxy = as_proxy(conn, obj).await?;
     if !is_window_role(proxy.get_role().await.unwrap_or(Role::Unknown)) {
@@ -1082,9 +1075,9 @@ pub fn set_value_at_point(x: f64, y: f64, value: &str) -> crate::harness::Result
             return Err(Error::AtspiEditUnsupported);
         }
         let editable = EditableTextProxy::builder(conn.connection())
-            .destination(hit.hit.name.clone())
+            .destination(hit.hit.name_as_str().unwrap_or_default().to_string())
             .map_err(|e| Error::AtspiEditFailed(Box::new(e)))?
-            .path(hit.hit.path.clone())
+            .path(hit.hit.path_as_str().to_string())
             .map_err(|e| Error::AtspiEditFailed(Box::new(e)))?
             .cache_properties(atspi::zbus::proxy::CacheProperties::No)
             .build()
@@ -1309,7 +1302,7 @@ mod tests {
         let cache = EventCache::new();
         assert!(cache.focus().is_none());
         assert!(cache.active_window().is_none());
-        let obj = ObjectRef::default();
+        let obj = ObjectRefOwned::default();
         cache.note_focus(Some(obj.clone()));
         cache.note_active_window(obj.clone());
         assert_eq!(cache.focus(), Some(obj.clone()));

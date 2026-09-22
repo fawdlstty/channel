@@ -316,9 +316,9 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "atspi"
-version = "0.28.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f69452d8edfa472dd275429f0741506db841e58a6a4823d0cd4231534eb21eb2"
+checksum = "6bf601cccedfffec598ec2db1f9d6745885458bccc0e8916d7023f017c94b3d0"
 dependencies = [
  "atspi-common",
  "atspi-connection",
@@ -328,9 +328,9 @@ dependencies = [
 
 [[package]]
 name = "atspi-common"
-version = "0.12.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfc0be6df62223cff94caf829f976d76f5c8362a5c937ef5e8547e59bff8fd93"
+checksum = "f8a79bed3f5b408ce3152f36e07327a845e6ed5d7e2821a89264037dbcc11daf"
 dependencies = [
  "enumflags2",
  "serde",
@@ -344,9 +344,9 @@ dependencies = [
 
 [[package]]
 name = "atspi-connection"
-version = "0.12.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e51a316dbfe8ed21268c35d9a869c77078a4611e21bde796f81b7bcd69eab37"
+checksum = "8fab8e4f574f5a7d3af280b38eff25fb6f47a537dac9ae39ce152f52b19fb10b"
 dependencies = [
  "atspi-common",
  "atspi-proxies",
@@ -356,9 +356,9 @@ dependencies = [
 
 [[package]]
 name = "atspi-proxies"
-version = "0.12.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdc2fc2a2bac8a6746e658d786b064b41966cf250a76dcbd4ff19c99dc4a94e9"
+checksum = "53403acd3ab2fdb5914f6558da22e540fc07656fce5510f8c02be0e6ef68413e"
 dependencies = [
  "atspi-common",
  "serde",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "channel"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "ashpd",
  "atspi",
