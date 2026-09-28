@@ -1,6 +1,6 @@
 [package]
 name = "channel"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -66,7 +66,11 @@ png = { version = "0.17", optional = true }
 # - proxies: interface proxies (Accessible/Component/EditableText/Text/Value);
 # - connection: AccessibilityConnection (a11y bus discovery + event stream);
 # - zbus: zbus type re-exports (CacheProperties etc. used by proxy builders).
-atspi = { version = "0.30", optional = true, default-features = false, features = ["proxies", "connection", "zbus"] }
+atspi = { git = "https://github.com/fawdlstty/atspi", optional = true, default-features = false, features = [
+    "proxies",
+    "connection",
+    "zbus",
+] }
 # futures-lite: block_on/poll_once sync wrappers (AT-SPI probe; sync calls /
 # dedicated event thread block_on, no tokio pulled in).
 futures-lite = { version = "2", optional = true, default-features = false, features = ["std"] }

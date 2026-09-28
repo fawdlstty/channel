@@ -244,10 +244,12 @@ impl crate::protocol::BackendSpec {
                 HarnessKind::Codex => BackendKind::CodexAppServer,
                 HarnessKind::OpenCode
                 | HarnessKind::ZedAcp
-                | HarnessKind::ZCode
                 | HarnessKind::DeepSeek
                 | HarnessKind::Hermes => BackendKind::Acp,
-                HarnessKind::ClaudeCode => BackendKind::StructuredCli,
+                // ZCode has no `acp` subcommand; its scriptable entry point
+                // is the headless CLI (`zcode -p ... --output-format
+                // stream-json`), so it routes to the structured CLI backend.
+                HarnessKind::ZCode | HarnessKind::ClaudeCode => BackendKind::StructuredCli,
             },
         }
     }
@@ -280,10 +282,9 @@ impl crate::protocol::BackendSpec {
                 HarnessKind::Codex => vec!["app-server".to_owned(), "--stdio".to_owned()],
                 HarnessKind::OpenCode
                 | HarnessKind::ZedAcp
-                | HarnessKind::ZCode
                 | HarnessKind::DeepSeek
                 | HarnessKind::Hermes => vec!["acp".to_owned()],
-                _ => Vec::new(),
+                HarnessKind::ZCode | HarnessKind::ClaudeCode => Vec::new(),
             },
         }
     }
@@ -1337,6 +1338,26 @@ mod tests {
         assert_eq!(
             session.info().visibility.resumability,
             Resumability::InMemoryOnly
+        );
+    }
+
+    #[test]
+    fn zcode_auto_backend_routes_to_structured_cli() {
+        // The ZCode CLI has no `acp` subcommand, so Auto routes it to the
+        // headless structured CLI backend with plain `zcode` (no extra args).
+        let config = SessionConfig::default_for(HarnessKind::ZCode);
+        assert_eq!(
+            config.backend.backend_kind(&HarnessKind::ZCode),
+            BackendKind::StructuredCli
+        );
+        assert_eq!(
+            config.backend.backend_kind(&HarnessKind::OpenCode),
+            BackendKind::Acp
+        );
+        assert_eq!(config.backend.args(&HarnessKind::ZCode), Vec::<String>::new());
+        assert_eq!(
+            config.backend.command(&HarnessKind::ZCode).as_deref(),
+            Some("zcode")
         );
     }
 

@@ -49,7 +49,7 @@ impl CliBackend {
         let session_id = match &config.conversation.mode {
             crate::protocol::ConversationSpec::New => None,
             crate::protocol::ConversationSpec::Resume(target) => {
-                if !matches!(kind, HarnessKind::ClaudeCode) {
+                if !matches!(kind, HarnessKind::ClaudeCode | HarnessKind::ZCode) {
                     return Err(Error::UnsupportedCapability(format!(
                         "provider session resume is not supported by the {kind:?} CLI"
                     )));
@@ -210,6 +210,9 @@ impl CliBackend {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if self.kind == HarnessKind::ZCode {
+            return self.parse_zcode_event(value, kind);
+        }
         match kind {
             "system" => Vec::new(),
             "stream_event" => self.parse_stream_event(value),
@@ -304,6 +307,106 @@ impl CliBackend {
                 .push_back(Event::Finished(Finish::new(status, "")));
         }
     }
+
+    /// Parses one NDJSON event emitted by the ZCode headless CLI
+    /// (`zcode -p <message> --output-format stream-json`). Each stdout line
+    /// carries a top-level `type`; per-turn results arrive as a terminal
+    /// `result` line, while provider failures end with `turn.failed` and no
+    /// `result`. Unknown event types are ignored: the ZCode event surface is
+    /// still evolving.
+    fn parse_zcode_event(&mut self, value: &Value, kind: &str) -> Vec<Event> {
+        let payload = value.get("payload").cloned().unwrap_or(Value::Null);
+        match kind {
+            "model.streaming" => self.parse_zcode_streaming(&payload),
+            "turn.failed" => {
+                self.finished = true;
+                let message = payload
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("zcode turn failed without an error message")
+                    .to_owned();
+                vec![
+                    Event::Error(message),
+                    Event::Finished(Finish::new(Status::Failed, "")),
+                ]
+            }
+            "result" => {
+                let mut events = Vec::new();
+                // After a `turn.failed` the turn is already terminal; a late
+                // result line must not re-complete it.
+                if !self.finished {
+                    if !self.text_seen {
+                        if let Some(text) = value
+                            .get("response")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                        {
+                            self.text_seen = true;
+                            events.push(Event::TextDelta(text.to_owned()));
+                        }
+                    }
+                    self.finished = true;
+                    events.push(Event::Finished(Finish::new(Status::Completed, "")));
+                }
+                events
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn parse_zcode_streaming(&mut self, payload: &Value) -> Vec<Event> {
+        let kind = payload
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match kind {
+            "reasoning_delta" => Self::zcode_delta(payload)
+                .map(|delta| vec![Event::ReasoningDelta(delta)])
+                .unwrap_or_default(),
+            "text_delta" => Self::zcode_delta(payload)
+                .map(|delta| {
+                    self.text_seen = true;
+                    vec![Event::TextDelta(delta)]
+                })
+                .unwrap_or_default(),
+            "tool_input_start" => self.zcode_tool_events(payload, "requested"),
+            "tool_input_end" => self.zcode_tool_events(payload, "running"),
+            "tool_call" => self.zcode_tool_events(payload, "completed"),
+            _ => Vec::new(),
+        }
+    }
+
+    fn zcode_delta(payload: &Value) -> Option<String> {
+        payload
+            .get("delta")
+            .and_then(Value::as_str)
+            .filter(|delta| !delta.is_empty())
+            .map(str::to_owned)
+    }
+
+    fn zcode_tool_events(&self, payload: &Value, status: &'static str) -> Vec<Event> {
+        let id = payload
+            .get("toolCallId")
+            .or_else(|| payload.get("tool_call_id"))
+            .and_then(JsonValueExt::string_value);
+        let name = payload
+            .get("toolName")
+            .or_else(|| payload.get("tool_name"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool")
+            .to_owned();
+        let input = payload
+            .get("input")
+            .filter(|input| !input.is_null())
+            .cloned()
+            .unwrap_or(Value::Null);
+        let output = payload
+            .get("output")
+            .or_else(|| payload.get("result"))
+            .filter(|output| !output.is_null());
+        ToolEvent::new(id, name, input, status, output, false).events()
+    }
 }
 
 impl Backend for CliBackend {
@@ -381,6 +484,8 @@ impl CliBackend {
         crate::protocol::CapabilitySet {
             streaming_events: true,
             structured_text: true,
+            // The ZCode headless CLI streams `reasoning_delta` events.
+            reasoning_summary: matches!(kind, HarnessKind::ZCode),
             tool_calls: true,
             tool_inputs: true,
             tool_outputs: true,
@@ -389,7 +494,8 @@ impl CliBackend {
             command_execution: true,
             turn_cancel: true,
             session_close: true,
-            provider_resume: matches!(kind, HarnessKind::ClaudeCode),
+            // Both CLIs resume via `--resume <sessionId>`.
+            provider_resume: matches!(kind, HarnessKind::ClaudeCode | HarnessKind::ZCode),
             raw_events: true,
             ..crate::protocol::CapabilitySet::default()
         }
@@ -444,6 +550,7 @@ impl HarnessKind {
     fn cli_command(&self) -> Result<(String, Vec<String>), Error> {
         match self {
             HarnessKind::ClaudeCode => Ok(("claude".to_owned(), Vec::new())),
+            HarnessKind::ZCode => Ok(("zcode".to_owned(), Vec::new())),
             _ => Err(Error::UnsupportedHarness(self.clone())),
         }
     }
@@ -451,7 +558,7 @@ impl HarnessKind {
 
 impl HarnessKind {
     fn turn_args(&self, base: &[String], session_id: Option<&str>, message: &str) -> Vec<String> {
-        if !matches!(self, HarnessKind::ClaudeCode) {
+        if !matches!(self, HarnessKind::ClaudeCode | HarnessKind::ZCode) {
             return base.to_vec();
         }
         if !base.is_empty() {
@@ -467,14 +574,23 @@ impl HarnessKind {
             }
             return args;
         }
-        let mut args = vec![
-            "-p".to_owned(),
-            message.to_owned(),
-            "--output-format".to_owned(),
-            "stream-json".to_owned(),
-            "--verbose".to_owned(),
-            "--include-partial-messages".to_owned(),
-        ];
+        let mut args = if matches!(self, HarnessKind::ZCode) {
+            vec![
+                "-p".to_owned(),
+                message.to_owned(),
+                "--output-format".to_owned(),
+                "stream-json".to_owned(),
+            ]
+        } else {
+            vec![
+                "-p".to_owned(),
+                message.to_owned(),
+                "--output-format".to_owned(),
+                "stream-json".to_owned(),
+                "--verbose".to_owned(),
+                "--include-partial-messages".to_owned(),
+            ]
+        };
         if let Some(id) = session_id {
             args.extend(["--resume".to_owned(), id.to_owned()]);
         }
@@ -964,5 +1080,189 @@ mod tests {
             }))[0],
             Event::Raw(_)
         ));
+    }
+
+    fn zcode_backend() -> CliBackend {
+        CliBackend::new_with_config(crate::protocol::SessionConfig::default_for(
+            HarnessKind::ZCode,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn zcode_turn_args_use_headless_stream_json_and_resume() {
+        let args = HarnessKind::ZCode.turn_args(&[], None, "你好");
+        assert_eq!(
+            args,
+            vec![
+                "-p".to_owned(),
+                "你好".to_owned(),
+                "--output-format".to_owned(),
+                "stream-json".to_owned()
+            ]
+        );
+        let resumed = HarnessKind::ZCode.turn_args(&[], Some("sess-1"), "继续");
+        assert!(resumed
+            .windows(2)
+            .any(|pair| pair == ["--resume", "sess-1"]));
+        assert!(!resumed.contains(&"--verbose".to_owned()));
+    }
+
+    #[test]
+    fn zcode_parses_reasoning_and_text_deltas() {
+        let mut backend = zcode_backend();
+        let reasoning = serde_json::json!({
+            "type": "model.streaming",
+            "payload": { "kind": "reasoning_delta", "delta": "The" }
+        });
+        assert_eq!(
+            backend.parse_json(&reasoning),
+            vec![Event::ReasoningDelta("The".to_owned())]
+        );
+        let text = serde_json::json!({
+            "type": "model.streaming",
+            "payload": { "kind": "text_delta", "delta": "答案" }
+        });
+        assert_eq!(
+            backend.parse_json(&text),
+            vec![Event::TextDelta("答案".to_owned())]
+        );
+        assert!(backend.text_seen);
+        // Empty deltas and lifecycle kinds are ignored.
+        for payload in [
+            serde_json::json!({ "kind": "text_delta", "delta": "" }),
+            serde_json::json!({ "kind": "reasoning_delta", "delta": "" }),
+            serde_json::json!({ "kind": "start" }),
+            serde_json::json!({ "kind": "reasoning_start" }),
+            serde_json::json!({ "kind": "text_end" }),
+            serde_json::json!({ "kind": "finish" }),
+            serde_json::json!({ "kind": "tool_input_delta", "partial": "{}" }),
+        ] {
+            assert_eq!(
+                backend.parse_json(&serde_json::json!({
+                    "type": "model.streaming",
+                    "payload": payload
+                })),
+                Vec::new()
+            );
+        }
+    }
+
+    #[test]
+    fn zcode_tool_streaming_maps_to_tool_calls() {
+        let mut backend = zcode_backend();
+        let events = backend.parse_json(&serde_json::json!({
+            "type": "model.streaming",
+            "payload": {
+                "kind": "tool_input_start",
+                "toolCallId": "tc-1",
+                "toolName": "Read",
+            }
+        }));
+        assert!(matches!(&events[0], Event::ToolCall(call)
+            if call.id.as_deref() == Some("tc-1")
+                && call.name == "Read"
+                && call.status == ToolStatus::Requested));
+        let events = backend.parse_json(&serde_json::json!({
+            "type": "model.streaming",
+            "payload": {
+                "kind": "tool_call",
+                "toolCallId": "tc-1",
+                "toolName": "Read",
+                "input": { "file_path": "src/lib.rs" }
+            }
+        }));
+        assert!(matches!(&events[0], Event::ToolCall(call)
+            if call.status == ToolStatus::Completed && call.input.is_some()));
+        assert!(matches!(&events[1], Event::FileRead(file) if file.path == "src/lib.rs"));
+    }
+
+    #[test]
+    fn zcode_result_line_completes_and_extracts_session_id() {
+        let mut backend = zcode_backend();
+        let events = backend.parse_json(&serde_json::json!({
+            "type": "result",
+            "sessionId": "sess_9",
+            "response": "完整回答",
+            "usage": {}
+        }));
+        assert_eq!(
+            events,
+            vec![
+                Event::TextDelta("完整回答".to_owned()),
+                Event::Finished(Finish::new(Status::Completed, "")),
+            ]
+        );
+        assert!(backend.finished);
+        assert_eq!(backend.session_id.as_deref(), Some("sess_9"));
+
+        // A streamed turn falls back to the result only when no delta was seen.
+        let mut backend = zcode_backend();
+        backend.parse_json(&serde_json::json!({
+            "type": "model.streaming",
+            "payload": { "kind": "text_delta", "delta": "流式" }
+        }));
+        let events = backend.parse_json(&serde_json::json!({
+            "type": "result",
+            "sessionId": "sess_10",
+            "response": "完整回答"
+        }));
+        assert_eq!(
+            events,
+            vec![Event::Finished(Finish::new(Status::Completed, ""))]
+        );
+    }
+
+    #[test]
+    fn zcode_turn_failed_reports_error_and_failed_terminal() {
+        let mut backend = zcode_backend();
+        let events = backend.parse_json(&serde_json::json!({
+            "type": "turn.failed",
+            "payload": {
+                "error": { "message": "[1309] 套餐到期", "code": "1309" },
+                "turnPhase": "processing_input"
+            }
+        }));
+        assert_eq!(
+            events,
+            vec![
+                Event::Error("[1309] 套餐到期".to_owned()),
+                Event::Finished(Finish::new(Status::Failed, "")),
+            ]
+        );
+        assert!(backend.finished);
+        // A trailing result line after a failure must not re-complete the turn.
+        assert_eq!(
+            backend.parse_json(&serde_json::json!({
+                "type": "result", "sessionId": "sess_11", "response": "late"
+            })),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn zcode_ignores_lifecycle_and_unknown_event_types() {
+        let mut backend = zcode_backend();
+        for kind in [
+            "turn.started",
+            "turn.completed",
+            "session.created",
+            "session.resumed",
+            "session.titleUpdated",
+            "session.updated",
+            "message.upserted",
+            "totally_unknown",
+        ] {
+            assert_eq!(
+                backend.parse_json(&serde_json::json!({
+                    "type": kind,
+                    "sessionId": "sess_1",
+                    "payload": {}
+                })),
+                Vec::new()
+            );
+        }
+        // Session-id extraction still works for ignored events.
+        assert_eq!(backend.session_id.as_deref(), Some("sess_1"));
     }
 }

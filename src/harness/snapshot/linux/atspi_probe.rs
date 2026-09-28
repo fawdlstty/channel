@@ -190,6 +190,7 @@ pub(crate) fn role_to_control_type(role: Role) -> &'static str {
         Role::Terminal => "Document",
         Role::Text => "Edit",
         Role::ToggleButton => "Button",
+        Role::Switch => "Button",
         Role::ToolBar => "ToolBar",
         Role::ToolTip => "ToolTip",
         Role::Tree => "Tree",

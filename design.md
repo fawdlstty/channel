@@ -3,7 +3,9 @@
 > 维护规则见 [AGENTS.md](AGENTS.md)。每一项内容都标注来源：
 > 【用户要求】= 用户明确提出的改动/约束（含原始诉求语义）；
 > 【AI 演绎】= AI 为落实用户要求而自行推导补全的细节，尚未逐项确认。
-> 最近更新：2026-09-13（CI Windows job 的 Linux 平台隔离哨兵收敛为纯
+> 最近更新：2026-09-28（ZCode Auto 后端 ACP → StructuredCli，见 §3.2；
+> 同日 atspi 依赖改为直接 git 引用 fawdlstty/atspi（用户要求，见 §3.6）；
+> 此前 2026-09-13：CI Windows job 的 Linux 平台隔离哨兵收敛为纯
 > `cargo tree` 反查；同日 `full` 聚合可编译性收敛：GPU 卸载后端退出聚合、
 > metal 变体按 Apple 目标 gating，用户要求修复
 > `cargo clippy --features full --all-targets -- -D warnings`；
@@ -57,6 +59,16 @@
 - 【AI 演绎】`harness::codex`：Codex app-server 适配（stdio JSONL 进程或
   本地 ws endpoint 双传输；turn 生命周期、权限审批、模型清单）。
 - 【AI 演绎】`harness::acp` / `harness::cli`：ACP 代理与 CLI 型后端。
+- 【用户要求，2026-09-28】ZCode 的 Auto 后端路由由 ACP 改为 StructuredCli
+  （`src/session.rs` / `src/harness/mod.rs` / `src/harness/cli.rs`）：
+  现行 zcode（桌面 3.14.3 与开源 CLI main）没有 `acp` 子命令，原路径
+  spawn `zcode acp` 只会拉起 GUI 并报 JSON 解析错误；改为每回合
+  `zcode -p <message> --output-format stream-json`（NDJSON 事件流，
+  `model.streaming` 的 `reasoning_delta`/`text_delta` 映射思考与输出增量，
+  `turn.failed`/末行 `result` 映射终态，`--resume <sessionId>` 续接）。
+  模型选择无 CLI 参数，由 zcode 自身配置（`~/.zcode/v2/provider_config.json`
+  的 `defaultModelSelection`）决定，channel 的 `set_model` 不传递（与
+  ClaudeCode CLI 后端行为一致）。显式 `BackendSpec::Acp` 仍走 ACP 适配。
 
 ### 3.3 `llm`（feature `llm`）
 
@@ -150,6 +162,18 @@
 - 【AI 演绎，已被上一条取代后收敛】Linux 侧依赖（x11rb+png、atspi+
   futures-lite、ashpd）保持 optional，统一由 `harness` feature 以
   `dep:` 引用启用（非 Linux 目标下这些引用为空操作）。
+- 【用户要求，2026-09-28】`atspi` 依赖改为直接 git 引用
+  `https://github.com/fawdlstty/atspi`（不再走 registry 版本号）：
+  atspi 0.31 未发布 registry（crates.io 止步 0.30.0），而 WorkRecorder
+  消费仓的 third_party/atspi 补丁基线即 0.31.0/atspi-common 0.15.0；
+  registry `^0.30` 会解析出旧版，依赖图中并存两套互不兼容的
+  atspi-common 类型。
+- 【AI 演绎，2026-09-28，落实上一条】feature 面维持
+  `proxies`/`connection`/`zbus` 不变（0.31 的 features 表未显式声明
+  `zbus`，但 zbus 为 optional 依赖且无 `dep:` 引用，隐式 feature 仍在，
+  `atspi::zbus` 类型 re-export 路径不变，zbus 5.5）；
+  `role_to_control_type` 补 `Role::Switch → Button` 映射（atspi-common
+  0.15 新增变体，穷尽 match 编译期强制补表）。
 
 ### 3.7 ws 传输层（2026-09-12 重构，本次变更）
 
@@ -214,9 +238,16 @@
   原生编译覆盖。
 - 【AI 演绎】发布顺序约束（2026-09-12 起）：先 `cargo publish` potato
   0.4.1，channel 的 `[patch.crates-io]`（本地桥接）随后移除。
+- 【AI 演绎，2026-09-28】`cargo publish` 暂被 atspi git 依赖阻断
+  （crates.io 不接受 git 依赖），待 fawdlstty/atspi 0.31 系发布到
+  registry 后切回版本号引用即可恢复发布路径。
 
 ## 5. 与其他系统的关系
 
+- 【AI 演绎，落实用户要求 git 引用】atspi（fawdlstty/atspi，odilia-app/
+  atspi 的 0.31 基线 fork，zbus 5.5）：Linux AT-SPI2 控件树感知的协议
+  实现，channel 经 git 依赖直接引用；WorkRecorder 仓的 third_party/atspi
+  补丁与其同源同版本（0.31.0/0.15.0），保证两侧 atspi-common 类型一致。
 - 【AI 演绎】potato（fawdlstty/potato ≥ 0.4.1）：HTTP 传输（Session/
   HttpServer/SSE）+ WebSocket 客户端（wslite 泛型客户端 / full
   `Websocket::connect`）+ 最小 `block_on` 执行器。

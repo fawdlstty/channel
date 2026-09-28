@@ -480,6 +480,13 @@ impl Drop for Relay {
 /// anthropic 路径仍为非流式整段转发，该值继续充当其总超时。
 const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// 流建立后单个 chunk 之间的空闲上限：深度推理模型（glm-5.3-flash）在大上下文
+/// 下实测静默 424s 不吐 token 仍属正常推进（2026-09-28 三渠道溯源取证），空闲
+/// 判死必须高于该值；超时按流截断处理（finish 以 response.failed 收场），codex
+/// 会判本轮失败并自行重试，不惊动调用方的渠道切换看门狗。半开连接（上游或中间
+/// NAT 静默丢弃 FIN）由此在有限时间内显式终结，不再无限死等。
+const UPSTREAM_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
 struct RelayConnection {
     stream: TcpStream,
     provider: Arc<ResolvedProvider>,
@@ -607,7 +614,15 @@ impl RelayConnection {
         }
         let mut converter = ChatStreamConverter::new();
         let mut buffer: Vec<u8> = Vec::new();
-        while let Some(bytes) = upstream.next_chunk().await {
+        // 空闲超时把"上游长时间零字节"收敛为流截断（Elapsed 映射为 None 结束循环），
+        // 由下方 finish 以 response.failed 收场；正常长思考（chunk 间隔数分钟）不受影响。
+        while let Some(bytes) = tokio::time::timeout(
+            UPSTREAM_STREAM_IDLE_TIMEOUT,
+            upstream.next_chunk(),
+        )
+        .await
+        .unwrap_or_default()
+        {
             buffer.extend_from_slice(&bytes);
             while let Some(frame) = take_sse_frame(&mut buffer) {
                 for event in converter.feed_frame(&frame) {

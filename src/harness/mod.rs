@@ -105,10 +105,11 @@ impl Adapter {
                 HarnessKind::Codex => Adapter::Codex,
                 HarnessKind::OpenCode
                 | HarnessKind::ZedAcp
-                | HarnessKind::ZCode
                 | HarnessKind::DeepSeek
                 | HarnessKind::Hermes => Adapter::Acp,
-                HarnessKind::ClaudeCode => Adapter::Cli,
+                // ZCode exposes no ACP server; route it to the structured
+                // CLI backend (headless `zcode -p` stream-json mode).
+                HarnessKind::ZCode | HarnessKind::ClaudeCode => Adapter::Cli,
             },
             BackendSpec::StructuredCli { .. } | BackendSpec::PlainCli { .. } => Adapter::Cli,
         }
