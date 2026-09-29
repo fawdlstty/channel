@@ -27,20 +27,46 @@ impl SwitchProvider {
         config: &SessionConfig,
     ) -> Result<Option<PreparedResources>, Error> {
         match self {
-            Self::CcSwitch => ccswitch::CodexResources::prepare(config)
-                .await
-                .map(|resources| resources.map(PreparedResources)),
+            Self::CcSwitch => {
+                let keyed = config.get_switch_key(Self::CcSwitch).is_some();
+                match (&config.kind, keyed) {
+                    (crate::protocol::HarnessKind::ZCode, _) => {
+                        ccswitch::ZcodeResources::prepare(config)
+                            .await
+                            .map(|resources| resources.map(PreparedResources::Zcode))
+                    }
+                    (crate::protocol::HarnessKind::Codex, _) => {
+                        ccswitch::CodexResources::prepare(config)
+                            .await
+                            .map(|resources| resources.map(PreparedResources::Codex))
+                    }
+                    // 其余 harness 配置了渠道切换时显式报错：静默忽略会让调用方
+                    // 以为已按渠道切换、实际一直跑本地默认渠道。
+                    (_, true) => Err(Error::UnsupportedCapability(format!(
+                        "cc-switch provider switching is not supported for the {:?} harness",
+                        config.kind
+                    ))),
+                    (_, false) => Ok(None),
+                }
+            }
         }
     }
 }
 
 #[cfg(feature = "ccswitch")]
-pub(crate) struct PreparedResources(ccswitch::CodexResources);
+pub(crate) enum PreparedResources {
+    Codex(ccswitch::CodexResources),
+    Zcode(ccswitch::ZcodeResources),
+}
 
 #[cfg(feature = "ccswitch")]
 impl PreparedResources {
-    pub(crate) fn env(&self) -> [(&str, &Path); 1] {
-        self.0.env()
+    /// 应注入子进程环境的 (变量名, 路径值) 列表。
+    pub(crate) fn env(&self) -> Vec<(&'static str, &Path)> {
+        match self {
+            Self::Codex(resources) => resources.env().to_vec(),
+            Self::Zcode(resources) => resources.env().to_vec(),
+        }
     }
 }
 
@@ -68,14 +94,14 @@ impl SwitchProvider {
 }
 
 // Shape-compatible stub for the no-`ccswitch` build: `env()` yields an empty
-// list so the `PreparedResources::env` slicing in codex/mod.rs compiles
+// list so the spawn call sites in codex/mod.rs and harness/cli.rs compile
 // as-is.
 #[cfg(not(feature = "ccswitch"))]
 pub(crate) struct PreparedResources;
 
 #[cfg(not(feature = "ccswitch"))]
 impl PreparedResources {
-    pub(crate) fn env(&self) -> [(&'static str, &'static Path); 0] {
-        []
+    pub(crate) fn env(&self) -> Vec<(&'static str, &'static Path)> {
+        Vec::new()
     }
 }

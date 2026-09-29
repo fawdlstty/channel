@@ -156,10 +156,7 @@ impl CodexBackend {
                     &command,
                     &arg_refs,
                     Some(config.workspace_cwd()),
-                    resource_env
-                        .as_ref()
-                        .map(|environment| &environment[..])
-                        .unwrap_or(&[]),
+                    resource_env.as_deref().unwrap_or(&[]),
                 )
                 .await?,
             ))

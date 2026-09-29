@@ -37,10 +37,16 @@ pub(crate) struct CliBackend {
     stream_tools: HashMap<usize, StreamTool>,
     cwd: PathBuf,
     kill_grace_period: Duration,
+    /// 渠道切换资源（cc-switch）：ZCode 经 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE
+    /// 指向按渠道改写过的 provider 配置副本；持有它保证会话期间副本不被丢弃。
+    resources: Option<crate::switch::PreparedResources>,
 }
 
 impl CliBackend {
-    pub(crate) fn new_with_config(config: crate::protocol::SessionConfig) -> Result<Self, Error> {
+    pub(crate) fn new_with_config(
+        config: crate::protocol::SessionConfig,
+        resources: Option<crate::switch::PreparedResources>,
+    ) -> Result<Self, Error> {
         let kind = config.kind.clone();
         let (mut command, args) = config.backend.cli_command(&kind)?;
         if let Some(executable) = config.runtime.process.executable.as_ref() {
@@ -82,6 +88,7 @@ impl CliBackend {
             stream_tools: HashMap::new(),
             cwd: config.workspace_cwd().to_path_buf(),
             kill_grace_period: config.runtime.process.kill_grace_period,
+            resources,
         })
     }
 
@@ -90,20 +97,23 @@ impl CliBackend {
         let args = self
             .kind
             .turn_args(&self.args, self.session_id.as_deref(), &message);
-        let mut child = Command::new(&self.command)
+        let mut command = Command::new(&self.command);
+        command
             .kill_on_drop(true)
             .args(&args)
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| {
-                Error::Backend(format!(
-                    "failed to start CLI command {}: {error}",
-                    self.command
-                ))
-            })?;
+            .stderr(Stdio::null());
+        for (name, value) in self.resources.as_ref().map(|r| r.env()).unwrap_or_default() {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            Error::Backend(format!(
+                "failed to start CLI command {}: {error}",
+                self.command
+            ))
+        })?;
         let stdout = child
             .stdout
             .take()
@@ -516,7 +526,10 @@ impl CliBackend {
         first_message: String,
         initialized: Option<crate::protocol::HarnessState>,
     ) -> Result<crate::session::Session, Error> {
-        let backend = Self::new_with_config(config.clone())?;
+        let resources = crate::protocol::SwitchProvider::CcSwitch
+            .prepare_resources(&config)
+            .await?;
+        let backend = Self::new_with_config(config.clone(), resources)?;
         let mut session = crate::session::Session::with_backend_config(
             config,
             None,
@@ -985,7 +998,7 @@ mod tests {
                 id: "s-9".to_owned(),
             },
         );
-        let backend = CliBackend::new_with_config(config).unwrap();
+        let backend = CliBackend::new_with_config(config, None).unwrap();
         assert_eq!(backend.session_id.as_deref(), Some("s-9"));
         assert_eq!(backend.id().as_deref(), Some("s-9"));
     }
@@ -1001,7 +1014,7 @@ mod tests {
             crate::protocol::ResumeTarget::ChannelDefault("s-1".to_owned()),
         );
         assert!(matches!(
-            CliBackend::new_with_config(config),
+            CliBackend::new_with_config(config, None),
             Err(Error::UnsupportedCapability(_))
         ));
     }
@@ -1015,7 +1028,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            CliBackend::new_with_config(config),
+            CliBackend::new_with_config(config, None),
             Err(Error::UnsupportedCapability(_))
         ));
     }
@@ -1024,7 +1037,7 @@ mod tests {
     fn parses_claude_stream_and_result() {
         let mut backend = CliBackend::new_with_config(crate::protocol::SessionConfig::default_for(
             HarnessKind::ClaudeCode,
-        ))
+        ), None)
         .unwrap();
         let stream = serde_json::json!({
             "type": "stream_event",
@@ -1047,7 +1060,7 @@ mod tests {
     fn parses_structured_tool_and_file_read_events() {
         let mut backend = CliBackend::new_with_config(crate::protocol::SessionConfig::default_for(
             HarnessKind::ClaudeCode,
-        ))
+        ), None)
         .unwrap();
         let events = backend.parse_json(&serde_json::json!({
             "type": "tool_use",
@@ -1067,7 +1080,7 @@ mod tests {
     fn preserves_plain_text_and_unknown_json_as_fallbacks() {
         let mut backend = CliBackend::new_with_config(crate::protocol::SessionConfig::default_for(
             HarnessKind::ClaudeCode,
-        ))
+        ), None)
         .unwrap();
         assert_eq!(
             backend.parse_json(&serde_json::json!({ "type": "future_event" })),
@@ -1085,7 +1098,7 @@ mod tests {
     fn zcode_backend() -> CliBackend {
         CliBackend::new_with_config(crate::protocol::SessionConfig::default_for(
             HarnessKind::ZCode,
-        ))
+        ), None)
         .unwrap()
     }
 

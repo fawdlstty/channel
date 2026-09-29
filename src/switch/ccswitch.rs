@@ -353,7 +353,7 @@ pub(crate) struct CodexResources {
 }
 
 impl CodexResources {
-    pub(crate) fn env(&self) -> [(&str, &Path); 1] {
+    pub(crate) fn env(&self) -> [(&'static str, &std::path::Path); 1] {
         [("CODEX_HOME", self.codex_home.path.as_path())]
     }
 
@@ -414,6 +414,214 @@ impl CodexResources {
             relay,
         }))
     }
+}
+
+/// zcode 无头 CLI 的渠道切换实现。zcode 没有 --provider 一类的一次性参数，
+/// provider 选择由"个人 provider 配置"里的 defaultModelSelection 决定，且该
+/// 文件可经 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE 重定向（0.16.9 实测）。因此
+/// 每个渠道会话把基础配置复制一份、把默认 provider 改写到该渠道对应的
+/// providerId（渠道名与 providerRules[].providerName 对齐，如 "glm团队2"，
+/// 各渠道的 key 由运维预先在 zcode 里配好），再以该环境变量指给子进程。
+/// zcode 分析期间持续外发 reasoning/text delta（headless stream-json），调用
+/// 方的无输出看门狗由此始终有活动可依，不再出现"深度推理静默被杀"。
+pub(crate) struct ZcodeResources {
+    config_path: PathBuf,
+}
+
+impl ZcodeResources {
+    pub(crate) fn env(&self) -> [(&'static str, &Path); 1] {
+        [("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", &self.config_path)]
+    }
+
+    pub(crate) async fn prepare(
+        config: &crate::protocol::SessionConfig,
+    ) -> Result<Option<Self>, Error> {
+        let Some(provider_name) = config.get_switch_key(crate::protocol::SwitchProvider::CcSwitch)
+        else {
+            return Ok(None);
+        };
+        let base = Self::base_config_path()?;
+        let root_base = Self::session_root_base()?;
+        Ok(Some(Self {
+            config_path: Self::write_channel_config(provider_name, &base, &root_base)?,
+        }))
+    }
+
+    /// 复制基础 provider 配置、把默认 provider 切到该渠道对应的 providerId、
+    /// 落成按渠道分目录的会话副本并返回其路径。base/root_base 由调用方解析
+    /// （生产走 env/HOME，测试直接注入临时路径）。
+    fn write_channel_config(
+        provider_name: &str,
+        base: &Path,
+        root_base: &Path,
+    ) -> Result<PathBuf, Error> {
+        let text = std::fs::read_to_string(base).map_err(|error| {
+            Error::Initialization(format!(
+                "failed to read the ZCode provider config {}: {error}; configure the switch providers in ZCode first",
+                base.display()
+            ))
+        })?;
+        let mut provider_config: Value = serde_json::from_str(&text).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "invalid ZCode provider config {}: {error}",
+                base.display()
+            ))
+        })?;
+        let provider_id = find_zcode_provider_id(&provider_config, provider_name)?;
+        // 模板配置里的模型选择（如 GLM-5.3-Flash）原样保留，只替换 providerId。
+        let selection = provider_config
+            .pointer_mut("/config/defaultModelSelection")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "the ZCode provider config {} has no config.defaultModelSelection; pick a default model in ZCode first",
+                    base.display()
+                ))
+            })?;
+        selection.insert("providerId".to_owned(), Value::String(provider_id));
+
+        // 会话副本与 channel-codex-homes 同放 cc-switch 数据目录旁，按渠道名
+        // 分目录（内容含各渠道 key，目录 0700、文件 0600），48 小时惰性清理。
+        let root = Self::session_root(root_base, provider_name);
+        std::fs::create_dir_all(&root).map_err(|error| {
+            Error::Initialization(format!(
+                "failed to create the ZCode config dir {}: {error}",
+                root.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+        }
+        Self::prune_stale_configs(&root);
+        let path = root.join(format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        ));
+        let bytes = serde_json::to_vec(&provider_config)
+            .map_err(|error| Error::InvalidConfig(error.to_string()))?;
+        std::fs::write(&path, bytes).map_err(|error| {
+            Error::Initialization(format!(
+                "failed to write the ZCode provider config {}: {error}",
+                path.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(path)
+    }
+
+    fn base_config_path() -> Result<PathBuf, Error> {
+        if let Some(path) = std::env::var_os("CHANNEL_ZCODE_PROVIDER_CONFIG") {
+            return Ok(PathBuf::from(path));
+        }
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .ok_or_else(|| {
+                Error::Initialization(
+                    "cannot locate the user home directory for the ZCode config".to_owned(),
+                )
+            })?;
+        Ok(PathBuf::from(home)
+            .join(".zcode")
+            .join("v2")
+            .join("provider_config.json"))
+    }
+
+    fn session_root_base() -> Result<PathBuf, Error> {
+        let database = CodexDatabase::path()?;
+        let base = database
+            .0
+            .parent()
+            .ok_or_else(|| {
+                Error::Initialization(
+                    "cannot locate the cc-switch data directory".to_owned(),
+                )
+            })?
+            .join("channel-zcode-configs");
+        Ok(base)
+    }
+
+    fn session_root(root_base: &Path, provider_name: &str) -> PathBuf {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&provider_name, &mut hasher);
+        root_base.join(format!(
+            "{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+    }
+
+    /// 会话副本用完即弃但没人删；按修改时间惰性清理超过 48 小时的残留，
+    /// 失败静默（下次会话再试）。
+    fn prune_stale_configs(root: &Path) {
+        let Some(cutoff) = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(48 * 3600))
+        else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .map(|modified| modified < cutoff)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// 在 zcode 个人 provider 配置里按渠道名（providerName）查 providerId。
+/// providerRules 里还存在无 providerName 的账号类条目（account:*），它们不是
+/// 可切换的 key 实例，匹配与列举都跳过。
+fn find_zcode_provider_id(provider_config: &Value, provider_name: &str) -> Result<String, Error> {
+    let rules = provider_config
+        .pointer("/config/providerConfigRules/providerRules")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "the ZCode provider config has no providerConfigRules.providerRules; add provider \"{provider_name}\" in ZCode first"
+            ))
+        })?;
+    let mut available = Vec::new();
+    for rule in rules {
+        let Some(name) = rule.get("providerName").and_then(Value::as_str) else {
+            continue;
+        };
+        if name == provider_name {
+            let id = rule
+                .get("providerId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if id.is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "ZCode provider \"{provider_name}\" has no providerId"
+                )));
+            }
+            return Ok(id.to_owned());
+        }
+        available.push(name.to_owned());
+    }
+    Err(Error::InvalidConfig(format!(
+        "cc-switch provider \"{provider_name}\" has no matching ZCode provider (providerName); available ZCode providers: {}",
+        if available.is_empty() {
+            "(none)".to_owned()
+        } else {
+            available.join("、")
+        }
+    )))
 }
 
 pub(crate) struct Relay {
@@ -2775,5 +2983,114 @@ mod tests {
         let (last, _) = notifications.last().expect("turn/completed recorded");
         assert_eq!(last, "turn/completed");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 中心 AI 溯源的 zcode 渠道切换（2026-09-29）：渠道名按 providerName 匹配
+    /// zcode providerRules，会话副本只改写 defaultModelSelection.providerId，
+    /// 其余内容（各渠道 key、模型选择）逐字保留。
+    #[test]
+    fn zcode_channel_config_switches_default_provider_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "channel-zcode-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("provider_config.json");
+        std::fs::write(
+            &base,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "config": {
+                    "defaultModelSelection": {
+                        "modelId": "GLM-5.3-Flash",
+                        "options": { "reasoningLevel": "max" },
+                        "providerId": "bigmodel-api-3"
+                    },
+                    "providerConfigRules": {
+                        "providerRules": [
+                            { "providerId": "account:zai", "config": { "modelOrder": [] } },
+                            { "providerId": "bigmodel-api", "templateId": "bigmodel-api",
+                              "providerName": "glm团队1",
+                              "config": { "access": { "type": "zhipu-coding-plan-api-key", "apiKey": "key-1" } } },
+                            { "providerId": "bigmodel-api-3", "templateId": "bigmodel-api",
+                              "providerName": "glm团队2",
+                              "config": { "access": { "type": "zhipu-coding-plan-api-key", "apiKey": "key-2" } } }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let path =
+            ZcodeResources::write_channel_config("glm团队1", &base, &dir.join("sessions")).unwrap();
+        assert!(path.is_file(), "session copy should exist at {path:?}");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written.pointer("/config/defaultModelSelection/providerId").unwrap(),
+            "bigmodel-api"
+        );
+        // 模型选择与其余渠道内容原样保留。
+        assert_eq!(
+            written.pointer("/config/defaultModelSelection/modelId").unwrap(),
+            "GLM-5.3-Flash"
+        );
+        assert_eq!(
+            written
+                .pointer("/config/providerConfigRules/providerRules/2/config/access/apiKey")
+                .unwrap(),
+            "key-2"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zcode_channel_config_reports_unknown_provider_with_available_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "channel-zcode-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("provider_config.json");
+        std::fs::write(
+            &base,
+            serde_json::json!({
+                "config": {
+                    "defaultModelSelection": { "modelId": "m", "providerId": "p" },
+                    "providerConfigRules": {
+                        "providerRules": [
+                            { "providerId": "account:zai", "config": {} },
+                            { "providerId": "bigmodel-api", "templateId": "t",
+                              "providerName": "glm团队1", "config": {} }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = ZcodeResources::write_channel_config(
+            "不存在的渠道",
+            &base,
+            &dir.join("sessions"),
+        )
+        .unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("不存在的渠道"), "message: {message}");
+        // 账号类条目（无 providerName）不进可选列表，key 实例要列出来辅助排障。
+        assert!(message.contains("glm团队1"), "message: {message}");
+        assert!(!message.contains("account:zai"), "message: {message}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
