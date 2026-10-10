@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "channel"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "ashpd",
  "atspi",
@@ -3318,9 +3318,9 @@ dependencies = [
 
 [[package]]
 name = "ormer"
-version = "0.2.12"
+version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4200eb444ab8653d4c275326d8a0b94f365246f9be606de1b818e570e2b399ba"
+checksum = "1869451e1a8406caa608be4b1ad30133c3a415a9de1f979c50fb1dd2298c70d3"
 dependencies = [
  "async-trait",
  "bigdecimal",
@@ -3339,9 +3339,9 @@ dependencies = [
 
 [[package]]
 name = "ormer-derive"
-version = "0.2.12"
+version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f3a4aa497436246a867bf66589a9e1fdd07f86b1cc41da90b359d4a4679636a"
+checksum = "5d27c6f7ccad14377b6c19200de2e2e049de4052d3162f7a74ca2f6831c45b01"
 dependencies = [
  "proc-macro2",
  "quote",

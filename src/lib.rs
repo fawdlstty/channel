@@ -75,7 +75,7 @@ impl Harness {
         let mut config = self.0.config.clone();
         config.conversation.mode = ConversationSpec::Resume(target);
         let state = self.0;
-        Session::start_session(config, String::new(), Some(state)).await
+        Session::start_session(config, String::new(), Vec::new(), Some(state)).await
     }
 
     pub fn kind(&self) -> HarnessKind {
@@ -150,10 +150,22 @@ impl Session {
         config: SessionConfig,
         first_message: impl Into<String>,
     ) -> Result<Self, Error> {
+        Self::create_with_attachments(config, first_message, Vec::new()).await
+    }
+
+    /// Creates a session and opens the first turn carrying file attachments
+    /// (absolute paths, resolved on the harness host). Backends without
+    /// attachment support drop them silently.
+    pub async fn create_with_attachments(
+        config: SessionConfig,
+        first_message: impl Into<String>,
+        attachments: Vec<String>,
+    ) -> Result<Self, Error> {
         let harness = Harness::initialize_with(config).await?;
         let state = harness.0;
         let initialized_config = state.config.clone();
-        Self::start_session(initialized_config, first_message.into(), Some(state)).await
+        Self::start_session(initialized_config, first_message.into(), attachments, Some(state))
+            .await
     }
 }
 
@@ -161,11 +173,12 @@ impl Session {
     async fn start_session(
         mut config: SessionConfig,
         first_message: String,
+        attachments: Vec<String>,
         initialized: Option<HarnessState>,
     ) -> Result<Session, Error> {
         config.prepare_workspace()?;
         harness::Adapter::for_config(&config)
-            .create_session_with_config(config, first_message, initialized)
+            .create_session_with_config(config, first_message, attachments, initialized)
             .await
     }
 }

@@ -40,6 +40,10 @@ pub(crate) struct CliBackend {
     /// 渠道切换资源（cc-switch）：ZCode 经 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE
     /// 指向按渠道改写过的 provider 配置副本；持有它保证会话期间副本不被丢弃。
     resources: Option<crate::switch::PreparedResources>,
+    /// fully-unrestricted permission mode: forwarded to ZCode as `--mode yolo`.
+    full_access: bool,
+    /// Attachment paths for the turn being spawned (consumed by spawn_turn).
+    pending_attachments: Vec<String>,
 }
 
 impl CliBackend {
@@ -88,15 +92,22 @@ impl CliBackend {
             stream_tools: HashMap::new(),
             cwd: config.workspace_cwd().to_path_buf(),
             kill_grace_period: config.runtime.process.kill_grace_period,
+            full_access: config.is_full_access(),
+            pending_attachments: Vec::new(),
             resources,
         })
     }
 
     async fn spawn_turn(&mut self, message: String) -> Result<(), Error> {
         self.stop_process().await?;
-        let args = self
-            .kind
-            .turn_args(&self.args, self.session_id.as_deref(), &message);
+        let attachments = std::mem::take(&mut self.pending_attachments);
+        let args = self.kind.turn_args(
+            &self.args,
+            self.session_id.as_deref(),
+            &message,
+            self.full_access,
+            &attachments,
+        );
         let mut command = Command::new(&self.command);
         command
             .kill_on_drop(true)
@@ -343,6 +354,21 @@ impl CliBackend {
             }
             "result" => {
                 let mut events = Vec::new();
+                // ZCode 在 result 行的 projection 里带上下文占用（token 已用 /
+                // 窗口总量），供 UI 展示上下文容量；缺字段或非数值时静默跳过。
+                if let Some(used) = value
+                    .get("projection")
+                    .and_then(|projection| projection.get("contextUsed"))
+                    .and_then(Value::as_u64)
+                {
+                    if let Some(total) = value
+                        .get("projection")
+                        .and_then(|projection| projection.get("contextWindow"))
+                        .and_then(Value::as_u64)
+                    {
+                        events.push(Event::ContextUsage { used, total });
+                    }
+                }
                 // After a `turn.failed` the turn is already terminal; a late
                 // result line must not re-complete it.
                 if !self.finished {
@@ -424,6 +450,17 @@ impl Backend for CliBackend {
         self.session_id.clone()
     }
     fn send<'a>(&'a mut self, message: String) -> BackendFuture<'a, ()> {
+        Box::pin(async move { self.spawn_turn(message).await })
+    }
+
+    fn send_with_attachments<'a>(
+        &'a mut self,
+        message: String,
+        attachments: &[String],
+    ) -> BackendFuture<'a, ()> {
+        // Attachments ride on the next spawned turn; the structured CLI backends
+        // that understand them (ZCode) take `--attach <path>` per file.
+        self.pending_attachments = attachments.to_vec();
         Box::pin(async move { self.spawn_turn(message).await })
     }
 
@@ -524,6 +561,7 @@ impl CliBackend {
     pub(crate) async fn create_session_with_config(
         config: crate::protocol::SessionConfig,
         first_message: String,
+        attachments: Vec<String>,
         initialized: Option<crate::protocol::HarnessState>,
     ) -> Result<crate::session::Session, Error> {
         let resources = crate::protocol::SwitchProvider::CcSwitch
@@ -537,7 +575,9 @@ impl CliBackend {
             initialized,
         );
         if !first_message.is_empty() {
-            session.send(first_message, SendMode::Immediate).await?;
+            session
+                .send_with_attachments(first_message, attachments, SendMode::Immediate)
+                .await?;
         }
         Ok(session)
     }
@@ -570,7 +610,14 @@ impl HarnessKind {
 }
 
 impl HarnessKind {
-    fn turn_args(&self, base: &[String], session_id: Option<&str>, message: &str) -> Vec<String> {
+    fn turn_args(
+        &self,
+        base: &[String],
+        session_id: Option<&str>,
+        message: &str,
+        full_access: bool,
+        attachments: &[String],
+    ) -> Vec<String> {
         if !matches!(self, HarnessKind::ClaudeCode | HarnessKind::ZCode) {
             return base.to_vec();
         }
@@ -584,6 +631,9 @@ impl HarnessKind {
                 .collect();
             if !base.iter().any(|arg| arg.contains("{message}")) {
                 args.push(message.to_owned());
+            }
+            for path in attachments {
+                args.extend(["--attach".to_owned(), path.clone()]);
             }
             return args;
         }
@@ -604,6 +654,15 @@ impl HarnessKind {
                 "--include-partial-messages".to_owned(),
             ]
         };
+        if matches!(self, HarnessKind::ZCode) {
+            // ZCode 的「完全访问」= yolo 权限模式（减少确认次数）。注意 zcode
+            // 对 `-p` 默认即 yolo，关闭时必须显式给 `--mode build` 才会回到标准模式。
+            let mode = if full_access { "yolo" } else { "build" };
+            args.extend(["--mode".to_owned(), mode.to_owned()]);
+        }
+        for path in attachments {
+            args.extend(["--attach".to_owned(), path.clone()]);
+        }
         if let Some(id) = session_id {
             args.extend(["--resume".to_owned(), id.to_owned()]);
         }
@@ -981,7 +1040,7 @@ mod tests {
 
     #[test]
     fn claude_args_include_resume_and_streaming() {
-        let args = HarnessKind::ClaudeCode.turn_args(&[], Some("session-1"), "你好");
+        let args = HarnessKind::ClaudeCode.turn_args(&[], Some("session-1"), "你好", false, &[]);
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--resume", "session-1"]));
@@ -1104,21 +1163,41 @@ mod tests {
 
     #[test]
     fn zcode_turn_args_use_headless_stream_json_and_resume() {
-        let args = HarnessKind::ZCode.turn_args(&[], None, "你好");
+        // zcode 对 -p 默认即 yolo，标准模式必须显式 --mode build 才会生效。
+        let args = HarnessKind::ZCode.turn_args(&[], None, "你好", false, &[]);
         assert_eq!(
             args,
             vec![
                 "-p".to_owned(),
                 "你好".to_owned(),
                 "--output-format".to_owned(),
-                "stream-json".to_owned()
+                "stream-json".to_owned(),
+                "--mode".to_owned(),
+                "build".to_owned()
             ]
         );
-        let resumed = HarnessKind::ZCode.turn_args(&[], Some("sess-1"), "继续");
+        let full_access_args = HarnessKind::ZCode.turn_args(&[], None, "你好", true, &[]);
+        assert!(full_access_args
+            .windows(2)
+            .any(|pair| pair == ["--mode", "yolo"]));
+        let resumed = HarnessKind::ZCode.turn_args(&[], Some("sess-1"), "继续", false, &[]);
         assert!(resumed
             .windows(2)
             .any(|pair| pair == ["--resume", "sess-1"]));
         assert!(!resumed.contains(&"--verbose".to_owned()));
+    }
+
+    #[test]
+    fn zcode_turn_args_carry_attachments() {
+        let args = HarnessKind::ZCode.turn_args(
+            &[],
+            None,
+            "看图",
+            false,
+            &["/tmp/a.png".to_owned(), "/tmp/b.jpg".to_owned()],
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--attach", "/tmp/a.png"]));
+        assert!(args.windows(2).any(|pair| pair == ["--attach", "/tmp/b.jpg"]));
     }
 
     #[test]

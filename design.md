@@ -3,7 +3,9 @@
 > 维护规则见 [AGENTS.md](AGENTS.md)。每一项内容都标注来源：
 > 【用户要求】= 用户明确提出的改动/约束（含原始诉求语义）；
 > 【AI 演绎】= AI 为落实用户要求而自行推导补全的细节，尚未逐项确认。
-> 最近更新：2026-09-28（ZCode Auto 后端 ACP → StructuredCli，见 §3.2；
+> 最近更新：2026-10-10（Session 附件传递、ContextUsage 事件、ZCode CLI
+> `--mode`/`--attach`，见 §3.1/§3.2；此前 2026-09-28：ZCode Auto 后端
+> ACP → StructuredCli，见 §3.2；
 > 同日 atspi 依赖改为直接 git 引用 fawdlstty/atspi（用户要求，见 §3.6）；
 > 此前 2026-09-13：CI Windows job 的 Linux 平台隔离哨兵收敛为纯
 > `cargo tree` 反查；同日 `full` 聚合可编译性收敛：GPU 卸载后端退出聚合、
@@ -51,6 +53,13 @@
   CapabilitySet 等协议契约与 wire 形状。
 - 【AI 演绎】`session`：Session 状态机（BackendFuture 要求 `+ Send`），
   send/next_event/permission/interrupt/close 统一面。
+- 【AI 演绎，2026-10-10】Session 公开面两项扩展：① 附件传递——
+  `Session::create_with_attachments` / `send_with_attachments` 以绝对路径
+  附件开启/发送回合，后端不支持时经 trait 默认实现静默丢弃、回退纯文本；
+  ② 上下文占用事件——`Event`/`SessionEvent` 新增
+  `ContextUsage { used, total }`，后端流携带用量投影时透出（ZCode 取自
+  result 行的 `projection.contextUsed`/`projection.contextWindow`，缺字段
+  或非数值静默跳过），无该数据的后端不产出该事件。
 - 【AI 演绎】`runtime`：harness 可执行文件发现（PATH + 平台特化探测）
   与 cwd 解析。
 
@@ -69,6 +78,10 @@
   模型选择无 CLI 参数，由 zcode 自身配置（`~/.zcode/v2/provider_config.json`
   的 `defaultModelSelection`）决定，channel 的 `set_model` 不传递（与
   ClaudeCode CLI 后端行为一致）。显式 `BackendSpec::Acp` 仍走 ACP 适配。
+  【AI 演绎，2026-10-10】命令面扩展：每回合追加 `--mode yolo|build`——
+  「完全访问」配置映射 yolo；zcode 对 `-p` 无头模式默认即 yolo，故常规
+  回合显式传 `--mode build` 回到标准权限模式。附件（见 §3.1）以逐文件
+  `--attach <path>` 附加在回合参数上。
 
 ### 3.3 `llm`（feature `llm`）
 
@@ -174,6 +187,19 @@
   `atspi::zbus` 类型 re-export 路径不变，zbus 5.5）；
   `role_to_control_type` 补 `Role::Switch → Button` 映射（atspi-common
   0.15 新增变体，穷尽 match 编译期强制补表）。
+- 【用户要求，2026-10-11】恢复 `cargo publish` 发布路径（0.3.10 发布被
+  "dependency `atspi` does not specify a version" 阻断）。【AI 演绎，
+  落实上一条，保留 git 引用前提】atspi 依赖补版本要求
+  `>=0.30, <0.32`：publish 时 git 段被剥除，crates.io 下游按范围解析到
+  上游 0.30.0；本地 git fork（0.31.0）与 WorkRecorder third_party 补丁
+  （0.31.0）同样命中该范围，依赖图仍统一在单一 atspi-common 版本。
+  【AI 演绎，落实上一条】`role_to_control_type` 撤下 `Role::Switch →
+  Button` 分支（registry 0.30/atspi-common 0.14 无此变体，下游编译不过），
+  表尾改 `_ => "Custom"` 兜底并加 `#[allow(unreachable_patterns)]`
+  （0.30 全覆盖 match 下 `_` 必触发 unreachable 警告，CI `-D warnings`
+  会挂；fork 本地构建 Switch 经兜底落 Custom）。上游合并 PR #384 并
+  发布 0.31 后：版本要求收紧为 `0.31`，删除 `_` 与 allow、恢复
+  `Role::Switch => "Button"` 分支。
 
 ### 3.7 ws 传输层（2026-09-12 重构，本次变更）
 
@@ -238,16 +264,20 @@
   原生编译覆盖。
 - 【AI 演绎】发布顺序约束（2026-09-12 起）：先 `cargo publish` potato
   0.4.1，channel 的 `[patch.crates-io]`（本地桥接）随后移除。
-- 【AI 演绎，2026-09-28】`cargo publish` 暂被 atspi git 依赖阻断
-  （crates.io 不接受 git 依赖），待 fawdlstty/atspi 0.31 系发布到
-  registry 后切回版本号引用即可恢复发布路径。
+- 【用户要求，2026-10-11，2026-09-28 条目已解决】`cargo publish` 曾被
+  atspi git 依赖阻断（crates.io 不接受无版本号的 git 依赖），已按
+  3.6 节 2026-10-11 条目的版本范围方案恢复；待 fawdlstty/atspi 0.31 系
+  发布到 registry 后可收紧为版本号引用。
 
 ## 5. 与其他系统的关系
 
 - 【AI 演绎，落实用户要求 git 引用】atspi（fawdlstty/atspi，odilia-app/
   atspi 的 0.31 基线 fork，zbus 5.5）：Linux AT-SPI2 控件树感知的协议
-  实现，channel 经 git 依赖直接引用；WorkRecorder 仓的 third_party/atspi
-  补丁与其同源同版本（0.31.0/0.15.0），保证两侧 atspi-common 类型一致。
+  实现，channel 经 git 依赖 + 版本范围 `>=0.30, <0.32` 引用——git 构建
+  （channel 本地、WorkRecorder 补丁仓）落在 fork 0.31.0，crates.io 发布
+  形态剥除 git 段落解析到上游 0.30.0（2026-10-11 起）；WorkRecorder 仓的
+  third_party/atspi 补丁与其同源同版本（0.31.0/0.15.0），保证两侧
+  atspi-common 类型一致。
 - 【AI 演绎】potato（fawdlstty/potato ≥ 0.4.1）：HTTP 传输（Session/
   HttpServer/SSE）+ WebSocket 客户端（wslite 泛型客户端 / full
   `Websocket::connect`）+ 最小 `block_on` 执行器。

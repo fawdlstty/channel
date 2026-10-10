@@ -1,6 +1,6 @@
 [package]
 name = "channel"
-version = "0.3.9"
+version = "0.3.10"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -26,7 +26,7 @@ minijinja-contrib = { version = "2", optional = true, default-features = false, 
 # cc-switch switching only (`ccswitch` feature): provider config stored in a
 # SQLite database, read through the ormer ORM (turso backend, pure Rust —
 # default builds stay free of any C toolchain requirement).
-ormer = { version = "0.2.12", optional = true, default-features = false, features = ["sqlite"] }
+ormer = { version = "0.2.18", optional = true, default-features = false, features = ["sqlite"] }
 # std: base HTTP stack; tls: upstream HTTPS (rustls); websocket: RFC 6455
 # client handshake + frames (anyhow/sha1 already pulled by std, near-zero cost).
 # 0.4.1: exposes the lite WebsocketIo client (wslite) on std builds.
@@ -66,7 +66,16 @@ png = { version = "0.17", optional = true }
 # - proxies: interface proxies (Accessible/Component/EditableText/Text/Value);
 # - connection: AccessibilityConnection (a11y bus discovery + event stream);
 # - zbus: zbus type re-exports (CacheProperties etc. used by proxy builders).
-atspi = { git = "https://github.com/fawdlstty/atspi", optional = true, default-features = false, features = [
+# The version range spans the fork's base (0.31.0-dev, unpublished; carries
+# the initialize_peers skip fix, upstream PR #384) and the newest registry
+# release (0.30.0). `cargo publish` strips the git spec, so published builds
+# resolve upstream 0.30.0 from crates.io, while the local git fork (0.31.0)
+# and the WorkRecorder third_party/atspi patch (0.31.0) both satisfy the
+# range and unify on one atspi-common version. A pinned `^0.30` would
+# exclude the 0.31.0 patch and fork two incompatible atspi-common types
+# into consumer graphs. Once upstream merges PR #384 and releases 0.31,
+# tighten this to `version = "0.31"` (keep or drop the git spec).
+atspi = { git = "https://github.com/fawdlstty/atspi", version = ">=0.30, <0.32", optional = true, default-features = false, features = [
     "proxies",
     "connection",
     "zbus",

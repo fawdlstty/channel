@@ -1409,6 +1409,13 @@ pub enum Event {
         detail: String,
     },
     Status(Status),
+    /// Provider-reported context window occupancy (tokens used / window
+    /// total). Emitted by backends whose stream carries usage projections
+    /// (ZCode `result.projection`); backends without the data never emit it.
+    ContextUsage {
+        used: u64,
+        total: u64,
+    },
     Error(String),
     Finished(Finish),
     Raw(serde_json::Value),

@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 is_newline = ev.text.ends_with('\n');
             }
             channel::SessionEvent::Permission(_) => {}
+            channel::SessionEvent::ContextUsage { .. } => {}
             channel::SessionEvent::Finished(_) => {}
         }
     }

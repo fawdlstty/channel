@@ -180,6 +180,7 @@ impl Adapter {
         self,
         config: SessionConfig,
         first_message: String,
+        attachments: Vec<String>,
         initialized: Option<crate::protocol::HarnessState>,
     ) -> Result<Session, crate::protocol::Error> {
         match self {
@@ -191,9 +192,16 @@ impl Adapter {
                 acp::AcpBackend::create_session_with_config(config, first_message, initialized)
                     .await
             }
+            // CLI backend carries attachments on the first spawned turn;
+            // backends without attachment support drop them silently.
             Self::Cli => {
-                cli::CliBackend::create_session_with_config(config, first_message, initialized)
-                    .await
+                cli::CliBackend::create_session_with_config(
+                    config,
+                    first_message,
+                    attachments,
+                    initialized,
+                )
+                .await
             }
         }
     }

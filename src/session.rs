@@ -21,6 +21,17 @@ pub(crate) trait Backend: Send {
         None
     }
     fn send<'a>(&'a mut self, message: String) -> BackendFuture<'a, ()>;
+    /// Send a turn with file attachments (images and documents referenced by
+    /// absolute path). Backends that cannot carry attachments silently drop
+    /// them and fall back to plain text, matching the previous behavior.
+    fn send_with_attachments<'a>(
+        &'a mut self,
+        message: String,
+        attachments: &[String],
+    ) -> BackendFuture<'a, ()> {
+        let _ = attachments;
+        self.send(message)
+    }
     fn next_event<'a>(&'a mut self) -> BackendFuture<'a, Option<Event>>;
     fn interrupt<'a>(&'a mut self) -> BackendFuture<'a, ()>;
     fn close<'a>(&'a mut self) -> BackendFuture<'a, ()>;
@@ -56,6 +67,11 @@ pub struct ActivityEvent {
     pub kind: ActivityKind,
     pub status: ActivityStatus,
     pub display: String,
+    /// Short zcode-style summary for the summary row: the command for shell
+    /// tools, the search pattern for search tools, the file name for file
+    /// tools. `None` when nothing structured could be extracted and the UI
+    /// should fall back to `display`.
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +80,7 @@ pub struct ActivityView {
     pub kind: ActivityKind,
     pub status: ActivityStatus,
     pub display: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -108,6 +125,11 @@ pub enum SessionEvent {
     Activity(ActivityEvent),
     Message(MessageEvent),
     Permission(PermissionEvent),
+    /// Context window occupancy reported by the provider for the current turn.
+    ContextUsage {
+        used: u64,
+        total: u64,
+    },
     Finished(Finish),
 }
 
@@ -164,6 +186,43 @@ trait ActivityName {
     fn activity_display(&self, detail: Option<&str>) -> String;
 }
 
+/// Extract the zcode-style summary row detail from a tool call input payload:
+/// the command for shell tools, the search pattern for search tools, the file
+/// path for file tools. Returns `None` when the input carries nothing
+/// structured, letting the UI fall back to the plain display text.
+fn tool_row_detail(name: &str, input: Option<&str>) -> Option<String> {
+    let input = input?;
+    let value: serde_json::Value = match serde_json::from_str(input) {
+        Ok(value @ serde_json::Value::Object(_)) => value,
+        _ => return None,
+    };
+    let field = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("bash") || lower.contains("command") || lower.contains("shell") || lower.contains("exec") {
+        return field(&["command", "cmd", "script"]);
+    }
+    if lower.contains("grep") || lower.contains("glob") || lower.contains("search") {
+        return field(&["pattern", "query", "search"]);
+    }
+    if lower.contains("todo") || lower.contains("plan") || lower.contains("workflow") {
+        return None;
+    }
+    field(&["filePath", "file_path", "path", "filename", "notebook_path"])
+        .or_else(|| field(&["command", "cmd", "pattern", "query"]))
+}
+
+/// Keep only the file name for summary rows; the full path stays available in
+/// `display` for tooltips.
+fn file_row_detail(path: &str) -> String {
+    path.rsplit('/').find(|segment| !segment.is_empty()).unwrap_or(path).to_owned()
+}
+
 impl ActivityName for str {
     fn activity_kind(&self) -> ActivityKind {
         let name = self.to_ascii_lowercase();
@@ -199,6 +258,7 @@ impl ToolCall {
             kind: self.name.activity_kind(),
             status: self.status,
             display: self.name.activity_display(self.output.as_deref()),
+            detail: tool_row_detail(&self.name, self.input.as_deref()),
         }
     }
 }
@@ -214,6 +274,7 @@ impl FileRead {
             kind: ActivityKind::ReadFile,
             status: self.status,
             display: format!("Read {}", self.path),
+            detail: Some(file_row_detail(&self.path)),
         }
     }
 }
@@ -229,6 +290,7 @@ impl FileChange {
             kind: ActivityKind::WriteFile,
             status: self.status,
             display: format!("Changed {}", self.path),
+            detail: Some(file_row_detail(&self.path)),
         }
     }
 }
@@ -489,6 +551,18 @@ impl Session {
         message: impl Into<String>,
         mode: SendMode,
     ) -> Result<SendResult, Error> {
+        self.send_with_attachments(message, Vec::new(), mode).await
+    }
+
+    /// Send a turn carrying file attachments (absolute paths, resolved on the
+    /// harness host). Turn bookkeeping mirrors [`Session::send`]; only the
+    /// backend delivery differs.
+    pub async fn send_with_attachments(
+        &mut self,
+        message: impl Into<String>,
+        attachments: Vec<String>,
+        mode: SendMode,
+    ) -> Result<SendResult, Error> {
         if self.status == Status::Closed {
             return Err(Error::Closed);
         }
@@ -538,7 +612,11 @@ impl Session {
         });
         self.touch_info();
 
-        if let Err(error) = self.backend.send(message).await {
+        if let Err(error) = self
+            .backend
+            .send_with_attachments(message, &attachments)
+            .await
+        {
             self.fail(error.to_string());
             return Err(error);
         }
@@ -680,9 +758,10 @@ impl Session {
                     .clone()
                     .map(|id| format!("tool-{id}"))
                     .unwrap_or_else(|| format!("tool-activity-{}", call.sequence)),
-                kind: ActivityKind::Tool,
+                kind: call.name.activity_kind(),
                 status: call.status,
                 display: call.name.activity_display(call.output.as_deref()),
+                detail: tool_row_detail(&call.name, call.input.as_deref()),
             }
         }));
         items.extend(self.files_read.iter().map(|file| {
@@ -695,6 +774,7 @@ impl Session {
                 kind: ActivityKind::ReadFile,
                 status: file.status,
                 display: format!("Read {}", file.path),
+                detail: Some(file_row_detail(&file.path)),
             }
         }));
         items.extend(self.files_changed.iter().map(|change| {
@@ -707,6 +787,7 @@ impl Session {
                 kind: ActivityKind::WriteFile,
                 status: change.status,
                 display: format!("Changed {}", change.path),
+                detail: Some(file_row_detail(&change.path)),
             }
         }));
         items.sort_by_key(|item| item.id.clone());
@@ -845,10 +926,15 @@ impl Session {
                 kind: ActivityKind::Tool,
                 status: ToolStatus::Requested,
                 display: name.activity_display(detail.as_deref()),
+                detail: None,
             })),
             Event::ToolCall(call) => Some(SessionEvent::Activity(call.activity_event())),
             Event::FileRead(file) => Some(SessionEvent::Activity(file.activity_event())),
             Event::FileChange(change) => Some(SessionEvent::Activity(change.activity_event())),
+            Event::ContextUsage { used, total } => Some(SessionEvent::ContextUsage {
+                used: *used,
+                total: *total,
+            }),
             Event::PermissionRequired { id, detail } => {
                 Some(SessionEvent::Permission(PermissionEvent {
                     id: id.clone(),
@@ -907,6 +993,7 @@ impl Session {
                 self.status = Status::WaitingForPermission;
             }
             Event::Status(status) => self.set_status(*status),
+            Event::ContextUsage { .. } => {}
             Event::Finished(finish) => {
                 let finish = if finish.text.is_empty() {
                     Finish::new(finish.status, self.text.clone())

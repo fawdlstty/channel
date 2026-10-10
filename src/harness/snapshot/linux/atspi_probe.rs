@@ -125,6 +125,12 @@ impl EventCache {
 /// password-text→Edit（密码判定走角色）、frame/window→Window（顶层窗口
 /// 识别）。输出词汇表 ⊆ UIA 侧 [`crate::harness::snapshot::uia`] 的 ControlType
 /// 清单（单测断言）。
+///
+/// 末尾 `_` 兜底：registry 发布版（atspi 0.30 / atspi-common 0.14）没有
+/// `Role::Switch`（0.31/0.15 变体），穷尽 match 在下游编译不过；fork 本地
+/// 构建时 Switch 经兜底落 "Custom"。上游合并 PR #384 并发布 0.31 后，
+/// 删除 `_` 与下方 allow、恢复 `Role::Switch => "Button"` 分支。
+#[allow(unreachable_patterns)]
 pub(crate) fn role_to_control_type(role: Role) -> &'static str {
     match role {
         Role::Invalid => "Custom",
@@ -190,7 +196,6 @@ pub(crate) fn role_to_control_type(role: Role) -> &'static str {
         Role::Terminal => "Document",
         Role::Text => "Edit",
         Role::ToggleButton => "Button",
-        Role::Switch => "Button",
         Role::ToolBar => "ToolBar",
         Role::ToolTip => "ToolTip",
         Role::Tree => "Tree",
@@ -258,6 +263,7 @@ pub(crate) fn role_to_control_type(role: Role) -> &'static str {
         Role::Mark => "Custom",
         Role::Suggestion => "Custom",
         Role::PushButtonMenu => "SplitButton",
+        _ => "Custom",
     }
 }
 
