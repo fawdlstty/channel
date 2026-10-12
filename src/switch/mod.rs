@@ -4,8 +4,11 @@
 // as usual, while an explicit switch request fails with
 // `Error::UnsupportedCapability` instead of pulling the stack in.
 
+// pub(crate): the catalog enumeration (`crate::catalog`) reads provider keys
+// through the same database handle the session layer uses, and the catalog
+// tests reuse the cc-switch test database builder.
 #[cfg(feature = "ccswitch")]
-mod ccswitch;
+pub(crate) mod ccswitch;
 
 use std::path::Path;
 

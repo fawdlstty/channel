@@ -226,13 +226,25 @@ fn file_row_detail(path: &str) -> String {
 impl ActivityName for str {
     fn activity_kind(&self) -> ActivityKind {
         let name = self.to_ascii_lowercase();
-        if name.contains("agent") {
+        if name.contains("agent") || name.contains("task") {
             ActivityKind::Subagent
-        } else if name.contains("read") || name.contains("cat") || name.contains("list") {
+        } else if name.contains("read")
+            || name.contains("cat")
+            || name.contains("list")
+            || name.contains("grep")
+            || name.contains("glob")
+            || name.contains("search")
+            || name.contains("find")
+        {
             ActivityKind::ReadFile
         } else if name.contains("write") || name.contains("edit") || name.contains("patch") {
             ActivityKind::WriteFile
-        } else if name.contains("command") || name.contains("shell") || name.contains("exec") {
+        } else if name.contains("command")
+            || name.contains("shell")
+            || name.contains("exec")
+            || name.contains("bash")
+            || name.contains("terminal")
+        {
             ActivityKind::RunCommand
         } else {
             ActivityKind::Tool
@@ -923,7 +935,7 @@ impl Session {
                 id: id
                     .clone()
                     .unwrap_or_else(|| format!("activity-{}", self.next_sequence)),
-                kind: ActivityKind::Tool,
+                kind: name.activity_kind(),
                 status: ToolStatus::Requested,
                 display: name.activity_display(detail.as_deref()),
                 detail: None,

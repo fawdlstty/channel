@@ -63,6 +63,13 @@ impl CodexDatabase {
         ))
     }
 
+    /// Whether the database file exists at all. A missing file means
+    /// cc-switch is not installed, which callers treat as "no keys" instead
+    /// of an error.
+    pub(crate) fn exists(&self) -> bool {
+        self.0.is_file()
+    }
+
     /// Connects to the cc-switch database. turso creates missing database
     /// files on open, but the cc-switch database is an external artifact, so
     /// a missing file is surfaced here instead of querying an empty store.
@@ -3092,5 +3099,66 @@ mod tests {
         assert!(message.contains("glm团队1"), "message: {message}");
         assert!(!message.contains("account:zai"), "message: {message}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// Database builder shared with the `catalog` unit tests, which exercise the
+// public channel enumeration against a real cc-switch database file.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{ProviderRow, APP_TYPE};
+
+    pub(crate) struct TestDatabase {
+        path: std::path::PathBuf,
+        connection: ormer::Database,
+    }
+
+    impl TestDatabase {
+        pub(crate) async fn create() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "channel-catalog-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let connection =
+                ormer::Database::connect(ormer::DbType::Sqlite, &path.to_string_lossy())
+                    .await
+                    .unwrap();
+            connection.create_table::<ProviderRow>().execute().await.unwrap();
+            Self { path, connection }
+        }
+
+        /// Inserts a provider whose Codex config pins `model`.
+        pub(crate) async fn insert_provider(&self, name: &str, model: &str) {
+            let settings_config = format!(
+                r#"{{"auth":{{"OPENAI_API_KEY":"secret"}},"config":"model = \"{model}\"\n[model_providers.custom]\nbase_url = \"https://example.invalid/v1\"\n"}}"#
+            );
+            self.connection
+                .insert(&ProviderRow {
+                    id: name.to_owned(),
+                    app_type: APP_TYPE.to_owned(),
+                    name: name.to_owned(),
+                    settings_config,
+                    meta: "{}".to_owned(),
+                    created_at: None,
+                    sort_index: None,
+                })
+                .execute()
+                .await
+                .unwrap();
+        }
+
+        pub(crate) fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }

@@ -1,6 +1,7 @@
 // Harness adapters (Codex/ACP/CLI) plus the opt-in desktop-sensing harness
 // (feature `harness`, former `charness` crate); see the module docs there.
 pub mod harness;
+mod catalog;
 #[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 mod llm;
 mod process;
@@ -12,6 +13,8 @@ mod utils;
 
 use protocol::{HarnessInit, HarnessState};
 
+// Installation detection and channel enumeration for embedding applications.
+pub use catalog::{detect_harness, list_channels, ChannelInfo, DetectInfo};
 pub use protocol::{
     AccountRef, ApprovalPolicy, AuditDescriptor, AuditMode, BackendInfo, BackendKind, BackendSpec,
     Capabilities, Capability, CapabilityEvidence, CapabilityReport, CapabilitySet, Confidence,
