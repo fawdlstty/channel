@@ -98,6 +98,34 @@
   代码模块名（`src/switch/`、`mod switch;`、`SwitchProvider`）保持不变，
   仅 feature 名改为 `ccswitch`；未启用时 `SwitchProvider` 降级为
   unsupported-capability 错误（错误消息同步指向 `ccswitch`）。
+- 【用户要求，2026-10-15】cc-switch 的供应商按 `app_type` 分属各开发环境
+  （codex/claude/opencode/gemini），渠道枚举与会话切换复用其中 channel
+  支持的三类（gemini 无对应 harness，不枚举）：
+  - Codex（`app_type=codex`，原有）：config.toml + cc-switch key 合并，
+    切换经 `CODEX_HOME` 会话 home（0.3.11 起既有行为不变）；
+  - ClaudeCode（`app_type=claude`）：`settings_config` 即 `{"env":{...}}`
+    （ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL 等），切换为逐键注入子进程
+    环境变量（claude CLI 对这组变量的响应优先于全局配置），不落盘；
+  - OpenCode（`app_type=opencode`）：`settings_config` 是 opencode.json
+    `provider.<id>` 切片，切换时挂到会话本地配置的固定 provider id
+    `ccswitch` 下（`model` 指向所选模型）经 `OPENCODE_CONFIG` 指给
+    `opencode acp`（该变量优先级高于用户全局配置，实测
+    `session/new` 的 model `currentValue` 生效）。
+- 【AI 演绎，2026-10-15，落实上一条】`CodexDatabase` 更名
+  `CcSwitchDatabase`，`available_keys`/`resolve_provider`/`resolve_row`
+  带 `app_type` 参数；`PreparedResources::env` 从路径对放宽为
+  `(String, String)`；ACP 后端（`harness/acp.rs`）补上 env 注入通道。
+  渠道枚举（`catalog::list_channels`）：Codex 静态 config.toml 优先、
+  ClaudeCode 全部来自 cc-switch、OpenCode 静态 `opencode.json`/
+  `opencode.jsonc`（逐 provider×model 条目）+ cc-switch 合并（同名团队
+  静态优先）；claude 条目模型取 `env.ANTHROPIC_MODEL`（缺省 default），
+  opencode 条目按 `models` 表逐模型展开。
+- 【AI 演绎，2026-10-15】cc-switch 桌面端常驻时持有数据库锁，turso 无法
+  直连被外部进程锁定的既有 SQLite 文件（枚举与会话切换解析同时受损）：
+  直连失败回退为把 `cc-switch.db`（连同 `-wal`/`-shm`，SQLite 锁为 POSIX
+  建议锁、文件字节始终可读）逐字节复制到
+  `$TMPDIR/channel-ccswitch-snapshots/` 快照再打开，快照按小时惰性清理；
+  读取均为轻量只读查询，可接受秒级陈旧。
 
 ### 3.5 `local-safetensors-cpu` 家族（含 `local-gguf-*`，+cuda/metal/vulkan 变体）
 

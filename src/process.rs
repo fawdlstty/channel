@@ -30,7 +30,7 @@ impl JsonlProcess {
         command: &str,
         args: &[&str],
         cwd: Option<&std::path::Path>,
-        envs: &[(&str, &std::path::Path)],
+        envs: &[(String, String)],
     ) -> Result<Self, Error> {
         let mut command_builder = Command::new(command);
         command_builder.kill_on_drop(true);

@@ -266,7 +266,7 @@ impl Actuator for XTestActuator {
     fn type_text(&self, text: &str, interval_ms: u64) -> Result<(), Error> {
         // 非 ASCII（中文等）：keysym 只覆盖 Latin-1 → 剪贴板粘贴路径
         //（§7.1；sendinput.rs 因 IME 拦截 UNICODE 注入走同路的对偶决策）。
-        if text.chars().any(|c| !c.is_ascii()) {
+        if !text.is_ascii() {
             return self.type_text_via_clipboard(text, CLIPBOARD_SETTLE_MS, CLIPBOARD_CONSUME_MS);
         }
         for c in text.chars() {

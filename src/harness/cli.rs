@@ -9,18 +9,50 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 
 struct CliProcess {
     child: Child,
     stdout: BufReader<ChildStdout>,
+    /// stderr tail collector. The structured CLIs keep their real failure
+    /// reason (provider business errors, config problems) on stderr; the
+    /// tail is surfaced when the process exits nonzero without a terminal
+    /// event, instead of dropping it into a null sink.
+    stderr_tail: Option<tokio::task::JoinHandle<String>>,
 }
 
 impl Drop for CliProcess {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
+}
+
+/// Keeps at most the last [`STDERR_TAIL_BYTES`] of a CLI's stderr.
+const STDERR_TAIL_BYTES: usize = 4096;
+
+async fn collect_stderr_tail(
+    mut stderr: tokio::process::ChildStderr,
+) -> String {
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut chunk = [0_u8; 2048];
+    loop {
+        match stderr.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(count) => {
+                buffer.extend_from_slice(&chunk[..count]);
+                if buffer.len() > STDERR_TAIL_BYTES * 2 {
+                    let excess = buffer.len() - STDERR_TAIL_BYTES;
+                    buffer.drain(..excess);
+                }
+            }
+        }
+    }
+    if buffer.len() > STDERR_TAIL_BYTES {
+        let excess = buffer.len() - STDERR_TAIL_BYTES;
+        buffer.drain(..excess);
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
 }
 
 pub(crate) struct CliBackend {
@@ -115,7 +147,7 @@ impl CliBackend {
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         for (name, value) in self.resources.as_ref().map(|r| r.env()).unwrap_or_default() {
             command.env(name, value);
         }
@@ -129,9 +161,14 @@ impl CliBackend {
             .stdout
             .take()
             .ok_or_else(|| Error::Backend("CLI stdout is unavailable".to_owned()))?;
+        let stderr_tail = child
+            .stderr
+            .take()
+            .map(|stderr| tokio::spawn(collect_stderr_tail(stderr)));
         self.process = Some(CliProcess {
             child,
             stdout: BufReader::new(stdout),
+            stderr_tail,
         });
         self.queued.clear();
         self.text_seen = false;
@@ -191,8 +228,28 @@ impl CliBackend {
                     if self.interrupt_requested {
                         self.queue_finished(Status::Interrupted);
                     } else if !status.success() {
-                        self.queued
-                            .push_back(Event::Error(format!("CLI exited with status {status}")));
+                        // Nonzero exit without a terminal event: the CLI died
+                        // before reporting why. Its stderr (kept providers
+                        // print the business error there) is the only source
+                        // of the real reason — surface its tail verbatim.
+                        let stderr_tail = match process.stderr_tail.take() {
+                            Some(handle) => tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                handle,
+                            )
+                            .await
+                            .ok()
+                            .and_then(|result| result.ok())
+                            .unwrap_or_default(),
+                            None => String::new(),
+                        };
+                        let mut message = format!("CLI exited with status {status}");
+                        let tail = stderr_tail.trim();
+                        if !tail.is_empty() {
+                            message.push_str(": ");
+                            message.push_str(tail);
+                        }
+                        self.queued.push_back(Event::Error(message));
                         self.queue_finished(Status::Failed);
                     } else {
                         self.queue_finished(Status::Completed);
@@ -387,6 +444,18 @@ impl CliBackend {
                 }
                 events
             }
+            "session.updated" => {
+                // ZCode 投影时 compact_started/completed/failed/boundary 等
+                // 内部事件全部落进 session.updated 兜底分支且 payload 原样
+                // 透传。只有 compact_boundary 载荷特有的键组（strict zod
+                // schema 独有，其他事件 payload 不含，无误判面）才提升为
+                // 一等事件；其余维持现状静默忽略。
+                if is_zcode_compaction_boundary_payload(&payload) {
+                    vec![Event::CompactionBoundary { payload }]
+                } else {
+                    Vec::new()
+                }
+            }
             _ => Vec::new(),
         }
     }
@@ -443,6 +512,29 @@ impl CliBackend {
             .filter(|output| !output.is_null());
         ToolEvent::new(id, name, input, status, output, false).events()
     }
+}
+
+/// `compact_boundary` 载荷键组判定（对齐 ZCode contracts 的 strict zod
+/// schema）：payload 为 object 且四条同时满足——`boundaryId` 非空 string、
+/// `summaryMessageIds` 为 array、`preCompactTokenCount` 为 number、
+/// `traceId` 非空 string。该键组为 compact_boundary 载荷独有，其他
+/// session.updated 载荷（普通状态快照等）不含，无误判面。
+fn is_zcode_compaction_boundary_payload(payload: &Value) -> bool {
+    payload.is_object()
+        && payload
+            .get("boundaryId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        && payload
+            .get("summaryMessageIds")
+            .is_some_and(Value::is_array)
+        && payload
+            .get("preCompactTokenCount")
+            .is_some_and(Value::is_number)
+        && payload
+            .get("traceId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
 }
 
 impl Backend for CliBackend {
@@ -1356,5 +1448,92 @@ mod tests {
         }
         // Session-id extraction still works for ignored events.
         assert_eq!(backend.session_id.as_deref(), Some("sess_1"));
+    }
+
+    /// stream-json `session.updated` 行实拍样本：payload 为 ZCode
+    /// CompactBoundaryPayload（compact_boundary 事件经 catch-all 透传）。
+    #[test]
+    fn zcode_compaction_boundary_payload_becomes_a_first_class_event() {
+        let mut backend = zcode_backend();
+        let payload = serde_json::json!({
+            "boundaryId": "compact_7f3a2c",
+            "trigger": "auto",
+            "phase": "mid_turn",
+            "compactReason": "context_limit",
+            "summarySource": "model",
+            "preCompactTokenCount": 155320,
+            "postCompactTokenCount": 21330,
+            "truePostCompactTokenCount": 22470,
+            "autoCompactThreshold": 166000,
+            "willRetriggerNextTurn": false,
+            "summarizedMessageCount": 42,
+            "keptMessageCount": 2,
+            "lastSummarizedMessageId": "msg_41",
+            "preservedSegment": {
+                "headMessageId": "msg_40",
+                "anchorMessageId": "msg_40",
+                "tailMessageId": "msg_41"
+            },
+            "summaryMessageIds": ["msg_42"],
+            "customInstructions": false,
+            "traceId": "trace_9f2",
+            "turnId": "turn_77"
+        });
+        let events = backend.parse_json(&serde_json::json!({
+            "type": "session.updated",
+            "sessionId": "sess_cb",
+            "eventId": "evt_1",
+            "payload": payload,
+        }));
+        assert_eq!(
+            events,
+            vec![Event::CompactionBoundary { payload: payload.clone() }],
+            "boundary 键组命中 → 提升为一等事件，payload 原样透传"
+        );
+        assert_eq!(backend.session_id.as_deref(), Some("sess_cb"));
+    }
+
+    /// 非 boundary 载荷（普通状态快照 / 键组不全 / 非 object）维持忽略，
+    /// 既有 session.updated 静默语义不变。
+    #[test]
+    fn zcode_session_updated_without_boundary_key_group_stays_ignored() {
+        let mut backend = zcode_backend();
+        // 空 payload（既有忽略语义）
+        assert_eq!(
+            backend.parse_json(&serde_json::json!({
+                "type": "session.updated", "sessionId": "s", "payload": {}
+            })),
+            Vec::new()
+        );
+        // 普通状态快照：无 boundaryId / traceId
+        assert_eq!(
+            backend.parse_json(&serde_json::json!({
+                "type": "session.updated", "sessionId": "s",
+                "payload": {"status": "running", "turns": 3}
+            })),
+            Vec::new()
+        );
+        // 键组不全：缺 summaryMessageIds 数组与 number 型 token 计数
+        assert_eq!(
+            backend.parse_json(&serde_json::json!({
+                "type": "session.updated", "sessionId": "s",
+                "payload": {"boundaryId": "compact_x", "traceId": "tr"}
+            })),
+            Vec::new()
+        );
+        // payload 非 object
+        assert_eq!(
+            backend.parse_json(&serde_json::json!({
+                "type": "session.updated", "sessionId": "s", "payload": "text"
+            })),
+            Vec::new()
+        );
+        // 无 payload 行
+        assert_eq!(
+            backend.parse_json(&serde_json::json!({
+                "type": "session.updated", "sessionId": "s"
+            })),
+            Vec::new()
+        );
     }
 }

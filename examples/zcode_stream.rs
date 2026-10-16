@@ -88,6 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SessionEvent::ContextUsage { used, total } => {
                 println!("\n[t+{:.3}s] context usage: {used}/{total}", at.as_secs_f64());
             }
+            SessionEvent::CompactionBoundary { .. } => {
+                println!("\n[t+{:.3}s] compaction boundary", at.as_secs_f64());
+            }
             SessionEvent::Finished(finish) => {
                 println!("\n[t+{:.3}s] finished: {:?} text({} chars)",
                     at.as_secs_f64(), finish.status, finish.text.chars().count());

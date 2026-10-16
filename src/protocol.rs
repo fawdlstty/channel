@@ -1416,6 +1416,15 @@ pub enum Event {
         used: u64,
         total: u64,
     },
+    /// External engine compaction boundary: the ZCode `compact_boundary`
+    /// event as projected through the headless `session.updated` catch-all.
+    /// `payload` is the ZCode `CompactBoundaryPayload` JSON passed through
+    /// verbatim; channel deliberately keeps no typed copy of the still
+    /// evolving engine event surface (the transcription layer re-parses it
+    /// into `channel::CompactionBoundary`).
+    CompactionBoundary {
+        payload: serde_json::Value,
+    },
     Error(String),
     Finished(Finish),
     Raw(serde_json::Value),

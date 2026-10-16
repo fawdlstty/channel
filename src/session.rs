@@ -120,7 +120,7 @@ pub enum PermissionResponse {
     Deny,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SessionEvent {
     Activity(ActivityEvent),
     Message(MessageEvent),
@@ -129,6 +129,13 @@ pub enum SessionEvent {
     ContextUsage {
         used: u64,
         total: u64,
+    },
+    /// External engine compaction boundary; `payload` is the ZCode
+    /// `CompactBoundaryPayload` JSON passed through verbatim (see
+    /// [`Event::CompactionBoundary`]). Carried to the caller untouched —
+    /// session state aggregation ignores it.
+    CompactionBoundary {
+        payload: serde_json::Value,
     },
     Finished(Finish),
 }
@@ -947,6 +954,9 @@ impl Session {
                 used: *used,
                 total: *total,
             }),
+            Event::CompactionBoundary { payload } => Some(SessionEvent::CompactionBoundary {
+                payload: payload.clone(),
+            }),
             Event::PermissionRequired { id, detail } => {
                 Some(SessionEvent::Permission(PermissionEvent {
                     id: id.clone(),
@@ -1006,6 +1016,9 @@ impl Session {
             }
             Event::Status(status) => self.set_status(*status),
             Event::ContextUsage { .. } => {}
+            // 外部引擎压缩 boundary 是透传事实，不改会话状态聚合（宿主在
+            // 事件消费侧处理转写，见 design.md 压缩一节）。
+            Event::CompactionBoundary { .. } => {}
             Event::Finished(finish) => {
                 let finish = if finish.text.is_empty() {
                     Finish::new(finish.status, self.text.clone())
@@ -1371,6 +1384,47 @@ mod tests {
         ));
         assert!(matches!(session.wait_event().await, Ok(None)));
         assert_eq!(session.activity().counts.total, 2);
+    }
+
+    #[tokio::test]
+    async fn compaction_boundary_surfaces_without_state_changes() {
+        let payload = serde_json::json!({
+            "boundaryId": "compact_1",
+            "trigger": "auto",
+            "preCompactTokenCount": 100,
+            "summarizedMessageCount": 2,
+            "summaryMessageIds": ["msg_2"],
+            "traceId": "tr_1"
+        });
+        let mut session = session([
+            Event::TextDelta("回答".to_owned()),
+            Event::CompactionBoundary {
+                payload: payload.clone(),
+            },
+            Event::Finished(Finish::new(Status::Completed, "回答")),
+        ]);
+        session.send("请求", SendMode::Immediate).await.unwrap();
+        // 事件原样透传给消费方（宿主据此外部压缩转写）
+        assert_eq!(
+            session.wait_event().await.unwrap(),
+            Some(SessionEvent::Message(MessageEvent {
+                text: "回答".to_owned(),
+                reasoning: false,
+            }))
+        );
+        match session.wait_event().await.unwrap() {
+            Some(SessionEvent::CompactionBoundary { payload: carried }) => {
+                assert_eq!(carried, payload, "payload 原样透传");
+            }
+            other => panic!("expected CompactionBoundary, got {other:?}"),
+        }
+        // apply 忽略：不改会话状态聚合（文本/工具/终态均不受影响）
+        assert!(session.tool_calls.is_empty());
+        assert!(matches!(
+            session.wait_event().await.unwrap(),
+            Some(SessionEvent::Finished(_))
+        ));
+        assert_eq!(session.result().unwrap().status, Status::Completed);
     }
 
     #[tokio::test]

@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             channel::SessionEvent::Permission(_) => {}
             channel::SessionEvent::ContextUsage { .. } => {}
+            channel::SessionEvent::CompactionBoundary { .. } => {}
             channel::SessionEvent::Finished(_) => {}
         }
     }

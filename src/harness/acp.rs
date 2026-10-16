@@ -30,10 +30,14 @@ impl AcpProcess {
         command: &str,
         args: &[String],
         cwd: Option<&std::path::Path>,
+        envs: &[(String, String)],
     ) -> Result<Self, Error> {
         let mut command_builder = Command::new(command);
         command_builder.kill_on_drop(true);
         command_builder.args(args);
+        for (name, value) in envs {
+            command_builder.env(name, value);
+        }
         if let Some(cwd) = cwd {
             command_builder.current_dir(cwd);
         }
@@ -128,6 +132,8 @@ pub(crate) struct AcpBackend {
     kill_grace_period: Duration,
     protocol_version: Option<String>,
     server_name: Option<String>,
+    /// 渠道切换资源（cc-switch）：持有以保持会话切换落盘文件存活。
+    resources: Option<crate::switch::PreparedResources>,
 }
 
 impl AcpBackend {
@@ -136,12 +142,13 @@ impl AcpBackend {
         args: Vec<String>,
         cwd: Option<&std::path::Path>,
         executable: Option<&std::path::Path>,
+        envs: &[(String, String)],
     ) -> Result<Self, Error> {
         let command = executable
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or(command);
         let mut backend = Self {
-            process: AcpProcess::spawn_with_cwd(&command, &args, cwd).await?,
+            process: AcpProcess::spawn_with_cwd(&command, &args, cwd, envs).await?,
             session_id: String::new(),
             next_request_id: 1,
             prompt_id: None,
@@ -154,6 +161,7 @@ impl AcpBackend {
             kill_grace_period: Duration::from_secs(2),
             protocol_version: None,
             server_name: None,
+            resources: None,
         };
 
         let initialize_result = backend
@@ -481,6 +489,7 @@ impl AcpBackend {
             args.clone(),
             Some(&cwd),
             Some(&executable),
+            &[],
         )
         .await?;
         let initialization = AcpInitialization {
@@ -541,8 +550,19 @@ impl AcpBackend {
             &command,
             Some(&cwd),
         )?;
-        let backend =
-            AcpBackend::connect_with_cwd(command, args, Some(&cwd), Some(&executable)).await?;
+        // 渠道切换资源（cc-switch）：OpenCode 经 OPENCODE_CONFIG 指向会话本地
+        // 配置副本；持有它保证会话期间副本不被清理逻辑误删。
+        let resources = crate::protocol::SwitchProvider::CcSwitch
+            .prepare_resources(&config)
+            .await?;
+        let envs = resources
+            .as_ref()
+            .map(crate::switch::PreparedResources::env)
+            .unwrap_or_default();
+        let mut backend =
+            AcpBackend::connect_with_cwd(command, args, Some(&cwd), Some(&executable), &envs)
+                .await?;
+        backend.resources = resources;
         let id = backend.session_id.clone();
         let mut session = crate::session::Session::with_backend_config(
             config,

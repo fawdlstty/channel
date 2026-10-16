@@ -24,7 +24,9 @@ mod responses;
 mod local;
 
 #[cfg(feature = "llm")]
-pub use chat_completions::ChatCompletionsClient;
+pub use chat_completions::{
+    forward_chat_completions, ChatCompletionsClient, ForwardedCompletion,
+};
 #[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 pub use chat_completions::OpenAISender;
 #[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]

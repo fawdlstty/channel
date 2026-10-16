@@ -2,9 +2,9 @@
 
 #[cfg(feature = "llm")]
 use super::{
-    bearer_headers, check_model_against_list, check_stream_response, parse_json_body,
-    read_checked_body, read_json_body, send_request, spawn_sse_stream, ClientCore, LlmModelInfo,
-    SseAction, StreamChunk,
+    bearer_headers, check_model_against_list, check_stream_response, next_sse_event,
+    parse_json_body, read_checked_body, read_json_body, send_request, spawn_sse_stream,
+    ClientCore, LlmModelInfo, SseAction, StreamChunk,
 };
 use crate::protocol::Error;
 #[cfg(feature = "llm")]
@@ -205,6 +205,114 @@ pub(crate) fn parse_sse_event(event: &str) -> SseAction {
         },
         Err(_) => SseAction::Ignore,
     }
+}
+
+/// The result of a server-side forwarding request made with
+/// [`forward_chat_completions`]: the two possible shapes of an OpenAI Chat
+/// Completions exchange.
+#[cfg(feature = "llm")]
+pub enum ForwardedCompletion {
+    /// Non-streaming: the upstream response body in full (usage, choices,
+    /// tool_calls and any extension fields preserved as-is).
+    Full(serde_json::Value),
+    /// Streaming: raw SSE events, one complete event per item (including the
+    /// `data: ` prefix and the terminating blank line; the `data: [DONE]`
+    /// terminator passes through unchanged). Sender close = end of stream.
+    Stream(tokio::sync::mpsc::Receiver<Vec<u8>>),
+}
+
+/// Shapes a forwarded request body. The two transformations a relay may
+/// apply: replace `model` (when `model` is `Some`) and inject
+/// `stream_options.include_usage = true` for streaming requests that do not
+/// carry it (so the final chunk carries usage for metering). Every other
+/// field — tool_calls, vision payloads, sampling parameters — is preserved
+/// verbatim.
+#[cfg(feature = "llm")]
+pub(crate) fn shape_forward_body(
+    mut body: serde_json::Value,
+    model: Option<&str>,
+) -> serde_json::Value {
+    if let Some(model) = model {
+        body["model"] = serde_json::Value::String(model.to_owned());
+    }
+    let streaming = body
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if streaming {
+        let already = body
+            .get("stream_options")
+            .and_then(|options| options.get("include_usage"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !already {
+            let mut options = body
+                .get("stream_options")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            options.insert("include_usage".to_owned(), serde_json::Value::Bool(true));
+            body["stream_options"] = serde_json::Value::Object(options);
+        }
+    }
+    body
+}
+
+/// Forwards an arbitrary OpenAI Chat Completions body to `base_url`
+/// (server-side relay entry point; unlike [`ChatCompletionsClient`] it does
+/// not assemble the conversation — tool_calls, vision and other extension
+/// fields pass through untouched). Returns the non-streaming body in full or
+/// a per-event raw SSE stream; see [`ForwardedCompletion`].
+#[cfg(feature = "llm")]
+pub async fn forward_chat_completions(
+    base_url: impl AsRef<str>,
+    api_key: Option<&str>,
+    model: Option<&str>,
+    body: serde_json::Value,
+) -> Result<ForwardedCompletion, Error> {
+    let url = format!("{}/chat/completions", base_url.as_ref());
+    let body = shape_forward_body(body, model);
+    let streaming = body
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mut session = potato::Session::new();
+    let mut response = send_request(&mut session, &url, body, bearer_headers(api_key)).await?;
+    if streaming {
+        check_stream_response(&mut response).await?;
+        Ok(ForwardedCompletion::Stream(spawn_sse_passthrough(response)))
+    } else {
+        Ok(ForwardedCompletion::Full(read_json_body(&mut response).await?))
+    }
+}
+
+/// Spawns the background task that re-frames an upstream SSE byte stream
+/// into complete events (blank-line delimited) and forwards each event's raw
+/// bytes. A trailing partial event (upstream closed without the final blank
+/// line) is flushed as-is instead of being dropped.
+#[cfg(feature = "llm")]
+fn spawn_sse_passthrough(response: potato::HttpResponse) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        let mut response = response;
+        let mut stream = response.body.stream_data();
+        let mut buffer = String::new();
+        while let Some(chunk) = stream.next().await {
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(mut event) = next_sse_event(&mut buffer) {
+                event.push_str("\n\n");
+                if tx.send(event.into_bytes()).await.is_err() {
+                    // Downstream closed (client went away); stop pulling.
+                    return;
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            buffer.push_str("\n\n");
+            let _ = tx.send(buffer.into_bytes()).await;
+        }
+    });
+    rx
 }
 
 /// Emits an OpenAI Chat Completions SSE stream, for example to feed a
@@ -482,5 +590,69 @@ mod tests {
         assert_eq!(restored.reasoning_effort(), Some(ReasoningEffort::Low));
         assert_eq!(restored.messages(), client.messages());
         assert_eq!(restored.core.api_key.as_deref(), Some("key"));
+    }
+
+    #[test]
+    fn shape_forward_body_preserves_extension_fields_verbatim() {
+        // tool_calls / vision 等扩展字段原样保留，仅做允许的两处改动之外零触碰。
+        let body = serde_json::json!({
+            "model": "client-fixed-name",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "看这张图"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}}
+                ]}
+            ],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "tool_choice": "auto",
+            "temperature": 0.7,
+            "stream": false
+        });
+        let original = body.clone();
+        let shaped = shape_forward_body(body, None);
+        assert_eq!(shaped, original, "model=None 且非流式：body 必须原样");
+    }
+
+    #[test]
+    fn shape_forward_body_replaces_model_and_injects_include_usage() {
+        let body = serde_json::json!({
+            "model": "Recorder-0.1-Flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let shaped = shape_forward_body(body, Some("deepseek-flash"));
+        assert_eq!(shaped["model"], "deepseek-flash", "model 替换为上游真实名");
+        assert_eq!(
+            shaped["stream_options"]["include_usage"], true,
+            "流式且客户端未带 stream_options：注入 include_usage=true"
+        );
+
+        // 客户端已带 include_usage=true：不重复注入也不覆盖。
+        let body = serde_json::json!({
+            "model": "m", "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+        let shaped = shape_forward_body(body, None);
+        assert_eq!(shaped["stream_options"]["include_usage"], true);
+
+        // 客户端带 include_usage=false：服务器计费依赖末块 usage，覆写为 true
+        // （客户端置 false 意味着拿不到 usage → 0 计费，中转不允许）。
+        let body = serde_json::json!({
+            "model": "m", "stream": true,
+            "stream_options": {"include_usage": false, "custom": 1}
+        });
+        let shaped = shape_forward_body(body, None);
+        assert_eq!(shaped["stream_options"]["include_usage"], true);
+        assert_eq!(shaped["stream_options"]["custom"], 1);
+
+        // 非流式：不注入 stream_options。
+        let body = serde_json::json!({"model": "m", "messages": [], "stream": false});
+        let shaped = shape_forward_body(body, None);
+        assert!(shaped.get("stream_options").is_none());
+        // stream 字段缺失（缺省非流式）：同样不注入。
+        let body = serde_json::json!({"model": "m", "messages": []});
+        let shaped = shape_forward_body(body, None);
+        assert!(shaped.get("stream_options").is_none());
     }
 }

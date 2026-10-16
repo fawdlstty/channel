@@ -1,6 +1,6 @@
 [package]
 name = "channel"
-version = "0.3.12"
+version = "0.3.13"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -23,19 +23,33 @@ minijinja = { version = "2", optional = true }
 # Python-compat string/list methods (`split`, `strip`, ...) used by many
 # Hugging Face chat templates.
 minijinja-contrib = { version = "2", optional = true, default-features = false, features = ["pycompat"] }
-# cc-switch switching only (`ccswitch` feature): provider config stored in a
-# SQLite database, read through the ormer ORM (turso backend, pure Rust —
-# default builds stay free of any C toolchain requirement).
-ormer = { version = "0.2.18", optional = true, default-features = false, features = ["sqlite"] }
+# cc-switch provider reading (`ccswitch`) and the AI chat-history store
+# (`history`) share the same ormer ORM (turso backend, pure Rust — default
+# builds stay free of any C toolchain requirement). Path dependency on the
+# local checkout keeps the ormer version unified with consumer workspaces
+# (BlackAgent) so row-model types stay interchangeable; switch back to a
+# registry version if this crate is ever published to crates.io.
+ormer = { version = "0.2", optional = true, default-features = false, features = ["sqlite"] }
 # std: base HTTP stack; tls: upstream HTTPS (rustls); websocket: RFC 6455
 # client handshake + frames (anyhow/sha1 already pulled by std, near-zero cost).
 # 0.4.1: exposes the lite WebsocketIo client (wslite) on std builds.
 # Always compiled: the HTTP/ws transport underpins `llm`/`switch`/the local
 # model server and the Codex ws endpoint alike (no separate transport feature).
 potato = { version = "0.4.1", default-features = false, features = ["std", "tls", "websocket"] }
+# External-compaction transcription only (`history` feature): read-only
+# access to the ZCode engine session database (~/.zcode/cli/db/db.sqlite).
+# The turso red line forbids connecting to non-owned databases through ormer,
+# so external standard SQLite files always go through rusqlite (bundled
+# static SQLite, read-only connections; pure additive C source, no system
+# libsqlite3 requirement).
+rusqlite = { version = "0.40.2", optional = true, default-features = false, features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = { version = "2", optional = true }
+# Session/message ID generation (`history` feature): ZCode-style `sess_`/
+# `msg_`/`part_` identifiers embed v4 UUIDs, matching the IDs the BlackAgent
+# host wrote before the module moved into this crate.
+uuid = { version = "1", optional = true, features = ["v4"] }
 tokenizers = { version = "0.23.2", optional = true, default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 # cc-switch switching only (`ccswitch` feature): TOML config file parsing.
@@ -47,6 +61,12 @@ tracing-subscriber = { version = "0.3", optional = true, default-features = fals
 
 [dev-dependencies]
 tempfile = "3"
+# history integration tests drive the raw ormer::Database directly (lock()
+# escapes, pathogen reproductions) and build ZCode-engine-shaped SQLite
+# fixtures with rusqlite; same sources as the optional dependency so the
+# types unify with the ones channel re-exports.
+ormer = { version = "0.2", optional = false, default-features = false, features = ["sqlite"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 # test-util: start_paused virtual time for deterministic idle-clock tests.
 tokio = { version = "1", features = ["test-util"] }
 
@@ -124,6 +144,12 @@ llm = []
 # Off by default; without it `SwitchProvider` degrades to an
 # unsupported-capability error at the session layer.
 ccswitch = ["dep:ormer", "dep:toml"]
+# AI chat-history persistence (owned SQLite store via ormer/turso, ZCode
+# session-store compatible format; ZCode-side JSON `data` columns). Kept
+# independent from `ccswitch`: a host that only wants history storage does
+# not pull TOML, and vice versa. `history` also gates rusqlite (read-only
+# ZCode engine-database helper for external-compaction transcription).
+history = ["dep:ormer", "dep:rusqlite", "dep:uuid"]
 # In-process local inference, `local-<weight format>-<backend>`: the weight
 # format implies the engine — safetensors runs on the pure-Rust candle engine,
 # GGUF on llama.cpp (needs cmake and a C++ toolchain). The candle baseline (CPU) carries the
@@ -159,7 +185,7 @@ local-gguf-vulkan = ["local-gguf-cpu", "llama-cpp-2/vulkan"]
 # 在 Apple 目标自动开启，metal 标记 feature 无副作用，随聚合保留）。
 local-safetensors-full = ["local-safetensors-cpu"]
 local-gguf-full = ["local-gguf-cpu", "local-gguf-metal"]
-full = ["llm", "ccswitch", "local-safetensors-full", "local-gguf-full", "harness"]
+full = ["llm", "ccswitch", "history", "local-safetensors-full", "local-gguf-full", "harness"]
 # Desktop-sensing harness (folded in from the former `charness` crate):
 # UIA/AT-SPI control-tree awareness, association graph, read-only atomic
 # tools, JSON-lines service, store with redaction hooks. v1.15 (user request

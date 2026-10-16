@@ -126,7 +126,7 @@ pub(crate) fn capture_screen(
 /// w*4，无行尾填充需要跳过）。
 fn bgra_to_rgb(data: &[u8], little_endian: bool) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(data.len() / 4 * 3);
-    for px in data.chunks_exact(4) {
+    for px in data.as_chunks::<4>().0 {
         let (r, g, b) = if little_endian {
             (px[2], px[1], px[0])
         } else {

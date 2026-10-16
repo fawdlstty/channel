@@ -229,9 +229,9 @@ mod tests {
         let plain = dir.join("plain-file");
         std::fs::write(&plain, b"data").unwrap();
         // 命中：执行位在；不命中：无执行位/不存在/别的名字。
-        assert_eq!(which_in("fake-tool", &[dir.clone()]), Some(exe.clone()));
-        assert_eq!(which_in("plain-file", &[dir.clone()]), None);
-        assert_eq!(which_in("absent", &[dir.clone()]), None);
+        assert_eq!(which_in("fake-tool", std::slice::from_ref(&dir)), Some(exe.clone()));
+        assert_eq!(which_in("plain-file", std::slice::from_ref(&dir)), None);
+        assert_eq!(which_in("absent", std::slice::from_ref(&dir)), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

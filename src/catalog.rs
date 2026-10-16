@@ -30,6 +30,9 @@ use serde::{Deserialize, Serialize};
 use crate::protocol::{Error, HarnessKind};
 use crate::utils::path::CommandPath;
 
+#[cfg(feature = "ccswitch")]
+use crate::switch::ccswitch::app_type;
+
 /// Timeout of a single `--version` probe. Harness CLIs answer in well under a
 /// second; anything slower is treated as "binary present, version unknown".
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -78,9 +81,9 @@ pub struct ChannelInfo {
     /// `glm-5.3-flash`, ...).
     pub model: String,
     /// cc-switch key that restores this channel via
-    /// [`crate::SessionConfig::set_switch_provider`]. Filled for Codex
-    /// channels backed by a cc-switch entry; ZCode channels switch through
-    /// `set_model("{team}/{model}")` instead.
+    /// [`crate::SessionConfig::set_switch_provider`]. Filled for channels
+    /// backed by a cc-switch entry (Codex, ClaudeCode, OpenCode); ZCode
+    /// channels switch through `set_model("{team}/{model}")` instead.
     pub switch_key: Option<String>,
 }
 
@@ -121,9 +124,16 @@ fn command_of(kind: &HarnessKind) -> &'static str {
 ///   then `providerModelRules` modelIds, then `["default"]`.
 /// - **Codex**: one entry per `[model_providers.*]` section of
 ///   `~/.codex/config.toml` (model = top-level `model`), merged with the
-///   cc-switch key set when the cc-switch database exists (those entries
-///   carry their own model and `switch_key`). Requires the `ccswitch`
-///   feature; without it only the fallback entry is produced.
+///   cc-switch key set (`app_type = "codex"`) when the cc-switch database
+///   exists (those entries carry their own model and `switch_key`). Requires
+///   the `ccswitch` feature; without it only the fallback entry is produced.
+/// - **ClaudeCode**: the cc-switch key set (`app_type = "claude"`); each key
+///   is a full `{"env": {...}}` settings set, so one entry per key with the
+///   model from its `ANTHROPIC_MODEL` env when present.
+/// - **OpenCode**: one entry per (provider, model) of `opencode.json` /
+///   `opencode.jsonc` `provider.<id>` sections, merged with the cc-switch key
+///   set (`app_type = "opencode"`, whose `settings_config` is the same
+///   provider slice shape).
 /// - **Every other kind**: a single `default` entry.
 ///
 /// Missing or broken configuration degrades to a single
@@ -135,16 +145,24 @@ pub async fn list_channels(kind: HarnessKind) -> Result<Vec<ChannelInfo>, Error>
         #[cfg(feature = "ccswitch")]
         HarnessKind::Codex => {
             let mut channels = codex_config_channels();
-            merge_unique(&mut channels, ccswitch_channels().await);
+            merge_unique(&mut channels, ccswitch_channels(app_type::CODEX).await);
             channels
         }
         #[cfg(not(feature = "ccswitch"))]
         HarnessKind::Codex => Vec::new(),
-        HarnessKind::ClaudeCode
-        | HarnessKind::OpenCode
-        | HarnessKind::ZedAcp
-        | HarnessKind::DeepSeek
-        | HarnessKind::Hermes => Vec::new(),
+        #[cfg(feature = "ccswitch")]
+        HarnessKind::ClaudeCode => ccswitch_channels(app_type::CLAUDE).await,
+        #[cfg(not(feature = "ccswitch"))]
+        HarnessKind::ClaudeCode => Vec::new(),
+        #[cfg(feature = "ccswitch")]
+        HarnessKind::OpenCode => {
+            let mut channels = opencode_config_channels();
+            merge_unique(&mut channels, ccswitch_channels(app_type::OPENCODE).await);
+            channels
+        }
+        #[cfg(not(feature = "ccswitch"))]
+        HarnessKind::OpenCode => Vec::new(),
+        HarnessKind::ZedAcp | HarnessKind::DeepSeek | HarnessKind::Hermes => Vec::new(),
     };
     Ok(if channels.is_empty() {
         vec![default_channel()]
@@ -433,11 +451,14 @@ fn codex_channels_from_config(config_text: &str) -> Result<Vec<ChannelInfo>, Str
     Ok(channels)
 }
 
-/// cc-switch keys as Codex channels. A missing/unreadable cc-switch database
-/// is a normal "not installed" state, not an enumeration failure.
+/// cc-switch keys as channels of one app (`app_type`). A missing/unreadable
+/// cc-switch database is a normal "not installed" state, not an enumeration
+/// failure. Codex keys yield one entry each (the model their config pins);
+/// Claude keys yield one entry each (the model from `ANTHROPIC_MODEL` when
+/// present); OpenCode keys yield one entry per model of their `models` map.
 #[cfg(feature = "ccswitch")]
-async fn ccswitch_channels() -> Vec<ChannelInfo> {
-    let database = match crate::switch::ccswitch::CodexDatabase::path() {
+async fn ccswitch_channels(app: &str) -> Vec<ChannelInfo> {
+    let database = match crate::switch::ccswitch::CcSwitchDatabase::path() {
         Ok(database) => database,
         Err(error) => {
             catalog_note!("cannot locate the cc-switch database: {error}");
@@ -447,26 +468,137 @@ async fn ccswitch_channels() -> Vec<ChannelInfo> {
     if !database.exists() {
         return Vec::new();
     }
-    let keys = match database.available_keys().await {
+    let keys = match database.available_keys(app).await {
         Ok(keys) => keys,
         Err(error) => {
             catalog_note!("failed to read cc-switch keys: {error}");
             return Vec::new();
         }
     };
-    let mut channels = Vec::with_capacity(keys.len());
+    let mut channels = Vec::new();
     for key in keys {
-        let model = database
-            .resolve_provider(&key)
-            .await
-            .map(|provider| provider.model)
-            .unwrap_or_else(|_| "default".to_owned());
-        channels.push(ChannelInfo {
-            team: key.clone(),
-            team_id: key.clone(),
-            model,
-            switch_key: Some(key),
-        });
+        let models = match database.resolve_row(app, &key).await {
+            Ok(row) => ccswitch_entry_models(app, &key, &row.settings_config, &row.meta),
+            Err(error) => {
+                catalog_note!("failed to read cc-switch provider {key}: {error}");
+                vec!["default".to_owned()]
+            }
+        };
+        for model in models {
+            channels.push(ChannelInfo {
+                team: key.clone(),
+                team_id: key.clone(),
+                model,
+                switch_key: Some(key.clone()),
+            });
+        }
+    }
+    channels
+}
+
+/// The model ids a cc-switch entry enumerates as, per app shape.
+#[cfg(feature = "ccswitch")]
+fn ccswitch_entry_models(
+    app: &str,
+    key: &str,
+    settings_config: &str,
+    meta: &str,
+) -> Vec<String> {
+    let settings: serde_json::Value = match serde_json::from_str(settings_config) {
+        Ok(settings) => settings,
+        Err(error) => {
+            catalog_note!("invalid cc-switch settings for {key}: {error}");
+            return vec!["default".to_owned()];
+        }
+    };
+    match app {
+        app_type::CODEX => {
+            // Codex 条目解析失败（如 OAuth-only）时不整条丢弃，仍给 default。
+            match crate::switch::ccswitch::ResolvedProvider::parse(key, key, settings_config, meta)
+            {
+                Ok(provider) => vec![provider.model],
+                Err(_) => vec!["default".to_owned()],
+            }
+        }
+        app_type::CLAUDE => vec![settings
+            .pointer("/env/ANTHROPIC_MODEL")
+            .and_then(serde_json::Value::as_str)
+            .filter(|model| !model.is_empty())
+            .unwrap_or("default")
+            .to_owned()],
+        app_type::OPENCODE => {
+            let models: Vec<String> = settings
+                .pointer("/models")
+                .and_then(serde_json::Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter(|(model, _)| !model.is_empty())
+                .map(|(model, _)| model.clone())
+                .collect();
+            if models.is_empty() {
+                vec!["default".to_owned()]
+            } else {
+                models
+            }
+        }
+        _ => vec!["default".to_owned()],
+    }
+}
+
+/// One entry per (provider, model) of the user's OpenCode provider sections.
+/// Both `opencode.json` and `opencode.jsonc` are read (the latter only when
+/// it parses as plain JSON); a section without a `models` map falls back to
+/// a single `default` entry.
+#[cfg(feature = "ccswitch")]
+fn opencode_config_channels() -> Vec<ChannelInfo> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let mut channels = Vec::new();
+    for file in ["opencode.json", "opencode.jsonc"] {
+        let Some(text) = std::fs::read_to_string(home.join(".config").join("opencode").join(file))
+            .ok()
+            .filter(|text| !text.trim().is_empty())
+        else {
+            continue;
+        };
+        let config: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(config) => config,
+            Err(error) => {
+                catalog_note!("failed to parse the OpenCode config {file}: {error}");
+                continue;
+            }
+        };
+        let Some(providers) = config.get("provider").and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for (key, section) in providers {
+            let Some(section) = section.as_object() else {
+                continue;
+            };
+            let models: Vec<String> = section
+                .get("models")
+                .and_then(serde_json::Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter(|(model, _)| !model.is_empty())
+                .map(|(model, _)| model.clone())
+                .collect();
+            let models = if models.is_empty() {
+                vec!["default".to_owned()]
+            } else {
+                models
+            };
+            for model in models {
+                channels.push(ChannelInfo {
+                    team: key.clone(),
+                    team_id: key.clone(),
+                    model,
+                    switch_key: None,
+                });
+            }
+        }
     }
     channels
 }

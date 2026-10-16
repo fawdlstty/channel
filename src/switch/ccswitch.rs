@@ -11,25 +11,34 @@ use tokio::task::JoinHandle;
 
 const DEFAULT_API_FORMAT: &str = "openai_responses";
 
-/// cc-switch stores every supported app in one table; channel only reads the
-/// Codex entries.
-const APP_TYPE: &str = "codex";
+/// cc-switch stores every supported app in one `providers` table; `app_type`
+/// tells them apart. channel supports the entries of these apps:
+pub(crate) mod app_type {
+    /// Codex providers (`settings_config` = Codex config.toml + auth).
+    pub const CODEX: &str = "codex";
+    /// Claude Code providers (`settings_config` = `{"env": {...}}`).
+    pub const CLAUDE: &str = "claude";
+    /// OpenCode providers (a slice of opencode.json's `provider.<id>`).
+    pub const OPENCODE: &str = "opencode";
+}
 
 /// Read-only mirror of the cc-switch `providers` table. Column names must
 /// match the external schema exactly; columns the relay never reads
 /// (`is_current`) are omitted so the generated SELECT stays minimal.
+/// Fields are `pub(crate)`: the catalog enumeration reads the raw row to
+/// derive per-app channel entries.
 #[derive(Debug, Clone, ormer::Model)]
 #[table = "providers"]
-struct ProviderRow {
+pub(crate) struct ProviderRow {
     #[primary]
-    id: String,
+    pub(crate) id: String,
     #[primary]
-    app_type: String,
-    name: String,
-    settings_config: String,
-    meta: String,
-    created_at: Option<i64>,
-    sort_index: Option<i64>,
+    pub(crate) app_type: String,
+    pub(crate) name: String,
+    pub(crate) settings_config: String,
+    pub(crate) meta: String,
+    pub(crate) created_at: Option<i64>,
+    pub(crate) sort_index: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -44,9 +53,9 @@ pub(crate) struct ResolvedProvider {
     pub base_url: String,
 }
 
-pub(crate) struct CodexDatabase(std::path::PathBuf);
+pub(crate) struct CcSwitchDatabase(std::path::PathBuf);
 
-impl CodexDatabase {
+impl CcSwitchDatabase {
     pub(crate) fn path() -> Result<Self, Error> {
         if let Some(path) = std::env::var_os("CHANNEL_CC_SWITCH_DB") {
             return Ok(Self(std::path::PathBuf::from(path)));
@@ -73,6 +82,15 @@ impl CodexDatabase {
     /// Connects to the cc-switch database. turso creates missing database
     /// files on open, but the cc-switch database is an external artifact, so
     /// a missing file is surfaced here instead of querying an empty store.
+    ///
+    /// A direct open fails while the cc-switch desktop app is running: it
+    /// keeps its SQLite connection open and turso cannot share an externally
+    /// locked file the way native SQLite does. SQLite locking is advisory on
+    /// POSIX, so the file bytes stay readable — the fallback copies
+    /// `cc-switch.db` (plus its `-wal`/`-shm` sidecars, which hold the not
+    /// yet checkpointed rows) to a throwaway snapshot and opens that instead.
+    /// Enumeration and switch resolution are read-only light queries, so a
+    /// snapshot a moment old is fine.
     async fn connect(&self) -> Result<ormer::Database, Error> {
         if !self.0.is_file() {
             return Err(Error::Initialization(format!(
@@ -80,21 +98,91 @@ impl CodexDatabase {
                 self.0.display()
             )));
         }
-        ormer::Database::connect(ormer::DbType::Sqlite, &self.0.to_string_lossy())
+        match ormer::Database::connect(ormer::DbType::Sqlite, &self.0.to_string_lossy()).await {
+            Ok(database) => Ok(database),
+            Err(direct_error) => {
+                let direct_error = Error::Initialization(format!(
+                    "failed to open cc-switch database {}: {direct_error}",
+                    self.0.display()
+                ));
+                self.connect_snapshot(direct_error).await
+            }
+        }
+    }
+
+    /// Snapshot fallback of [`Self::connect`]: byte-copy the database (and
+    /// sidecars) into a per-process temp directory and open the copy. Old
+    /// snapshots are pruned on the way in; a snapshot that still cannot be
+    /// opened (e.g. a torn copy while the writer was mid-transaction) fails
+    /// with both errors attached.
+    async fn connect_snapshot(&self, direct_error: Error) -> Result<ormer::Database, Error> {
+        let dir = std::env::temp_dir().join("channel-ccswitch-snapshots");
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| Error::Initialization(format!("failed to create the snapshot directory {}: {error}", dir.display())))?;
+        Self::prune_stale_snapshots(&dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let stem = self
+            .0
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "cc-switch.db".to_owned());
+        let snapshot = dir.join(format!("{stem}.{stamp}.snapshot"));
+        std::fs::copy(&self.0, &snapshot).map_err(|error| {
+            Error::Initialization(format!(
+                "cc-switch database {} is locked ({direct_error}) and the snapshot copy failed: {error}",
+                self.0.display()
+            ))
+        })?;
+        for suffix in ["-wal", "-shm"] {
+            let source = self.0.with_file_name(format!("{stem}{suffix}"));
+            if source.is_file() {
+                let _ = std::fs::copy(
+                    &source,
+                    snapshot.with_file_name(format!("{stem}.{stamp}.snapshot{suffix}")),
+                );
+            }
+        }
+        ormer::Database::connect(ormer::DbType::Sqlite, &snapshot.to_string_lossy())
             .await
             .map_err(|error| {
                 Error::Initialization(format!(
-                    "failed to open cc-switch database {}: {error}",
+                    "failed to open cc-switch database {}: direct: {direct_error}; snapshot: {error}",
                     self.0.display()
                 ))
             })
     }
+    /// Snapshots are cheap but nobody deletes them; drop files older than an
+    /// hour on each new snapshot. Failures stay silent (the next snapshot
+    /// tries again).
+    fn prune_stale_snapshots(dir: &std::path::Path) {
+        let Some(cutoff) = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+        else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .map(|modified| modified < cutoff)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 
-    pub(crate) async fn available_keys(&self) -> Result<Vec<String>, Error> {
+    pub(crate) async fn available_keys(&self, app: &str) -> Result<Vec<String>, Error> {
         let connection = self.connect().await?;
         let rows = connection
             .select::<ProviderRow>()
-            .filter(|provider| provider.app_type.eq(APP_TYPE))
+            .filter(|provider| provider.app_type.eq(app))
             .order_by(|provider| provider.sort_index.asc())
             .order_by(|provider| provider.created_at.desc())
             .order_by(|provider| provider.id.asc())
@@ -104,11 +192,17 @@ impl CodexDatabase {
         Ok(rows.into_iter().map(|row| row.name).collect())
     }
 
-    pub(crate) async fn resolve_provider(&self, name: &str) -> Result<ResolvedProvider, Error> {
+    /// The raw provider row behind a cc-switch key; each app turns its own
+    /// `settings_config` shape into session resources on top of this.
+    pub(crate) async fn resolve_row(
+        &self,
+        app: &str,
+        name: &str,
+    ) -> Result<ProviderRow, Error> {
         let connection = self.connect().await?;
         let rows = connection
             .select::<ProviderRow>()
-            .filter(|provider| provider.app_type.eq(APP_TYPE))
+            .filter(|provider| provider.app_type.eq(app))
             .filter(|provider| provider.name.eq(name))
             .collect::<Vec<_>>()
             .await
@@ -120,6 +214,15 @@ impl CodexDatabase {
                 format!("cc-switch provider name is ambiguous: {name}")
             }));
         };
+        Ok(row.clone())
+    }
+
+    pub(crate) async fn resolve_provider(
+        &self,
+        app: &str,
+        name: &str,
+    ) -> Result<ResolvedProvider, Error> {
+        let row = self.resolve_row(app, name).await?;
         ResolvedProvider::parse(&row.id, &row.name, &row.settings_config, &row.meta)
     }
 }
@@ -135,7 +238,7 @@ impl<T> DatabaseResultExt<T> for ormer::Result<T> {
 }
 
 impl ResolvedProvider {
-    fn parse(id: &str, name: &str, settings: &str, meta: &str) -> Result<Self, Error> {
+    pub(crate) fn parse(id: &str, name: &str, settings: &str, meta: &str) -> Result<Self, Error> {
         let settings: Value = serde_json::from_str(settings).map_err(|error| {
             Error::InvalidConfig(format!("invalid cc-switch settings for {name}: {error}"))
         })?;
@@ -226,7 +329,7 @@ impl CodexHome {
     /// shared plugin cache (`skills`) is symlinked in so the warm start
     /// survives the per-session split.
     fn create(provider_name: &str) -> Result<Self, Error> {
-        let database = CodexDatabase::path()?;
+        let database = CcSwitchDatabase::path()?;
         let base = database
             .0
             .parent()
@@ -378,9 +481,9 @@ impl CodexResources {
                 "a configured cc-switch key requires the default Codex process endpoint".to_owned(),
             ));
         }
-        let database = CodexDatabase::path()?;
+        let database = CcSwitchDatabase::path()?;
         let provider_name = provider_name.to_owned();
-        let provider = database.resolve_provider(&provider_name).await?;
+        let provider = database.resolve_provider(app_type::CODEX, &provider_name).await?;
         let codex_home = CodexHome::create(&provider_name)?;
         let relay = if provider.api_format == DEFAULT_API_FORMAT {
             codex_home.write(&provider, &provider.base_url)?;
@@ -544,7 +647,7 @@ impl ZcodeResources {
     }
 
     fn session_root_base() -> Result<PathBuf, Error> {
-        let database = CodexDatabase::path()?;
+        let database = CcSwitchDatabase::path()?;
         let base = database
             .0
             .parent()
@@ -590,11 +693,170 @@ impl ZcodeResources {
     }
 }
 
+/// Claude Code 的渠道切换：cc-switch 的 claude 条目 `settings_config` 即
+/// `{"env": {...}}`（ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN /
+/// ANTHROPIC_MODEL 等），claude CLI 对这组环境变量的响应优先于其全局配置，
+/// 因此逐键注入子进程环境即可完成按渠道切换，无需落盘。
+pub(crate) struct ClaudeResources {
+    env_vars: Vec<(String, String)>,
+}
+
+impl ClaudeResources {
+    pub(crate) fn env(&self) -> &[(String, String)] {
+        &self.env_vars
+    }
+
+    pub(crate) async fn prepare(
+        config: &crate::protocol::SessionConfig,
+    ) -> Result<Option<Self>, Error> {
+        let Some(key) = config.get_switch_key(crate::protocol::SwitchProvider::CcSwitch) else {
+            return Ok(None);
+        };
+        let database = CcSwitchDatabase::path()?;
+        let row = database.resolve_row(app_type::CLAUDE, key).await?;
+        let settings: Value = serde_json::from_str(&row.settings_config).map_err(|error| {
+            Error::InvalidConfig(format!("invalid cc-switch settings for {key}: {error}"))
+        })?;
+        let env_vars = settings
+            .get("env")
+            .and_then(Value::as_object)
+            .map(|env| {
+                env.iter()
+                    .filter_map(|(name, value)| {
+                        let text = value.as_str()?;
+                        (!text.is_empty()).then(|| (name.clone(), text.to_owned()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if env_vars.is_empty() {
+            return Err(Error::InvalidConfig(format!(
+                "cc-switch provider \"{key}\" carries no Claude env configuration"
+            )));
+        }
+        Ok(Some(Self { env_vars }))
+    }
+}
+
+/// OpenCode 的渠道切换：cc-switch 的 opencode 条目就是 opencode.json
+/// `provider.<id>` 的切片（`{npm, options:{baseURL, apiKey}, models:{…}}`）。
+/// 把切片挂到会话本地配置的固定 provider id 下、`model` 指向所选模型，经
+/// `OPENCODE_CONFIG` 指给 `opencode acp`——该变量的优先级高于用户全局配置，
+/// 会话之间互不影响。
+pub(crate) struct OpencodeResources {
+    config_path: PathBuf,
+}
+
+impl OpencodeResources {
+    pub(crate) fn env(&self) -> [(&'static str, &Path); 1] {
+        [("OPENCODE_CONFIG", &self.config_path)]
+    }
+
+    pub(crate) async fn prepare(
+        config: &crate::protocol::SessionConfig,
+    ) -> Result<Option<Self>, Error> {
+        let Some(key) = config.get_switch_key(crate::protocol::SwitchProvider::CcSwitch) else {
+            return Ok(None);
+        };
+        let database = CcSwitchDatabase::path()?;
+        let row = database.resolve_row(app_type::OPENCODE, key).await?;
+        let settings: Value = serde_json::from_str(&row.settings_config).map_err(|error| {
+            Error::InvalidConfig(format!("invalid cc-switch settings for {key}: {error}"))
+        })?;
+        let models = settings
+            .pointer("/models")
+            .and_then(Value::as_object)
+            .map(|models| models.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        // 会话选择的具体模型优先；不在该 provider 的模型表里时回退第一个。
+        let model = config
+            .get_model()
+            .filter(|model| !model.is_empty() && models.iter().any(|m| m == model))
+            .or_else(|| models.first().cloned())
+            .unwrap_or_else(|| "default".to_owned());
+        let session_config = json!({
+            "$schema": "https://opencode.ai/config.json",
+            "provider": { "ccswitch": settings },
+            "model": format!("ccswitch/{model}"),
+        });
+        Ok(Some(Self {
+            config_path: Self::write_channel_config(key, &session_config)?,
+        }))
+    }
+
+    /// 会话本地配置落在 cc-switch 数据目录旁（与 channel-codex-homes 同款）：
+    /// 按 key 分目录、目录 0700，48 小时惰性清理。
+    fn write_channel_config(key: &str, session_config: &Value) -> Result<PathBuf, Error> {
+        let database = CcSwitchDatabase::path()?;
+        let base = database
+            .0
+            .parent()
+            .ok_or_else(|| {
+                Error::Initialization("cannot locate the cc-switch data directory".to_owned())
+            })?
+            .join("channel-opencode-configs");
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&key, &mut hasher);
+        let root = base.join(format!("{:016x}", std::hash::Hasher::finish(&hasher)));
+        std::fs::create_dir_all(&root).map_err(|error| {
+            Error::Initialization(format!(
+                "failed to create the OpenCode config dir {}: {error}",
+                root.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+        }
+        Self::prune_stale_configs(&root);
+        let path = root.join(format!(
+            "{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        ));
+        let bytes = serde_json::to_vec_pretty(session_config)
+            .map_err(|error| Error::InvalidConfig(error.to_string()))?;
+        std::fs::write(&path, bytes).map_err(|error| {
+            Error::Initialization(format!(
+                "failed to write the OpenCode config {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(path)
+    }
+
+    /// 会话配置用完即弃但没人删；按修改时间惰性清理超过 48 小时的残留，
+    /// 失败静默（下次会话再试）。
+    fn prune_stale_configs(root: &Path) {
+        let Some(cutoff) = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(48 * 3600))
+        else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .map(|modified| modified < cutoff)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 /// 在 zcode 个人 provider 配置里按渠道名（providerName）查 providerId。
 /// providerRules 里还存在无 providerName 的账号类条目（account:*），它们不是
 /// 可切换的 key 实例，匹配与列举都跳过。
-fn find_zcode_provider_id(provider_config: &Value, provider_name: &str) -> Result<String, Error> {
-    let rules = provider_config
+fn find_zcode_provider_id(provider_config: &Value, provider_name: &str) -> Result<String, Error> {    let rules = provider_config
         .pointer("/config/providerConfigRules/providerRules")
         .and_then(Value::as_array)
         .ok_or_else(|| {
@@ -2097,7 +2359,7 @@ mod tests {
             connection
                 .insert(&ProviderRow {
                     id: id.to_owned(),
-                    app_type: APP_TYPE.to_owned(),
+                    app_type: app_type::CODEX.to_owned(),
                     name: name.to_owned(),
                     settings_config: r#"{"auth":{"OPENAI_API_KEY":"secret"},"config":"model = \"demo\"\n[model_providers.custom]\nbase_url = \"https://example.invalid/v1\"\n"}"#.to_owned(),
                     meta: meta.to_owned(),
@@ -2122,8 +2384,8 @@ mod tests {
         database.insert("second", "beta", 2, "{}").await;
         database.insert("first", "alpha", 1, "{}").await;
         assert_eq!(
-            CodexDatabase(database.0.clone())
-                .available_keys()
+            CcSwitchDatabase(database.0.clone())
+                .available_keys(app_type::CODEX)
                 .await
                 .unwrap(),
             ["alpha", "beta"]
@@ -2135,24 +2397,46 @@ mod tests {
         let database = TestDatabase::new().await;
         database.insert("one", "team", 1, r#"{"apiFormat":"openai_chat"}"#).await;
         assert_eq!(
-            CodexDatabase(database.0.clone())
-                .resolve_provider("team")
+            CcSwitchDatabase(database.0.clone())
+                .resolve_provider(app_type::CODEX, "team")
                 .await
                 .unwrap()
                 .id,
             "one"
         );
         assert!(matches!(
-            CodexDatabase(database.0.clone())
-                .resolve_provider("missing")
+            CcSwitchDatabase(database.0.clone())
+                .resolve_provider(app_type::CODEX, "missing")
                 .await,
             Err(Error::InvalidConfig(message)) if message.contains("not found")
         ));
         database.insert("two", "team", 2, "{}").await;
         assert!(matches!(
-            CodexDatabase(database.0.clone()).resolve_provider("team").await,
+            CcSwitchDatabase(database.0.clone())
+                .resolve_provider(app_type::CODEX, "team")
+                .await,
             Err(Error::InvalidConfig(message)) if message.contains("ambiguous")
         ));
+    }
+
+    /// The cc-switch desktop app keeps its database locked while running;
+    /// reads must survive that via the snapshot fallback. A second ormer
+    /// connection open on the same file stands in for the desktop app's
+    /// native lock — whichever way the direct open goes, the keys come back.
+    #[tokio::test]
+    async fn reads_survive_a_second_open_connection() {
+        let database = TestDatabase::new().await;
+        database.insert("one", "alpha", 1, "{}").await;
+        let holder =
+            ormer::Database::connect(ormer::DbType::Sqlite, &database.0.to_string_lossy())
+                .await
+                .unwrap();
+        let keys = CcSwitchDatabase(database.0.clone())
+            .available_keys(app_type::CODEX)
+            .await
+            .unwrap();
+        assert_eq!(keys, ["alpha"]);
+        drop(holder);
     }
 
     #[tokio::test]
@@ -3106,7 +3390,7 @@ mod tests {
 // public channel enumeration against a real cc-switch database file.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{ProviderRow, APP_TYPE};
+    use super::{app_type, ProviderRow};
 
     pub(crate) struct TestDatabase {
         path: std::path::PathBuf,
@@ -3139,7 +3423,7 @@ pub(crate) mod test_support {
             self.connection
                 .insert(&ProviderRow {
                     id: name.to_owned(),
-                    app_type: APP_TYPE.to_owned(),
+                    app_type: app_type::CODEX.to_owned(),
                     name: name.to_owned(),
                     settings_config,
                     meta: "{}".to_owned(),
