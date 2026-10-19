@@ -82,6 +82,7 @@ server.serve().await?;
 | （默认） | 仅 Harness 会话 |
 | `llm` | 四种大模型直连协议客户端 + 服务端流发射器 |
 | `ccswitch` | cc-switch 供应商切换（SQLite 配置库 + TOML 配置 + 本地上游代理） |
+| `history` | AI 会话历史存储：自有 SQLite 库（`chat_histories.db`，兼容 ZCode session-store 格式），CRUD + 压缩存储原语 + ZCode 引擎库只读转写辅助 |
 | `local-safetensors-cpu` | 进程内本地推理，candle 后端（safetensors，纯 Rust），含本地模型 HTTP 服务 |
 | `local-safetensors-cuda` / `local-safetensors-metal` | candle 后端 GPU 加速 |
 | `local-gguf-cpu` | llama.cpp 后端，支持 GGUF 模型（隐含 `local-safetensors-cpu`） |

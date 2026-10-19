@@ -117,3 +117,69 @@ channel = { version = "0.3", features = ["llm"] }
 ```
 
 未启用 `llm` feature 时，channel 完全不依赖 potato，`llm` 模块不参与编译。
+
+## 10. 会话历史存储（可选 feature）
+
+channel 内置 AI 会话历史持久化，由 cargo feature `history` 按需启用。存储是宿主自有 SQLite 库（ormer/turso 后端，纯 Rust，默认构建无 C 工具链要求），表格式与 ZCode session-store 兼容：ZCode 有而 channel 不写的列照建并保持 NULL，同一份库文件可以继续被 ZCode 打开；`data` 列的 JSON 键名与 ZCode 完全一致（`sessionID`、`modelSelection` 等）。时间戳统一为 epoch 毫秒（行内 `i64`，记录层 `u64`）。
+
+启用方式示例：
+
+```toml
+[dependencies]
+channel = { version = "0.3", features = ["history"] }
+```
+
+### 10.1 打开存储
+
+`ChatHistoryDatabase::open_at(path)` 连接指定路径（库文件不存在则创建），依次完成：`journal_mode=wal` 切换（这是查询型 PRAGMA，内部走查询通道；非 wal 仅留痕不失败）、`foreign_keys=on` 与 `busy_timeout=5000`（失败留痕不失败）、六张表的幂等迁移（`project`/`session`/`message`/`part`/`session_entry`/`local_setting`）。打开或迁移失败返回 `Err`（`Error::Initialization`），由调用方决定去留。`ChatHistoryDatabase::open()` 等价对兜底路径（HOME/USERPROFILE + `chat_histories.db`，不经环境变量覆盖）调用 `open_at`；要改存储位置就换 `open_at` 的实参。
+
+宿主不需要在句柄外建表，也不要对句柄的库直发 PRAGMA（见 10.4）。
+
+### 10.2 CRUD 概览
+
+句柄方法按六个域组织，全部是 `&self` 异步方法；查询/写入失败统一返回 `Error::Backend`，前置不存在（会话查无此 id、找不到用户主目录等）返回 `Error::InvalidConfig` 或 `Error::Initialization`：
+
+- 设置（`local_setting` 表，scope/scope_id 固定 `user`）：`read_settings(namespace)` 返回该 namespace 下 key → JSON 值的映射；`write_local_setting(namespace, key, value)` 单键写入（存在改 value/time_updated，不存在新建）。
+- 项目（`project` 表）：`insert_project` / `find_project` / `list_projects` / `project_path_exists` / `delete_project_cascade`（单事务先子后父清掉项目下全部消息与会话，返回被删的 session_id 列表）。
+- 会话（`session` 表）：`insert_session`（宿主直接拼装 `SessionRow` 落库）与 `find_session` 返回行模型；`list_sessions(project_id)` 不含已存档、按 updated_at 降序，`channel_key` 从渠道选择 entry join 而来；`list_all_sessions` / `list_session_ids`；`rename_session`（title_source 转 custom）、`archive_session` / `unarchive_session`（存档 = `time_archived` 置时刻，软隐藏不删数据）、`touch_session`（time_updated 只前进不回退）、`auto_title_if_default`（标题仍为默认值时取输入前 24 字符，返回是否改过）、`delete_session_cascade`（单事务先子后父：part → message → session_entry → session）。
+- 渠道选择（`session_entry` 表，entry 固定 id `{session_id}:channel-selection`）：`insert_channel_selection` / `update_channel_selection`（存在改写、不存在新建）/ `find_channel_key`。
+- 消息（`message` + `part` 表）：`insert_user_message` 落 message 行 + 单个 text part；`insert_assistant_message` 落 message 行 + parts（reasoning 非空时 reasoning=0、text=1，否则仅 text=0），两者都返回生成的消息 id；`get_messages(session_id)` 还原 `MessageRecord`（content/reasoning 按 part 的 kind 归并，role 取自 message.data）。
+- 读取投影：`ProjectRecord` / `SessionRecord` / `MessageRecord`（serde camelCase），宿主自行转自己的 DTO。
+
+ID 用 `new_session_id()`（`sess_` + uuid v4）与 `new_event_id(prefix)`（`msg_`/`part_` + 毫秒时间戳 base36 + uuid v4），形状与 ZCode 一致；`data` 列 JSON 由 `user_message_data` / `assistant_message_data` / `part_data` / `channel_selection_data` 合成，宿主一般不需要手拼键名。
+
+### 10.3 遗留数据导入
+
+批量导入（如宿主旧格式的一次性迁移）走 `lock()`：它短暂交出底层 `ormer::Database`，可以在上面跑事务和批量行插入。
+
+```rust
+let conn = db.lock().await;
+conn.transaction(|txn| {
+    Box::pin(async move {
+        // 用 channel 行模型（SessionRow/MessageRow/…）+ data 合成函数逐行插入
+        // txn.insert(&row).execute().await?;
+        Ok(())
+    })
+}).await?;
+drop(conn);
+```
+
+契约：守卫只覆盖单个操作。持有守卫期间绝不能再经同一个句柄调用任何 `&self` 方法——内部 tokio Mutex 不可重入，嵌套获取即死锁；需要查询时在守卫上用 `conn.select::<T>()` / `conn.select_sql` 完成，用完即 drop。
+
+### 10.4 并发契约
+
+句柄内部是单条 turso 连接加一把 `tokio::sync::Mutex`：同一连接上两个查询执行窗口重叠会报 `concurrent use forbidden`，因此所有句柄方法都在锁内排队，多任务并发调用安全（启动期并行加载与运行期命令并发均已覆盖）。除 10.3 的 `lock()` 外，宿主不要绕过句柄直接操作库文件，也不要对句柄库直发 PRAGMA——`journal_mode` 这类查询型 PRAGMA 走 execute 会误报 unexpected row（副作用其实已生效），`open_at` 内已按查询通道处理。
+
+### 10.5 压缩（compaction）
+
+上下文压缩的落库格式与 ZCode 原生行同构：一条 role=user 的 summary message（data 含 `summary.title`/`summary.body` 与 `semantics`）+ text part（正文）+ compaction part（`compactBoundary` 元数据 + `operationId`）。存储原语：
+
+- `CompactionBoundary`：boundary 元数据，serde camelCase 键组与 ZCode zod schema 一一对应，未建模的引擎扩展键经 flatten 兜底无损往返。宿主自建压缩必填：`boundary_id`、`trigger`（auto/manual/partial/reactive/session_memory）、`phase`、`compact_reason`、`pre_compact_token_count`、`true_post_compact_token_count`、`tail_start_id`、`summarized_message_count`、`kept_message_count`。
+- `insert_compaction_summary(CompactionSummaryParams)`：单事务写 summary message + text part + compaction part；同 `boundary_id` 已存在则幂等跳过（返回 `Ok(None)`），成功返回消息 id。`operation_id` 传 `None` 生成 `cmp_host_` + uuid（宿主产品标记，`cmp_` 前缀保留给 ZCode 引擎）；`origin` 是 `semantics.origin` 来源标记，自建压缩写 `"blackagent"`、外部引擎转写如实写 `"zcode"`。
+- `record_external_compaction_marker(session_id, message_id, reason, pre_tokens, post_tokens)`：外部压缩观察标记（无 boundary，带 observedExternal 水位）；观察标记永不参与切片。
+- `latest_compaction_boundary(session_id)`：读最后一个 active boundary（`CompactionBoundaryView`，含 boundary、所在消息 id 与落库时刻），宿主触发自建压缩前确定选材区间用。
+- `get_context_messages(session_id)`：切片还原——从最后一个 active boundary 起返回，preservedSegment 区间插回 summary 之后；无 boundary 时等价 `get_messages` 全量。
+
+外部引擎压缩的转写辅助（ormer 短连接只读访问，仅发 SELECT，调用结束连接即弃）：`zcode_session_db_path()` 返回 ZCode 引擎库路径（`~/.zcode/cli/db/db.sqlite`，环境变量 `CHANNEL_ZCODE_SESSION_DB` 可覆盖，供测试与异机部署）；`read_zcode_compaction_summary_text(session_id, message_id)` 优先取 message.data 的 `summary.body`，缺失时回落该消息 text part 并剥除 ZCode 续接前导，库文件不存在或查无此行返回 `Ok(None)`，打开/查询失败返回 `Err`（宿主可降级为占位正文转写）。
+
+事件消费：外部引擎发生压缩时，会话事件流透出 `SessionEvent::CompactionBoundary { payload }`——payload 是 ZCode `CompactBoundaryPayload` JSON 原样，channel 不做 typed 转换。宿主消费事件后自行反序列化为 `channel::CompactionBoundary`，配合 `read_zcode_compaction_summary_text` 取正文、`insert_compaction_summary` 落转写行，转写行即可经 `get_messages`/`get_context_messages` 像原生压缩行一样投影；不消费该事件的宿主不受影响，会话状态聚合会忽略它。

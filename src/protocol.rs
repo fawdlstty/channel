@@ -173,6 +173,9 @@ pub struct SessionConfig {
     /// 切换渠道场景下，relay 对上游“首字节前失败”的额外重试次数
     /// （总尝试次数 = 1 + 该值；0 表示不重试，即失败立刻上报）。
     pub upstream_retries: u32,
+    /// 权限模式覆盖：原样透传给支持 `--mode` 的 CLI（ZCode：build / edit /
+    /// plan / yolo）。None 时按 full_access 推导（yolo / build）。
+    pub permission_mode: Option<String>,
     pub backend: BackendSpec,
 }
 
@@ -220,6 +223,10 @@ impl SessionConfig {
         self.model.reasoning_effort = reasoning_effort;
     }
 
+    pub(crate) fn permission_mode(&self) -> Option<&str> {
+        self.permission_mode.as_deref()
+    }
+
     pub(crate) fn is_full_access(&self) -> bool {
         self.security.approval == ApprovalPolicy::AutoApprove
             && self.security.permissions.filesystem.mode == FilesystemAccess::FullHost
@@ -228,9 +235,14 @@ impl SessionConfig {
             && self.security.permissions.secrets.access == SecretAccess::Allow
     }
 
+    /// 权限模式覆盖（ZCode：build / edit / plan / yolo）；None 按 full_access
+    /// 推导。三档 UI 语义：build=变更前确认、edit=自动编辑、yolo=完全访问。
+    pub fn set_permission_mode(&mut self, mode: Option<String>) {
+        self.permission_mode = mode;
+    }
+
     pub fn set_full_access(&mut self, full_access: bool) {
-        if full_access {
-            self.security.approval = ApprovalPolicy::AutoApprove;
+        if full_access {            self.security.approval = ApprovalPolicy::AutoApprove;
             self.security.permissions.filesystem.mode = FilesystemAccess::FullHost;
             self.security.network = NetworkPolicy::Unrestricted;
             self.security.permissions.process.execute = TriState::Yes;
@@ -314,6 +326,7 @@ impl SessionConfig {
             provider_options: ProviderOptions::new(),
             switch_key: None,
             upstream_retries: 0,
+            permission_mode: None,
             backend: BackendSpec::Auto,
         }
     }

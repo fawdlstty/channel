@@ -82,6 +82,7 @@ server.serve().await?;
 | *(default)* | Harness sessions only |
 | `llm` | Four direct LLM protocol clients plus server-side stream emitters |
 | `ccswitch` | cc-switch provider switching (SQLite config db + TOML config + local upstream proxy) |
+| `history` | AI chat-history persistence: owned SQLite store (`chat_histories.db`, ZCode session-store compatible format) with CRUD, compaction storage primitives and read-only ZCode engine-db transcription helpers |
 | `local-safetensors-cpu` | In-process local inference via the candle backend (safetensors, pure Rust), plus the local-model HTTP server |
 | `local-safetensors-cuda` / `local-safetensors-metal` | GPU support for the candle backend |
 | `local-gguf-cpu` | llama.cpp backend for GGUF models (implies `local-safetensors-cpu`) |

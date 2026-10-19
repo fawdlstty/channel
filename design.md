@@ -3,7 +3,9 @@
 > 维护规则见 [AGENTS.md](AGENTS.md)。每一项内容都标注来源：
 > 【用户要求】= 用户明确提出的改动/约束（含原始诉求语义）；
 > 【AI 演绎】= AI 为落实用户要求而自行推导补全的细节，尚未逐项确认。
-> 最近更新：2026-10-10（Session 附件传递、ContextUsage 事件、ZCode CLI
+> 最近更新：2026-10-19（新增 §3.8 历史存储 `history` feature、ormer 依赖
+> path 统一，见 §3.8/§4/§5；此前 2026-10-10：Session 附件传递、
+> ContextUsage 事件、ZCode CLI
 > `--mode`/`--attach`，见 §3.1/§3.2；此前 2026-09-28：ZCode Auto 后端
 > ACP → StructuredCli，见 §3.2；
 > 同日 atspi 依赖改为直接 git 引用 fawdlstty/atspi（用户要求，见 §3.6）；
@@ -35,6 +37,10 @@
     （stdout 恒为协议通道，日志进 stderr；【用户要求 F，2026-09-12】
     `[[bin]]` 表项撤销后经 cargo 默认发现，`harness` feature 门控内置于
     文件——未启用时编译出仅打印指引的占位 main）；
+  - `src/history.rs`：【用户要求，2026-10-16】AI 会话历史存储（feature
+    `history`），自 BlackAgent 宿主 db.rs 整体迁入；`src/lib.rs` 按
+    feature 条件导出全部公开面（句柄/行模型/压缩原语/转写辅助），见
+    §3.8；
   - `examples/`（basic / llm_chat / local_chat / local_server）经 cargo
     默认发现，feature 门控同样内置于各示例文件（【用户要求 F，
     2026-09-12】`[[example]]` 表项撤销）；`tests/`（集成测试，均带
@@ -260,16 +266,106 @@
 - 【AI 演绎】回归：`tests/ws_smoke.rs` 双路径回环冒烟（wslite 同步客户端
   + full `Websocket::connect`，手写最小 ws echo 服务端）。
 
+### 3.8 历史存储（feature `history`；2026-10-16 自 BlackAgent db.rs 迁入）
+
+- 【用户要求，2026-10-16】AI 会话历史持久化自 BlackAgent 宿主 db.rs
+  整体迁入 channel（迁移本体的接口细节按源码为准，权威 =
+  `src/history.rs` + `tests/history*.rs` 四件套）；存储为宿主自有
+  SQLite 库（ormer/turso 后端，纯 Rust，默认构建无 C 工具链要求），
+  格式与 ZCode session-store 兼容。
+- 【AI 演绎，落实上一条】职责与公开面（经 `src/lib.rs`
+  `#[cfg(feature = "history")] pub use` 导出）：
+  - 句柄 `ChatHistoryDatabase`：`open()`（兜底路径 HOME/USERPROFILE +
+    `chat_histories.db`，不走环境变量覆盖——存储位置由宿主经
+    `open_at(path)` 显式指定，2026-10-16 拍板）与六域方法（settings /
+    projects / sessions / channel-selection / messages / compaction）；
+  - 行模型（存储格式契约，供宿主做遗留数据导入等高级流程）：
+    `ProjectRow` / `SessionRow` / `MessageRow` / `PartRow` /
+    `SessionEntryRow` / `LocalSettingRow`；宿主投影类型
+    `ProjectRecord` / `SessionRecord` / `MessageRecord`（serde
+    camelCase，宿主自行转 DTO）；
+  - data 列合成函数（ZCode 键名照抄：`sessionID`/`modelSelection` 及
+    遗留 `model.providerID`/`modelID` 等）：`user_message_data` /
+    `assistant_message_data` / `part_data` / `channel_selection_data`；
+  - ID/工具：`new_session_id`（`sess_` + uuid v4）、`new_event_id`
+    （`msg_`/`part_` + 毫秒时间戳 base36 + uuid v4）、`slugify`。
+- 【AI 演绎】ZCode session-store 格式兼容契约：六表
+  `session`/`message`/`part`/`session_entry`/`local_setting` + channel
+  扩展表 `project`；ZCode 有而 channel 不写的列照建并保持 NULL（同一
+  库文件可继续被 ZCode 打开）；时间戳统一 epoch 毫秒（行内 `i64`、
+  记录层 `u64`）；ID 形状与 ZCode 一致。
+- 【用户要求，2026-10-16 制定；2026-10-19 修订第①条】turso 红线
+  （原文以注释存于 src/history.rs，宿主侧必须遵守）：① 数据库访问
+  一律经 ormer——自有库（`chat_histories.db` 由本模块创建/打开）直连
+  读写；外部标准 SQLite（如 ZCode 引擎库）同样经 ormer 只读访问
+  （单次调用内短连接打开、仅发 SELECT、用完即弃，不写不迁移；原
+  "外部库走独立只读连接"的约束由用户要求取消）；② `journal_mode`
+  是查询型
+  PRAGMA（execute 遇结果行报 unexpected row 属误报、副作用已生效），
+  `open_at` 内已按查询通道处理，宿主不得再对句柄库直发 PRAGMA；
+  ③ 模型不声明 `#[foreign]`（SQLite 不能 ALTER ADD CONSTRAINT，不声明
+  则保留存量外键），级联删除走显式先子后父事务；④ 单连接并发
+  forbidden——句柄内部 tokio Mutex 串行化，唯一豁口 `lock()`（tokio
+  Mutex 不可重入，持有守卫期间再经 `&self` 调任何句柄方法即死锁）。
+- 【AI 演绎】压缩存储原语（自建压缩与外部转写共用）：
+  `CompactionBoundary`（serde camelCase 键组与 ZCode zod schema
+  一一对应，未建模键经 flatten 兜底无损往返）、`CompactionSummaryParams`
+  + `insert_compaction_summary`（单事务写 summary message + text part +
+  compaction part，同 `boundary_id` 幂等跳过）、
+  `record_external_compaction_marker`（无 boundary 的水位观察标记，
+  读侧不认、永不参与切片）、`latest_compaction_boundary`（宿主自压
+  选材锚点）、`get_context_messages`（切片还原：最后一个 active
+  boundary 起返回，preservedSegment 区间插回 summary 之后；无 boundary
+  等价全量投影 `get_messages`）。
+- 【AI 演绎，2026-10-19 按用户要求改经 ormer】外部转写辅助（ormer
+  短连接只读，仅 SELECT，连接用完即弃）：
+  `zcode_session_db_path()`（`~/.zcode/cli/db/db.sqlite`，环境变量
+  `CHANNEL_ZCODE_SESSION_DB` 覆盖——读外部库的场景与"自有库路径不走
+  环境变量"的拍板不冲突，后者只约束 `chat_histories.db`）与
+  `read_zcode_compaction_summary_text(session_id, message_id)`
+  （优先 message.data 的 `summary.body`，缺失
+  回落 text part 并剥除 ZCode 续接前导；库不存在/查无此行返回
+  `Ok(None)`，打开/查询失败返回 `Err` 供宿主降级占位转写）。
+- 【用户要求，2026-10-16】CompactionBoundary 一等事件感知通道：
+  `Event::CompactionBoundary { payload }` /
+  `SessionEvent::CompactionBoundary { payload }`——payload 为 ZCode
+  `CompactBoundaryPayload` JSON 原样透传，channel 故意不维护引擎事件面
+  的 typed copy（仍在演化；转写层再解析为 `channel::CompactionBoundary`）；
+  会话状态聚合忽略该事件（透传事实，不改状态机），由宿主在事件消费侧
+  处理转写。
+- 【AI 演绎】回归：`tests/history.rs`（CRUD/投影/级联/标题/存档）、
+  `tests/history_compaction.rs`（自压落库键名快照、幂等、切片语义、
+  观察标记、外部转写真实 payload fixture、ormer 建库的引擎库只读
+  fixture）、
+  `tests/history_concurrency.rs`（句柄串行化并发炮轰 + 病灶复现
+  ignored 用例）、`tests/history_pragma.rs`（PRAGMA 执行/查询通道 +
+  重复打开幂等）；全部 `:memory:`/临时文件，不碰真实 `~/chat_histories.db`
+  与 `~/.zcode`。
+
 ## 4. 构建与发布
 
-- 【AI 演绎，2026-09-12 按用户要求 F 重组】feature 体系见 Cargo.toml：
-  `default = []`；特性面收敛为 `llm`、`ccswitch`（2026-09-12 按【用户要求
-  F】由 `switch` 改名，旧名不再保留）、`local-safetensors-cpu`（+
-  `local-safetensors-cuda/metal`、`local-gguf-cpu/cuda/metal/vulkan`）、
-  `harness`（含全部平台集成），及【用户要求 F，2026-09-12】聚合 feature
-  `local-safetensors-all`/`local-gguf-all`/`all`，共 13 项；`potato`/
-  `local`/`local-gguf`/`local-server`/`local-cuda`/`local-metal`/
-  `local-vulkan`/`harness-linux-*` 均已撤销。
+- 【AI 演绎，2026-09-12 按用户要求 F 重组；2026-09-13 聚合改名 `-full`
+  （见 §3.5，本条旧 `-all` 名顺带更正）；2026-10-16 新增 `history`】
+  feature 体系见 Cargo.toml：`default = []`；特性面为 `llm`、
+  `ccswitch`（2026-09-12 按【用户要求 F】由 `switch` 改名，旧名不再
+  保留）、`history`（AI 会话历史存储，见 §3.8；与 `ccswitch` 相互
+  独立——只要历史存储的宿主不拉 TOML，反之亦然）、
+  `local-safetensors-cpu`（+ `local-safetensors-cuda/metal`、
+  `local-gguf-cpu/cuda/metal/vulkan`）、`harness`（含全部平台集成），
+  及【用户要求 F，2026-09-12】聚合 feature
+  `local-safetensors-full`/`local-gguf-full`/`full`，共 14 项；
+  `potato`/`local`/`local-gguf`/`local-server`/`local-cuda`/
+  `local-metal`/`local-vulkan`/`harness-linux-*` 均已撤销。
+- 【用户要求，2026-10-19，迁移拍板纠偏；AI 演绎落实】ormer 依赖
+  （`ccswitch` 与 `history` 两 feature 共用）由 registry `0.2` 改为
+  path 指向本地 checkout `/home/fawdlstty/workspace/github/_/ormer/ormer`
+  （0.2.23，主依赖 optional + default-features = false + sqlite，dev
+  依赖同源），与消费仓 BlackAgent 的 path 依赖统一为同一 crate——
+  双版本并存时 `ormer::Database` 与行模型类型不互通；Cargo.toml 注明
+  发布 crates.io 时需切回 registry 版本。0.2.22 → 0.2.23 无公开 API
+  变化（sqlite 后端内部并发排队），channel 调用点零适配。
+  【AI 演绎】聚合 feature `full` 同步扩为 `["llm", "ccswitch",
+  "history", "local-safetensors-full", "local-gguf-full", "harness"]`。
 - 【AI 演绎】常用命令：`cargo check --features harness`、
   `cargo test --features harness`、【用户要求，2026-09-13】
   `cargo clippy --features full --all-targets -- -D warnings`（全量
@@ -309,7 +405,14 @@
 - 【AI 演绎】potato（fawdlstty/potato ≥ 0.4.1）：HTTP 传输（Session/
   HttpServer/SSE）+ WebSocket 客户端（wslite 泛型客户端 / full
   `Websocket::connect`）+ 最小 `block_on` 执行器。
-- 【AI 演绎】ormer(SQLite)：cc-switch 配置库读取（`switch` feature）。
+- 【AI 演绎，2026-10-19 更新】ormer（SQLite ORM，turso 后端）：
+  cc-switch 配置库读取（`ccswitch` feature）与 AI 会话历史存储
+  （`history` feature）共用同一依赖。【用户要求，2026-10-19】两处均
+  为 path 依赖本地 checkout（0.2.23），与 BlackAgent 统一单版本。
+- 【用户要求，2026-10-19】依赖收口：项目内数据库访问一律经 ormer，
+  独立 SQLite 驱动依赖已移除（`history` feature 只剩 `dep:ormer` +
+  `dep:uuid`）；外部标准 SQLite 只读访问同样走 ormer 短连接，见
+  §3.8 turso 红线第①条修订。
 - 【AI 演绎】Codex app-server：stdio JSONL / 本地 ws endpoint 双契约
   （initialize/thread.start/turn.* / 审批 accept/decline 枚举）。
 - 【AI 演绎】CC-Shift/宿主 App（Tauri）：harness bin JSON-lines 协议、

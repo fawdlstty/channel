@@ -74,6 +74,9 @@ pub(crate) struct CliBackend {
     resources: Option<crate::switch::PreparedResources>,
     /// fully-unrestricted permission mode: forwarded to ZCode as `--mode yolo`.
     full_access: bool,
+    /// 权限模式覆盖（ZCode --mode 原样透传，build/edit/plan/yolo）；
+    /// 优先于 full_access 推导。
+    permission_mode: Option<String>,
     /// Attachment paths for the turn being spawned (consumed by spawn_turn).
     pending_attachments: Vec<String>,
 }
@@ -125,6 +128,7 @@ impl CliBackend {
             cwd: config.workspace_cwd().to_path_buf(),
             kill_grace_period: config.runtime.process.kill_grace_period,
             full_access: config.is_full_access(),
+            permission_mode: config.permission_mode().map(str::to_owned),
             pending_attachments: Vec::new(),
             resources,
         })
@@ -138,6 +142,7 @@ impl CliBackend {
             self.session_id.as_deref(),
             &message,
             self.full_access,
+            self.permission_mode.as_deref(),
             &attachments,
         );
         let mut command = Command::new(&self.command);
@@ -708,6 +713,7 @@ impl HarnessKind {
         session_id: Option<&str>,
         message: &str,
         full_access: bool,
+        mode_override: Option<&str>,
         attachments: &[String],
     ) -> Vec<String> {
         if !matches!(self, HarnessKind::ClaudeCode | HarnessKind::ZCode) {
@@ -748,9 +754,12 @@ impl HarnessKind {
         };
         if matches!(self, HarnessKind::ZCode) {
             // ZCode 的「完全访问」= yolo 权限模式（减少确认次数）。注意 zcode
-            // 对 `-p` 默认即 yolo，关闭时必须显式给 `--mode build` 才会回到标准模式。
-            let mode = if full_access { "yolo" } else { "build" };
-            args.extend(["--mode".to_owned(), mode.to_owned()]);
+            // 对 `-p` 默认即 yolo，关闭时必须显式给 `--mode build` 才会回到标准
+            // 模式。permission_mode 覆盖优先（edit = 自动编辑档）。
+            let mode = mode_override
+                .map(str::to_owned)
+                .unwrap_or_else(|| (if full_access { "yolo" } else { "build" }).to_owned());
+            args.extend(["--mode".to_owned(), mode]);
         }
         for path in attachments {
             args.extend(["--attach".to_owned(), path.clone()]);
@@ -1132,7 +1141,7 @@ mod tests {
 
     #[test]
     fn claude_args_include_resume_and_streaming() {
-        let args = HarnessKind::ClaudeCode.turn_args(&[], Some("session-1"), "你好", false, &[]);
+        let args = HarnessKind::ClaudeCode.turn_args(&[], Some("session-1"), "你好", false, None, &[]);
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--resume", "session-1"]));
@@ -1256,7 +1265,7 @@ mod tests {
     #[test]
     fn zcode_turn_args_use_headless_stream_json_and_resume() {
         // zcode 对 -p 默认即 yolo，标准模式必须显式 --mode build 才会生效。
-        let args = HarnessKind::ZCode.turn_args(&[], None, "你好", false, &[]);
+        let args = HarnessKind::ZCode.turn_args(&[], None, "你好", false, None, &[]);
         assert_eq!(
             args,
             vec![
@@ -1268,15 +1277,25 @@ mod tests {
                 "build".to_owned()
             ]
         );
-        let full_access_args = HarnessKind::ZCode.turn_args(&[], None, "你好", true, &[]);
+        let full_access_args = HarnessKind::ZCode.turn_args(&[], None, "你好", true, None, &[]);
         assert!(full_access_args
             .windows(2)
             .any(|pair| pair == ["--mode", "yolo"]));
-        let resumed = HarnessKind::ZCode.turn_args(&[], Some("sess-1"), "继续", false, &[]);
+        let resumed = HarnessKind::ZCode.turn_args(&[], Some("sess-1"), "继续", false, None, &[]);
         assert!(resumed
             .windows(2)
             .any(|pair| pair == ["--resume", "sess-1"]));
         assert!(!resumed.contains(&"--verbose".to_owned()));
+    }
+
+    #[test]
+    fn zcode_turn_args_permission_mode_override_wins() {
+        // permission_mode 覆盖优先于 full_access 推导（edit = 自动编辑档）。
+        let args = HarnessKind::ZCode.turn_args(&[], None, "你好", true, Some("edit"), &[]);
+        assert!(args.windows(2).any(|pair| pair == ["--mode", "edit"]));
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--mode", "yolo"]));
     }
 
     #[test]
@@ -1286,6 +1305,7 @@ mod tests {
             None,
             "看图",
             false,
+            None,
             &["/tmp/a.png".to_owned(), "/tmp/b.jpg".to_owned()],
         );
         assert!(args.windows(2).any(|pair| pair == ["--attach", "/tmp/a.png"]));

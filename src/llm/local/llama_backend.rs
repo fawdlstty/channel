@@ -16,7 +16,7 @@ mod enabled {
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
-    use llama_cpp_2::model::{AddBos, LlamaModel};
+    use llama_cpp_2::model::LlamaModel;
     use llama_cpp_2::sampling::LlamaSampler;
     use llama_cpp_2::token::LlamaToken;
     use std::num::NonZeroU32;
@@ -138,10 +138,7 @@ mod enabled {
     }
 
     fn piece(model: &LlamaModel, token: LlamaToken) -> Option<String> {
-        model
-            .token_to_piece_bytes(token, 16, true, None)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
+        String::from_utf8(model.vocab().token_to_piece(token, true, None)).ok()
     }
 
     /// Loads a GGUF file (or the first shard of a sharded set) into a boot
@@ -183,8 +180,8 @@ mod enabled {
             .map_err(|error| map_load_error(error, gguf_path))?;
 
         let n_ctx = context.n_ctx();
-        let eos_token = model.token_eos();
-        let bos_piece = piece(&model, model.token_bos());
+        let eos_token = model.vocab().eos();
+        let bos_piece = piece(&model, model.vocab().bos());
         let eos_piece = piece(&model, eos_token);
         let quantization = quantization_from_filename(gguf_path);
 
@@ -260,10 +257,7 @@ mod enabled {
             // Special tokens embedded in the rendered template (for example
             // `<|im_start|>`) must map back to their vocabulary ids, which
             // is what llama.cpp's `special = true` tokenization does.
-            let tokens = self
-                .model
-                .str_to_token(text, AddBos::Never)
-                .map_err(|error| Error::Backend(format!("tokenization failed: {error}")))?;
+            let tokens = self.model.vocab().tokenize(text.as_bytes(), false, true);
             Ok(tokens.into_iter().map(|token| token.0 as u32).collect())
         }
 
@@ -362,13 +356,12 @@ mod enabled {
                     finish = GenerateFinish::Eos;
                     break;
                 }
-                if let Ok(bytes) = self.model.token_to_piece_bytes(token, 16, false, None) {
-                    utf8_buffer.extend_from_slice(&bytes);
-                    let text = drain_complete_utf8(&mut utf8_buffer);
-                    if !text.is_empty() && !emit(&text) {
-                        finish = GenerateFinish::Cancelled;
-                        break;
-                    }
+                let bytes = self.model.vocab().token_to_piece(token, false, None);
+                utf8_buffer.extend_from_slice(&bytes);
+                let text = drain_complete_utf8(&mut utf8_buffer);
+                if !text.is_empty() && !emit(&text) {
+                    finish = GenerateFinish::Cancelled;
+                    break;
                 }
                 sampler.accept(token);
                 generated += 1;

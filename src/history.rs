@@ -12,10 +12,12 @@
 //!
 //! # Red lines (carried over verbatim from the design spec, do not drop)
 //!
-//! 1. **turso 只连自有库**：ormer 底层是 turso 引擎，非标准 SQLite 锁协议；
-//!    `chat_histories.db` 由本模块自己创建/打开，属"自有库"，直连安全。
-//!    （外部标准 SQLite 库——如 ZCode 引擎库——一律走 rusqlite 只读连接，
-//!    见 [`zcode_session_db_path`] / [`read_zcode_compaction_summary_text`]。）
+//! 1. **数据库访问一律经 ormer**：自有库 `chat_histories.db` 由本模块
+//!    创建/打开，ormer（turso 引擎）直连读写；外部标准 SQLite 库——如
+//!    ZCode 引擎库——同样经 ormer 只读访问（单次调用内短连接打开、
+//!    仅发 SELECT、用完即弃，不写不迁移），见 [`zcode_session_db_path`]
+//!    / [`read_zcode_compaction_summary_text`]。（2026-10-19 修订：原
+//!    "外部库走独立只读连接"的约束由用户要求取消，统一收口 ormer。）
 //! 2. **journal_mode 是查询型 PRAGMA**：`Connection::execute` 遇结果行必报
 //!    `unexpected row during execution`，但副作用已生效——必须走查询通道
 //!    （`select_sql::<String>` 收 `Vec<String>`）消费结果行并校验返回值；
@@ -2070,9 +2072,9 @@ pub fn zcode_session_db_path() -> PathBuf {
 /// 按 summaryMessageId 读引擎摘要正文。优先 message.data 的
 /// summary.body（纯正文）；缺失或解析失败回落该消息 text part 的
 /// text 剥除 SUMMARY_CONTINUATION_PREFIX；两者皆无返回 Ok(None)。
-/// rusqlite 只读连接（SQLITE_OPEN_READ_ONLY），打开/查询失败返回
-/// Err（宿主降级占位转写，不 panic）；引擎进程仍在写时 WAL 只读
-/// 快照安全。库文件不存在返回 Ok(None)。
+/// ormer 短连接只读访问（turso 后端，仅 SELECT，调用结束连接即弃），
+/// 打开/查询失败返回 Err（宿主降级占位转写，不 panic）。
+/// 库文件不存在返回 Ok(None)。
 pub async fn read_zcode_compaction_summary_text(
     session_id: &str,
     message_id: &str,
@@ -2081,32 +2083,29 @@ pub async fn read_zcode_compaction_summary_text(
     if !path.is_file() {
         return Ok(None);
     }
-    let connection = rusqlite::Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|error| {
-        Error::Initialization(format!(
-            "failed to open the ZCode session database {}: {error}",
-            path.display()
+    let database = ormer::Database::connect(ormer::DbType::Sqlite, &path.to_string_lossy())
+        .await
+        .map_err(|error| {
+            Error::Initialization(format!(
+                "failed to open the ZCode session database {}: {error}",
+                path.display()
+            ))
+        })?;
+    let raw: Option<String> = database
+        .select_sql::<String>(ormer::sql!(
+            "SELECT data FROM message WHERE id = {mid} AND session_id = {sid}",
+            mid = message_id.to_string(),
+            sid = session_id.to_string(),
         ))
-    })?;
-    let raw: Option<String> = connection
-        .query_row(
-            "SELECT data FROM message WHERE id = ?1 AND session_id = ?2",
-            rusqlite::params![message_id, session_id],
-            |row| row.get(0),
-        )
-        .map(Some)
-        .or_else(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            error => Err(error),
-        })
+        .collect::<Vec<String>>()
+        .await
         .map_err(|error| {
             Error::Backend(format!(
                 "failed to query the ZCode session database: {error}"
             ))
-        })?;
+        })?
+        .into_iter()
+        .next();
     let Some(raw) = raw else {
         return Ok(None);
     };
@@ -2116,37 +2115,20 @@ pub async fn read_zcode_compaction_summary_text(
         }
     }
     // 回落：该消息的 text part（引擎库形状：type=="text" 携带前导+正文）。
-    let mut statement = connection
-        .prepare(
-            "SELECT data FROM part WHERE message_id = ?1 AND session_id = ?2 ORDER BY sequence",
-        )
+    let parts: Vec<String> = database
+        .select_sql::<String>(ormer::sql!(
+            "SELECT data FROM part WHERE message_id = {mid} AND session_id = {sid} ORDER BY sequence",
+            mid = message_id.to_string(),
+            sid = session_id.to_string(),
+        ))
+        .collect::<Vec<String>>()
+        .await
         .map_err(|error| {
             Error::Backend(format!(
                 "failed to query the ZCode session database: {error}"
             ))
         })?;
-    let mut rows = statement
-        .query(rusqlite::params![message_id, session_id])
-        .map_err(|error| {
-            Error::Backend(format!(
-                "failed to query the ZCode session database: {error}"
-            ))
-        })?;
-    while let Some(row) = rows
-        .next()
-        .map_err(|error| {
-            Error::Backend(format!(
-                "failed to read the ZCode session database row: {error}"
-            ))
-        })?
-    {
-        let data: String = row
-            .get(0)
-            .map_err(|error| {
-                Error::Backend(format!(
-                    "failed to read the ZCode session database row: {error}"
-                ))
-            })?;
+    for data in parts {
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
             continue;
         };

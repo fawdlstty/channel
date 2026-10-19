@@ -1,6 +1,6 @@
 //! history 压缩（compaction）语义测试：自压落库形状与键名快照、幂等、
 //! 切片语义、观察标记、外部转写（真实 boundary payload fixture）、
-//! ZCode 引擎库正文只读辅助（rusqlite fixture，经 CHANNEL_ZCODE_SESSION_DB
+//! ZCode 引擎库正文只读辅助（ormer fixture，经 CHANNEL_ZCODE_SESSION_DB
 //! 注入）。全部 :memory:/临时文件，不碰真实 `~/chat_histories.db` 与
 //! `~/.zcode`。
 //!
@@ -572,46 +572,57 @@ async fn compaction_writes_survive_concurrent_reads() {
 /// ENGINE_DB_ENV 串行化 env 注入（env 是进程级全局，测试并行跑会互踩）。
 static ENGINE_DB_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 用 rusqlite 建真实引擎库形状的 fixture：message.data 的 summary.body /
+/// 用 ormer 建真实引擎库形状的 fixture：message.data 的 summary.body /
 /// text part 前导剥离 / 查无此行 None / 库不存在 None。
 mod engine_fixture {
-    use rusqlite::Connection;
     use std::path::Path;
 
-    pub fn create(path: &Path) -> Connection {
-        let connection = Connection::open(path).expect("建 fixture 库失败");
-        connection
-            .execute_batch(
-                "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
-                 CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, sequence INTEGER);",
-            )
-            .unwrap();
-        connection
+    pub async fn create(path: &Path) -> ormer::Database {
+        let database = ormer::Database::connect(ormer::DbType::Sqlite, &path.to_string_lossy())
+            .await
+            .expect("建 fixture 库失败");
+        for ddl in [
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT)",
+            "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, sequence INTEGER)",
+        ] {
+            database
+                .execute_sql(ormer::sql!(ddl))
+                .await
+                .expect("建 fixture 表失败");
+        }
+        database
     }
 
-    pub fn insert_message(connection: &Connection, id: &str, session_id: &str, data: &str) {
-        connection
-            .execute(
-                "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
-                rusqlite::params![id, session_id, data],
-            )
-            .unwrap();
+    pub async fn insert_message(db: &ormer::Database, id: &str, session_id: &str, data: &str) {
+        db.execute_sql(ormer::sql!(
+            "INSERT INTO message (id, session_id, data) VALUES ({id}, {sid}, {data})",
+            id = id.to_string(),
+            sid = session_id.to_string(),
+            data = data.to_string(),
+        ))
+        .await
+        .expect("写入 fixture message 失败");
     }
 
-    pub fn insert_part(
-        connection: &Connection,
+    pub async fn insert_part(
+        db: &ormer::Database,
         id: &str,
         message_id: &str,
         session_id: &str,
         data: &str,
         sequence: i64,
     ) {
-        connection
-            .execute(
-                "INSERT INTO part (id, message_id, session_id, data, sequence) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![id, message_id, session_id, data, sequence],
-            )
-            .unwrap();
+        db.execute_sql(ormer::sql!(
+            "INSERT INTO part (id, message_id, session_id, data, sequence) \
+             VALUES ({id}, {mid}, {sid}, {data}, {sequence})",
+            id = id.to_string(),
+            mid = message_id.to_string(),
+            sid = session_id.to_string(),
+            data = data.to_string(),
+            sequence = sequence,
+        ))
+        .await
+        .expect("写入 fixture part 失败");
     }
 }
 
@@ -626,60 +637,68 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 #[test]
 fn engine_summary_body_is_preferred_and_text_part_falls_back() {
     let _guard = ENGINE_DB_ENV.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("db.sqlite");
-    let connection = engine_fixture::create(&db_path);
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let database = engine_fixture::create(&db_path).await;
 
-    // 消息 1：data 带 summary.body（纯正文）+ text part（前导+正文）→ 优先 body
-    engine_fixture::insert_message(
-        &connection,
-        "msg_1",
-        "sess_1",
-        r#"{"role":"user","summary":{"title":"Compact summary","body":"纯摘要正文"}}"#,
-    );
-    engine_fixture::insert_part(
-        &connection,
-        "part_1",
-        "msg_1",
-        "sess_1",
-        &serde_json::json!({
-            "type": "text",
-            "synthetic": true,
-            "text": format!("{SUMMARY_CONTINUATION_PREFIX}\n\n纯摘要正文")
-        })
-        .to_string(),
-        0,
-    );
-    // 消息 2：data 无 summary（解析回落）→ text part 剥前导
-    engine_fixture::insert_message(&connection, "msg_2", "sess_1", r#"{"role":"user"}"#);
-    engine_fixture::insert_part(
-        &connection,
-        "part_2",
-        "msg_2",
-        "sess_1",
-        &serde_json::json!({
-            "type": "text",
-            "text": format!("{SUMMARY_CONTINUATION_PREFIX}\n\n回落正文")
-        })
-        .to_string(),
-        0,
-    );
-    drop(connection);
+        // 消息 1：data 带 summary.body（纯正文）+ text part（前导+正文）→ 优先 body
+        engine_fixture::insert_message(
+            &database,
+            "msg_1",
+            "sess_1",
+            r#"{"role":"user","summary":{"title":"Compact summary","body":"纯摘要正文"}}"#,
+        )
+        .await;
+        engine_fixture::insert_part(
+            &database,
+            "part_1",
+            "msg_1",
+            "sess_1",
+            &serde_json::json!({
+                "type": "text",
+                "synthetic": true,
+                "text": format!("{SUMMARY_CONTINUATION_PREFIX}\n\n纯摘要正文")
+            })
+            .to_string(),
+            0,
+        )
+        .await;
+        // 消息 2：data 无 summary（解析回落）→ text part 剥前导
+        engine_fixture::insert_message(&database, "msg_2", "sess_1", r#"{"role":"user"}"#).await;
+        engine_fixture::insert_part(
+            &database,
+            "part_2",
+            "msg_2",
+            "sess_1",
+            &serde_json::json!({
+                "type": "text",
+                "text": format!("{SUMMARY_CONTINUATION_PREFIX}\n\n回落正文")
+            })
+            .to_string(),
+            0,
+        )
+        .await;
+        drop(database);
 
-    std::env::set_var("CHANNEL_ZCODE_SESSION_DB", &db_path);
-    let body = block_on(channel::read_zcode_compaction_summary_text("sess_1", "msg_1"))
-        .unwrap()
-        .unwrap();
-    assert_eq!(body, "纯摘要正文", "优先 message.data 的 summary.body");
-    let body = block_on(channel::read_zcode_compaction_summary_text("sess_1", "msg_2"))
-        .unwrap()
-        .unwrap();
-    assert_eq!(body, "回落正文", "回落 text part 并剥除前导文案");
-    // 查无此行 → Ok(None)
-    let none = block_on(channel::read_zcode_compaction_summary_text("sess_1", "msg_none"))
-        .unwrap();
-    assert_eq!(none, None);
-    std::env::remove_var("CHANNEL_ZCODE_SESSION_DB");
+        std::env::set_var("CHANNEL_ZCODE_SESSION_DB", &db_path);
+        let body = channel::read_zcode_compaction_summary_text("sess_1", "msg_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, "纯摘要正文", "优先 message.data 的 summary.body");
+        let body = channel::read_zcode_compaction_summary_text("sess_1", "msg_2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, "回落正文", "回落 text part 并剥除前导文案");
+        // 查无此行 → Ok(None)
+        let none = channel::read_zcode_compaction_summary_text("sess_1", "msg_none")
+            .await
+            .unwrap();
+        assert_eq!(none, None);
+        std::env::remove_var("CHANNEL_ZCODE_SESSION_DB");
+    });
 }
 
 #[test]
