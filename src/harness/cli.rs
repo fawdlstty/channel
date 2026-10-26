@@ -12,6 +12,47 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 
+/// 消息内联进 argv 的字节上限。Linux 内核限制单个 argv 字符串最长
+/// MAX_ARG_STRLEN（32 页 = 128KiB），超限 execve 直接 E2BIG——溯源类任务把
+/// system+工单历史+部分结论整体当首条消息传递，随失败轮次累积后必然超限，
+/// 且历史只增不减，渠道会陷入"每渠道 60s 重试、每轮必 E2BIG"的死循环
+/// （2026-10-15 起 cts 六渠道全灭事故）。超过该阈值即把完整消息落盘为
+/// 附件文件，argv 只携带一句短指令。阈值取 96KiB，为命令行其余部分与
+/// 环境块留足余量。
+const MESSAGE_INLINE_LIMIT: usize = 96 * 1024;
+
+/// 超限消息降级：完整消息写入临时 Markdown 文件，返回（替换后的短指令、
+/// 附件路径）。短指令同时覆盖两种附件语义——文件内容若已自动注入上下文
+/// 则直接生效；若只登记了路径，模型用 Read 工具读取。写入失败时返回
+/// None 让调用方按原样传递（行为与修复前一致，失败原因由 execve 报出）。
+fn overflow_message_to_attachment(message: &str) -> Option<(String, PathBuf)> {
+    if message.len() <= MESSAGE_INLINE_LIMIT {
+        return None;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "channel-prompt-{}-{}.md",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+    ));
+    std::fs::write(&path, message).ok()?;
+    let instruction = format!(
+        "本条任务的完整上下文与请求内容在附件文件 {path} 中。\
+         请先完整读取该附件（若附件内容未自动展开到对话里，用 Read 工具读取该路径），\
+         然后严格按附件中的全部指令执行，不要遗漏任何一节。",
+        path = path.display()
+    );
+    Some((instruction, path))
+}
+
+fn remove_stale_overflow_file(path: &Option<PathBuf>) {
+    if let Some(path) = path {
+        std::fs::remove_file(path).ok();
+    }
+}
+
 struct CliProcess {
     child: Child,
     stdout: BufReader<ChildStdout>,
@@ -64,6 +105,9 @@ pub(crate) struct CliBackend {
     process: Option<CliProcess>,
     queued: VecDeque<Event>,
     text_seen: bool,
+    /// 本进程是否产出过合法 JSON 事件（进程级健康证明，不随轮次重置）：
+    /// 结构化 CLI 仅在 json_seen=false 时对裸文本行判协议错。
+    json_seen: bool,
     finished: bool,
     interrupt_requested: bool,
     stream_tools: HashMap<usize, StreamTool>,
@@ -79,6 +123,8 @@ pub(crate) struct CliBackend {
     permission_mode: Option<String>,
     /// Attachment paths for the turn being spawned (consumed by spawn_turn).
     pending_attachments: Vec<String>,
+    /// 上一轮超限降级产生的临时附件文件；下一轮 spawn 或后端关闭时删除。
+    overflow_file: Option<PathBuf>,
 }
 
 impl CliBackend {
@@ -122,6 +168,7 @@ impl CliBackend {
             process: None,
             queued: VecDeque::new(),
             text_seen: false,
+            json_seen: false,
             finished: false,
             interrupt_requested: false,
             stream_tools: HashMap::new(),
@@ -130,6 +177,7 @@ impl CliBackend {
             full_access: config.is_full_access(),
             permission_mode: config.permission_mode().map(str::to_owned),
             pending_attachments: Vec::new(),
+            overflow_file: None,
             resources,
         })
     }
@@ -137,6 +185,22 @@ impl CliBackend {
     async fn spawn_turn(&mut self, message: String) -> Result<(), Error> {
         self.stop_process().await?;
         let attachments = std::mem::take(&mut self.pending_attachments);
+        // 超限消息降级为附件传递（E2BIG 防护），并清掉上一轮的临时文件。
+        let (message, overflow) = match overflow_message_to_attachment(&message) {
+            Some((instruction, path)) => {
+                remove_stale_overflow_file(&self.overflow_file);
+                (instruction, Some(path))
+            }
+            None => {
+                remove_stale_overflow_file(&self.overflow_file);
+                (message, None)
+            }
+        };
+        let mut attachments = attachments;
+        if let Some(path) = &overflow {
+            attachments.push(path.to_string_lossy().into_owned());
+        }
+        self.overflow_file = overflow;
         let args = self.kind.turn_args(
             &self.args,
             self.session_id.as_deref(),
@@ -216,11 +280,15 @@ impl CliBackend {
                 Some(process) => process,
                 None => return Ok(None),
             };
-            let mut line = String::new();
-            let bytes =
-                process.stdout.read_line(&mut line).await.map_err(|error| {
-                    Error::Backend(format!("failed to read CLI output: {error}"))
-                })?;
+            // read_until + lossy：CLI 偶发输出非 UTF-8 字节时按替换符续读，
+            // 不允许一行坏字节炸掉整个会话。
+            let mut buf = Vec::new();
+            let bytes = process
+                .stdout
+                .read_until(b'\n', &mut buf)
+                .await
+                .map_err(|error| Error::Backend(format!("failed to read CLI output: {error}")))?;
+            let line = String::from_utf8_lossy(&buf).into_owned();
             if bytes == 0 {
                 let mut process = self
                     .process
@@ -266,23 +334,37 @@ impl CliBackend {
                 return Ok(None);
             }
 
-            let trimmed = line.trim_end();
-            if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-                let events = self.parse_json(&value);
-                self.queued.extend(events);
-            } else {
-                if self.backend_kind == crate::protocol::BackendKind::StructuredCli {
-                    return Err(Error::ProtocolError(format!(
-                        "invalid structured CLI JSON output: {trimmed}"
-                    )));
-                }
-                self.text_seen = true;
-                self.queued.push_back(Event::TextDelta(line));
-            }
+            self.route_line(line)?;
+
             if let Some(event) = self.queued.pop_front() {
                 return Ok(Some(event));
             }
         }
+    }
+
+    /// 单行 CLI 输出路由：合法 JSON → 事件解析；空行跳过；裸文本行在
+    /// 结构化 CLI 上仅当"从未见过任何 JSON 事件"时判协议错（首行即裸文本
+    /// = CLI 没进 JSON 模式，快失败），已被证明健康的会话按文本事件收下，
+    /// 不许结果层偶发吐正文把已完成的整场分析作废。
+    fn route_line(&mut self, line: String) -> Result<(), Error> {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            self.json_seen = true;
+            let events = self.parse_json(&value);
+            self.queued.extend(events);
+            return Ok(());
+        }
+        if self.backend_kind == crate::protocol::BackendKind::StructuredCli && !self.json_seen {
+            return Err(Error::ProtocolError(format!(
+                "invalid structured CLI JSON output: {trimmed}"
+            )));
+        }
+        self.text_seen = true;
+        self.queued.push_back(Event::TextDelta(line));
+        Ok(())
     }
 
     fn parse_json(&mut self, value: &Value) -> Vec<Event> {
@@ -588,6 +670,12 @@ impl Backend for CliBackend {
 
     fn close<'a>(&'a mut self) -> BackendFuture<'a, ()> {
         Box::pin(async move { self.stop_process().await })
+    }
+}
+
+impl Drop for CliBackend {
+    fn drop(&mut self) {
+        remove_stale_overflow_file(&self.overflow_file);
     }
 }
 
@@ -1138,6 +1226,50 @@ impl CliStatus for str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 裸文本行路由回归（2026-10-23）：结构化 CLI 首行即裸文本仍快失败
+    ///（没进 JSON 模式）；但已被 JSON 事件证明健康的会话中途混入的裸文本
+    /// 与空行按文本收下/跳过，不许把已完成的整场分析作废。
+    #[test]
+    fn structured_cli_rejects_leading_raw_text_but_tolerates_late_noise() {
+        let mut backend = zcode_backend();
+        let error = backend
+            .route_line("Fatal: this is not a JSON stream".to_owned())
+            .unwrap_err();
+        assert!(matches!(error, Error::ProtocolError(_)));
+
+        // 一个合法 JSON 事件证明会话健康（json_seen=true）。
+        backend.route_line(r#"{"type":"system"}"#.to_owned()).unwrap();
+        // 结果层偶发吐正文：收为文本事件而非协议错；空行静默跳过。
+        backend
+            .route_line("工单（错误码 13）：我先加载全局指令正本。".to_owned())
+            .unwrap();
+        backend.route_line("   ".to_owned()).unwrap();
+        assert!(backend.text_seen);
+        assert!(matches!(
+            backend.queued.pop_front(),
+            Some(Event::TextDelta(text)) if text.contains("我先加载全局指令正本")
+        ));
+        assert!(backend.queued.is_empty());
+    }
+
+    /// E2BIG 防护回归（2026-10-23）：小消息原样内联；超限消息落盘为附件，
+    /// argv 换成携带路径的短指令，文件内容与原消息逐字节一致。
+    #[test]
+    fn overflow_message_routes_to_attachment_and_inline_stays_untouched() {
+        let small = "一条普通消息。";
+        assert!(overflow_message_to_attachment(small).is_none());
+
+        let big = "溯源".repeat(MESSAGE_INLINE_LIMIT); // 2 bytes * N > 96KiB
+        let (instruction, path) = overflow_message_to_attachment(&big)
+            .expect("oversized message must be diverted to an attachment");
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert!(path.to_string_lossy().ends_with(".md"));
+        assert_eq!(std::fs::read(&path).unwrap(), big.as_bytes());
+        assert!(instruction.contains(&path.to_string_lossy().to_string()));
+        assert!(instruction.len() < 1024, "inline instruction must stay small");
+        std::fs::remove_file(&path).ok();
+    }
 
     #[test]
     fn claude_args_include_resume_and_streaming() {

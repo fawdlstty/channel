@@ -1,6 +1,6 @@
 [package]
 name = "channel"
-version = "0.3.14"
+version = "0.3.15"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -33,7 +33,7 @@ minijinja = { version = "2", optional = true }
 minijinja-contrib = { version = "2", optional = true, default-features = false, features = ["pycompat"] }
 # Shared by the `ccswitch` and `history` features: cc-switch provider
 # reading and the AI chat-history store use the same ormer ORM (turso
-# backend, pure Rust â€” default builds stay free of any C toolchain
+# backend, pure Rust — default builds stay free of any C toolchain
 # requirement). Path dependency on the local checkout keeps the ormer
 # version unified with consumer workspaces (BlackAgent) so row-model types
 # stay interchangeable; switch back to a registry version if this crate is
@@ -154,7 +154,7 @@ ccswitch = ["dep:ormer", "dep:toml"]
 # connections, SELECT only).
 history = ["dep:ormer", "dep:uuid"]
 # In-process local inference, `local-<weight format>-<backend>`: the weight
-# format implies the engine â€” safetensors runs on the pure-Rust candle engine,
+# format implies the engine — safetensors runs on the pure-Rust candle engine,
 # GGUF on llama.cpp (needs cmake and a C++ toolchain). The candle baseline (CPU) carries the
 # shared LocalClient surface, the chat-template engine and the local-model
 # HTTP server (LocalLlmServer); the `cuda`/`metal`/`vulkan` backends only
@@ -168,11 +168,11 @@ local-safetensors-cpu = [
     "dep:minijinja-contrib",
 ]
 local-safetensors-cuda = ["local-safetensors-cpu", "candle-core/cuda"]
-# metal å˜ä½“ä»… Apple ç›®æ ‡å¯ç¼–è¯‘ï¼šcandle ä¸Šæ¸¸æŠŠ objc2 ç³» metal ä¾èµ–å£°æ˜Žä¸º
-# æ™®é€š optional ä¾èµ–ï¼ˆæ— ç›®æ ‡å¹³å° gatingï¼‰ï¼Œéž Apple ç›®æ ‡å¯ç”¨
-# `candle-core/metal` ç›´æŽ¥ compile_errorï¼ˆobjc2 ä»… Apple å¹³å°å¯ç¼–è¯‘ï¼‰ï¼›
-# cargo åˆä¸æ”¯æŒæŒ‰ç›®æ ‡å¹³å°æ¿€æ´» featureï¼ˆåŒåŒ…åŒåä¾èµ–æ— æ³•åŒåå¹¶å­˜ï¼‰ï¼Œ
-# å› æ­¤è¯¥å˜ä½“ä¸è¿›å…¥ä»»ä½•èšåˆ featureã€‚
+# metal 变体仅 Apple 目标可编译：candle 上游把 objc2 系 metal 依赖声明为
+# 普通 optional 依赖（无目标平台 gating），非 Apple 目标启用
+# `candle-core/metal` 直接 compile_error（objc2 仅 Apple 平台可编译）；
+# cargo 又不支持按目标平台激活 feature（同包同名依赖无法双名并存），
+# 因此该变体不进入任何聚合 feature。
 local-safetensors-metal = ["local-safetensors-cpu", "candle-core/metal"]
 local-gguf-cpu = ["local-safetensors-cpu", "dep:llama-cpp-2"]
 local-gguf-cuda = ["local-gguf-cpu", "llama-cpp-2/cuda"]
@@ -180,12 +180,12 @@ local-gguf-metal = ["local-gguf-cpu", "llama-cpp-2/metal"]
 local-gguf-vulkan = ["local-gguf-cpu", "llama-cpp-2/vulkan"]
 # Aggregates: `local-<format>-full` turns on every backend of that weight
 # format that builds WITHOUT external GPU SDK requirements (CPU baseline
-# included). cudaï¼ˆcandle-kernels æž„å»ºæœŸéœ€è¦ nvccï¼›llama.cpp æž„å»ºæœŸéœ€è¦
-# CUDA Toolkitï¼‰ä¸Ž vulkanï¼ˆWindows æž„å»ºæœŸå¼ºåˆ¶è¦æ±‚ VULKAN_SDKï¼‰æœ‰ç¼–è¯‘æœŸ
-# SDK ç¡¬ä¾èµ–ï¼Œcandle çš„ metal æœ‰ç›®æ ‡å¹³å°ç¡¬é™åˆ¶ï¼Œå‡ä¸è¿›å…¥èšåˆâ€”â€”å¦åˆ™
-# `full` åœ¨ä»»ä½•æ— å¯¹åº” SDK/å¹³å°çš„æœºå™¨ä¸Šéƒ½æ— æ³•ç¼–è¯‘ã€‚GPU åŽç«¯ä¿æŒç‹¬ç«‹
-# featureï¼Œç”±å…·å¤‡æ¡ä»¶çš„æž„å»ºçŽ¯å¢ƒæ˜¾å¼å¯ç”¨ï¼ˆllama ä¾§ GGML_METAL ç”± CMake
-# åœ¨ Apple ç›®æ ‡è‡ªåŠ¨å¼€å¯ï¼Œmetal æ ‡è®° feature æ— å‰¯ä½œç”¨ï¼Œéšèšåˆä¿ç•™ï¼‰ã€‚
+# included). cuda（candle-kernels 构建期需要 nvcc；llama.cpp 构建期需要
+# CUDA Toolkit）与 vulkan（Windows 构建期强制要求 VULKAN_SDK）有编译期
+# SDK 硬依赖，candle 的 metal 有目标平台硬限制，均不进入聚合——否则
+# `full` 在任何无对应 SDK/平台的机器上都无法编译。GPU 后端保持独立
+# feature，由具备条件的构建环境显式启用（llama 侧 GGML_METAL 由 CMake
+# 在 Apple 目标自动开启，metal 标记 feature 无副作用，随聚合保留）。
 local-safetensors-full = ["local-safetensors-cpu"]
 local-gguf-full = ["local-gguf-cpu", "local-gguf-metal"]
 full = ["llm", "ccswitch", "history", "local-safetensors-full", "local-gguf-full", "harness"]
@@ -194,8 +194,8 @@ full = ["llm", "ccswitch", "history", "local-safetensors-full", "local-gguf-full
 # tools, JSON-lines service, store with redaction hooks. v1.15 (user request
 # U): the recorder-facing capabilities (event recording `record`, CDP browser
 # `browser`, BYOK LLM bridge `llm_bridge`) moved back to the WorkRecorder
-# repo (`wr-harness-ext` crate). Every platform integration compiles in â€”
-# Windows UIA/SendInput/GDI+WIC, Linux X11/AT-SPI/portal/uinput â€” and which
+# repo (`wr-harness-ext` crate). Every platform integration compiles in —
+# Windows UIA/SendInput/GDI+WIC, Linux X11/AT-SPI/portal/uinput — and which
 # one is used is decided by the target OS plus runtime environment probing
 # (no per-platform sub-features).
 harness = [
