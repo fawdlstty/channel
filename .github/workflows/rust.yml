@@ -20,9 +20,11 @@ env:
 #   switch + harness（X11/AT-SPI/portal/uinput 随 harness 全量编译）；
 #   dbus-run-session 提供 session bus 供 AT-SPI 集成测试自举（无 DISPLAY
 #   时 GTK 演示窗起不来，测试优雅 skip）。
-# - Linux MSRV 档（1.88）：最小语言版本守护（crate rust-version）。1.85 →
+# - Linux MSRV 档（1.90）：最小语言版本守护（crate rust-version）。1.85 →
 #   1.88：potato 0.4.1 硬依赖 time ^0.3.55 / jsonwebtoken ^11（MSRV 1.88），
-#   1.85 无法满足，1.88 成为实际编译下限。
+#   1.85 无法满足，1.88 成为实际编译下限；1.88 → 1.90（2026-10-28）：history
+#   链路锁文件中 uuid 1.28.0（MSRV 1.89）、ordered-float 5.5.0 / roaring
+#   0.11.5（MSRV 1.90）抬高下限，按「不降级依赖、随依赖树上移」策略升至 1.90。
 # - Windows 档：cfg(windows) 全模块（uia/sendinput/screen + 事件直录
 #   win_event_hook/uia_events）真实 MSVC 编译与单测；真实桌面冒烟保持
 #   #[ignore]；并用 cargo tree 反查做平台隔离哨兵（windows/windows-core
@@ -50,8 +52,8 @@ jobs:
           - name: no-default-features
             toolchain: stable
             flags: --no-default-features
-          - name: msrv-1.88-default
-            toolchain: "1.88"
+          - name: msrv-1.90-default
+            toolchain: "1.90"
             flags: ""
     steps:
     - uses: actions/checkout@v4

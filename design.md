@@ -24,11 +24,15 @@
   并附带四种大模型直连 HTTP 协议客户端（可选本地推理/本地服务端）与
   桌面感知 harness（原 charness crate 并入）。库形态供宿主内嵌，服务
   形态经 `harness` bin（JSON-lines 协议）子进程拉起。
-- 【AI 演绎】crate 元数据：`channel` 0.3.5（edition 2021，rust 1.88），
+- 【AI 演绎】crate 元数据：`channel` 0.3.16（edition 2021，rust 1.90），
   MIT，仓库 github.com/fawdlstty/channel。【用户要求，2026-09-13】
   rust-version 1.85 → 1.88：potato 0.4.1 硬依赖 time ^0.3.55 /
   jsonwebtoken ^11（MSRV 1.88），且用户明确不降 potato 版本，CI 的
-  Linux MSRV 档同步升至 1.88。
+  Linux MSRV 档同步升至 1.88。【用户要求（既定策略延续），2026-10-28】
+  rust-version 1.88 → 1.90：history 链路锁文件中 uuid 1.28.0
+  （MSRV 1.89）与 ordered-float 5.5.0 / roaring 0.11.5（MSRV 1.90）
+  抬高下限，按 2026-09-13 确认的「不降级依赖、随依赖树上移」策略升至
+  1.90，CI Linux MSRV 档同步更名 msrv-1.90-default。
 
 ## 2. 总体结构
 
