@@ -27,9 +27,10 @@ pub use protocol::{
     ReasoningEffort, RepositoryDetection, RepositoryInfo, RepositoryKind, ResourcePolicy,
     Resumability, ResumeTarget, RetentionPolicy, RuntimeInfo, RuntimeOptions, RuntimeSpec,
     SecretAccess, SecretPermission, SecurityOptions, SessionConfig, SessionInfo, SessionState,
-    ShareAudience, Shareability, Status, StderrPolicy, SwitchProvider, TempPolicy, ToolCall,
-    ToolStatus, TransportKind, TriState, TurnInfo, Usage, VisibilityInfo, VisibilityLimitation,
-    VisibilityRequest, VisibilityState, WorkspaceInfo, WorkspaceOptions, WorkspaceRoot,
+    ShareAudience, Shareability, Status, StderrPolicy, SwitchProvider, TempPolicy, TodoEntry,
+    TodoSnapshot, TodoStatus, ToolCall, ToolStatus, TransportKind, TriState, TurnInfo, Usage,
+    VisibilityInfo, VisibilityLimitation, VisibilityRequest, VisibilityState, WorkspaceInfo,
+    WorkspaceOptions, WorkspaceRoot,
 };
 pub use session::{
     ActivityCounts, ActivityEvent, ActivityId, ActivityKind, ActivityStatus, ActivitySummary,

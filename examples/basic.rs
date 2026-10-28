@@ -27,6 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("ContextUsage: {used}/{total}")
             }
             channel::SessionEvent::CompactionBoundary { .. } => {}
+            channel::SessionEvent::Todo { .. } => {}
             channel::SessionEvent::Finished(_) => {}
         }
     }

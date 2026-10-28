@@ -1,6 +1,7 @@
 use crate::process::JsonlProcess;
 use crate::protocol::{
-    Confidence, Error, Event, FileRead, FileReadSource, Finish, Status, ToolCall, ToolStatus,
+    Confidence, Error, Event, FileRead, FileReadSource, Finish, Status, TodoSnapshot, ToolCall,
+    ToolStatus,
 };
 use crate::runtime::HarnessDiscovery;
 use crate::session::{Backend, BackendFuture, PermissionResponse, SendMode};
@@ -816,6 +817,21 @@ impl<'a> CodexNotification<'a> {
             "item/started" | "item/completed" => {
                 CodexItemLifecycle::new(self.0, &params, method).events()
             }
+            // turn/plan/updated：plan 数组为全量计划快照（条目 {step, status}，
+            // status 驼峰 inProgress 由 TodoSnapshot::parse 统一归一），
+            // explanation 为计划解释。实验性 item/plan/delta 与 type=plan 的
+            // item 生命周期保持现状（Raw/忽略），不在此处理。
+            "turn/plan/updated" => {
+                let explanation = params
+                    .get("explanation")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                params
+                    .get("plan")
+                    .and_then(|plan| TodoSnapshot::parse(plan, explanation))
+                    .map(|snapshot| vec![Event::Todo(snapshot)])
+                    .unwrap_or_default()
+            }
             _ => vec![Event::Raw(self.0.clone())],
         }
     }
@@ -1269,6 +1285,41 @@ mod tests {
                 vec![Event::Finished(Finish::new(status, ""))]
             );
         }
+    }
+
+    /// turn/plan/updated 提升为一等 Event::Todo：驼峰 inProgress 归一为
+    /// InProgress，explanation 字符串原样保留；缺 plan 数组时静默丢弃。
+    #[test]
+    fn parses_turn_plan_updated_into_todo_snapshot() {
+        let events = CodexNotification(&notification(
+            "turn/plan/updated",
+            json!({
+                "plan": [
+                    { "step": "盘点现场", "status": "completed" },
+                    { "step": "排查根因", "status": "inProgress" },
+                    { "step": "落实修复", "status": "pending" }
+                ],
+                "explanation": "先取证再动手"
+            }),
+        ))
+        .events();
+        assert_eq!(events.len(), 1);
+        let Some(Event::Todo(snapshot)) = events.into_iter().next() else {
+            panic!("turn/plan/updated 应产出 Event::Todo");
+        };
+        assert_eq!(snapshot.explanation.as_deref(), Some("先取证再动手"));
+        assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(snapshot.entries[0].status, crate::protocol::TodoStatus::Completed);
+        assert_eq!(snapshot.entries[1].status, crate::protocol::TodoStatus::InProgress);
+        assert_eq!(snapshot.entries[2].status, crate::protocol::TodoStatus::Pending);
+
+        // 无 plan 数组（或非数组）不产事件；explanation 非字符串不保留。
+        let malformed = CodexNotification(&notification(
+            "turn/plan/updated",
+            json!({ "explanation": 3 }),
+        ))
+        .events();
+        assert_eq!(malformed, Vec::new());
     }
 
     #[test]

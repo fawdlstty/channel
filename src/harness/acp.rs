@@ -1,6 +1,6 @@
 use crate::protocol::{
-    Confidence, Error, Event, FileRead, FileReadSource, Finish, HarnessKind, Status, ToolCall,
-    ToolStatus,
+    Confidence, Error, Event, FileRead, FileReadSource, Finish, HarnessKind, Status, TodoSnapshot,
+    ToolCall, ToolStatus,
 };
 use crate::runtime::HarnessDiscovery;
 use crate::session::{Backend, BackendFuture, PermissionResponse, SendMode};
@@ -698,6 +698,13 @@ impl AcpValue for Value {
             }
             "tool_call" | "toolCall" | "tool_call_update" | "toolCallUpdate" | "tool_result"
             | "toolResult" | "file_read" | "fileRead" => update.tool_events(kind),
+            // plan 会话更新：entries 为全量待办快照，提升为一等 Event::Todo
+            // （原先落入未知分支被过滤，GUI 侧不可见）。
+            "plan" => update
+                .get("entries")
+                .and_then(|entries| TodoSnapshot::parse(entries, None))
+                .map(|snapshot| vec![Event::Todo(snapshot)])
+                .unwrap_or_default(),
             "permission_request" | "permissionRequest" => vec![Event::PermissionRequired {
                 id: update
                     .get("id")
@@ -934,6 +941,40 @@ mod tests {
         assert!(
             matches!(events[0], Event::ToolCall(ToolCall { ref name, status: ToolStatus::Requested, .. }) if name == "shell")
         );
+    }
+
+    /// sessionUpdate=plan 提升为一等 Event::Todo：entries 的 status/priority
+    /// 按归一化口径收敛（原先落入未知分支只会变 Raw 被过滤）。
+    #[test]
+    fn parses_plan_update_into_todo_snapshot() {
+        let message = json!({
+            "method": "session/update",
+            "params": { "update": {
+                "sessionUpdate": "plan",
+                "entries": [
+                    { "content": "定位断点", "priority": "High", "status": "in_progress" },
+                    { "content": "修复并验证", "priority": "low", "status": "pending" },
+                    { "content": "回报", "status": "completed" }
+                ]
+            }}
+        });
+        let events = message.parse_update();
+        assert_eq!(events.len(), 1);
+        let Some(Event::Todo(snapshot)) = events.into_iter().next() else {
+            panic!("plan 更新应产出 Event::Todo");
+        };
+        assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(snapshot.entries[0].status, crate::protocol::TodoStatus::InProgress);
+        assert_eq!(snapshot.entries[0].priority.as_deref(), Some("high"));
+        assert_eq!(snapshot.entries[1].status, crate::protocol::TodoStatus::Pending);
+        assert_eq!(snapshot.entries[2].status, crate::protocol::TodoStatus::Completed);
+
+        // 非 plan 更新不产 Todo；无 entries 的 plan 更新静默丢弃。
+        let empty = json!({
+            "method": "session/update",
+            "params": { "update": { "sessionUpdate": "plan" } }
+        });
+        assert_eq!(empty.parse_update(), Vec::new());
     }
 
     #[test]

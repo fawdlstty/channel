@@ -32,7 +32,7 @@
 //! 5. **`type` 是 Rust 关键字**：`SessionEntryRow.entry_type` 用
 //!    `#[column(name = "type")]` 映射回列名。
 
-use crate::protocol::Error;
+use crate::protocol::{Error, TodoEntry, TodoSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -45,6 +45,9 @@ pub const TITLE_SOURCE_FIRST_INPUT: &str = "first_input";
 pub const TITLE_SOURCE_CUSTOM: &str = "custom";
 pub const ENTRY_TYPE_CHANNEL_SELECTION: &str = "runtime/channel_selection";
 pub const ENTRY_SUFFIX_CHANNEL_SELECTION: &str = ":channel-selection";
+/// 待办快照 entry（`{session_id}:todo-state`，覆盖式 upsert）。
+pub const ENTRY_TYPE_TODO_STATE: &str = "runtime/todo_state";
+pub const ENTRY_SUFFIX_TODO_STATE: &str = ":todo-state";
 /// local_setting ownership (scope/scope_id are fixed to the single-user
 /// layout; the namespace parameter keeps host namespaces isolated).
 pub const SETTING_SCOPE: &str = "user";
@@ -969,6 +972,21 @@ impl ChatHistoryDatabase {
         find_channel_key(&*self.inner.lock().await, session_id).await
     }
 
+    /// 覆盖式写入会话的最新待办快照（entry 固定 id，存在改写、不存在新建）。
+    pub async fn upsert_todo_state(
+        &self,
+        session_id: &str,
+        snapshot: &TodoSnapshot,
+        now: i64,
+    ) -> Result<(), Error> {
+        upsert_todo_state(&*self.inner.lock().await, session_id, snapshot, now).await
+    }
+
+    /// 单会话的最新待办快照（runtime/todo_state）；无则 None。
+    pub async fn find_todo_state(&self, session_id: &str) -> Result<Option<TodoSnapshot>, Error> {
+        find_todo_state(&*self.inner.lock().await, session_id).await
+    }
+
     // ----- messages -----
 
     /// 落盘用户消息：message 行（data=user_message_data）+ 单 text part
@@ -1543,6 +1561,86 @@ async fn find_channel_key(
         .await
         .db_error("failed to query the channel selection")?;
     Ok(rows.and_then(|row| parse_channel_key(&row.data)))
+}
+
+// ---------- todo state (session_entry) ----------
+
+/// `runtime/todo_state` 行的 data 载荷：TodoSnapshot 的 serde 投影。entries
+/// 复用 [`TodoEntry`] 自身的序列化（status snake_case、空 option 省略），
+/// TodoSnapshot 本体未 derive serde，这里仅做包装。
+#[derive(Serialize, Deserialize)]
+struct TodoStateData {
+    entries: Vec<TodoEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    explanation: Option<String>,
+}
+
+fn todo_state_data(snapshot: &TodoSnapshot) -> String {
+    let data = TodoStateData {
+        entries: snapshot.entries.clone(),
+        explanation: snapshot.explanation.clone(),
+    };
+    serde_json::to_string(&data).unwrap_or_else(|_| "{}".into())
+}
+
+fn parse_todo_state(data: &str) -> Option<TodoSnapshot> {
+    serde_json::from_str::<TodoStateData>(data)
+        .ok()
+        .map(|data| TodoSnapshot {
+            entries: data.entries,
+            explanation: data.explanation,
+        })
+}
+
+/// 覆盖式写入会话的最新待办快照（entry 固定 id，存在改写、不存在新建；
+/// 模式同 channel selection）。
+async fn upsert_todo_state(
+    db: &ormer::Database,
+    session_id: &str,
+    snapshot: &TodoSnapshot,
+    now: i64,
+) -> Result<(), Error> {
+    let id = format!("{session_id}{ENTRY_SUFFIX_TODO_STATE}");
+    let data = todo_state_data(snapshot);
+    let updated = db
+        .update::<SessionEntryRow>()
+        .filter(|m| m.id.eq(id.clone()))
+        .set(|m| {
+            m.data = m.data.set(data.clone());
+            m.time_updated = m.time_updated.set(now);
+        })
+        .execute()
+        .await
+        .db_error("failed to update the todo state")?;
+    if updated == 0 {
+        db.insert(&SessionEntryRow {
+            id,
+            session_id: session_id.to_string(),
+            entry_type: ENTRY_TYPE_TODO_STATE.to_string(),
+            time_created: now,
+            time_updated: now,
+            data,
+        })
+        .execute()
+        .await
+        .db_error("failed to insert the todo state")?;
+    }
+    Ok(())
+}
+
+/// 单会话的最新待办快照（runtime/todo_state entry）；无则 None。
+async fn find_todo_state(
+    db: &ormer::Database,
+    session_id: &str,
+) -> Result<Option<TodoSnapshot>, Error> {
+    let row: Option<SessionEntryRow> = db
+        .select::<SessionEntryRow>()
+        .filter(|m| m.session_id.eq(session_id.to_string()))
+        .filter(|m| m.entry_type.eq(ENTRY_TYPE_TODO_STATE.to_string()))
+        .first()
+        .await
+        .db_error("failed to query the todo state")?;
+    Ok(row.and_then(|row| parse_todo_state(&row.data)))
 }
 
 // ---------- messages ----------
@@ -2229,6 +2327,53 @@ mod tests {
 
         let entry: Value = serde_json::from_str(&channel_selection_data("ZCode|t|m")).unwrap();
         assert_eq!(entry["channelKey"], "ZCode|t|m");
+    }
+
+    #[test]
+    fn todo_state_data_round_trips_with_snake_case_status() {
+        let snapshot = TodoSnapshot {
+            entries: vec![
+                TodoEntry {
+                    content: "调研".into(),
+                    status: crate::protocol::TodoStatus::Completed,
+                    priority: Some("high".into()),
+                    active_form: None,
+                },
+                TodoEntry {
+                    content: "实现".into(),
+                    status: crate::protocol::TodoStatus::InProgress,
+                    priority: None,
+                    active_form: Some("实现中".into()),
+                },
+                TodoEntry {
+                    content: "验证".into(),
+                    status: crate::protocol::TodoStatus::Pending,
+                    priority: None,
+                    active_form: None,
+                },
+            ],
+            explanation: Some("计划说明".into()),
+        };
+        let data: Value = serde_json::from_str(&todo_state_data(&snapshot)).unwrap();
+        assert_eq!(data["entries"].as_array().map(Vec::len), Some(3));
+        assert_eq!(data["entries"][0]["status"], "completed");
+        assert_eq!(data["entries"][0]["priority"], "high");
+        assert!(data["entries"][0].get("active_form").is_none(), "空 option 省略");
+        assert_eq!(data["entries"][1]["status"], "in_progress");
+        assert_eq!(data["entries"][1]["active_form"], "实现中");
+        assert_eq!(data["entries"][2]["status"], "pending");
+        assert_eq!(data["explanation"], "计划说明");
+
+        // 无解释快照：explanation 键整体省略
+        let bare = TodoSnapshot {
+            entries: snapshot.entries.clone(),
+            explanation: None,
+        };
+        let data: Value = serde_json::from_str(&todo_state_data(&bare)).unwrap();
+        assert!(data.get("explanation").is_none());
+
+        // 序列化 → 反序列化往返一致
+        assert_eq!(parse_todo_state(&todo_state_data(&snapshot)), Some(snapshot));
     }
 
     #[test]

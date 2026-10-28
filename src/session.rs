@@ -2,9 +2,10 @@ use crate::protocol::{
     AuthInfo, AuthState, BackendInfo, BackendKind, Capabilities, CapabilityReport, CapabilitySet,
     Confidence, ConversationSpec, Error, Event, FileChange, FileRead, FileReadSource, Finish,
     HarnessKind, HarnessState, ModelInfo, ObservationSource, PermissionInfo, Resumability,
-    RuntimeInfo, SessionConfig, SessionInfo, Shareability, Status, ToolCall, ToolStatus,
-    TransportKind, TurnInfo, VisibilityInfo, VisibilityState, WorkspaceInfo,
+    RuntimeInfo, SessionConfig, SessionInfo, Shareability, Status, TodoSnapshot, ToolCall,
+    ToolStatus, TransportKind, TurnInfo, VisibilityInfo, VisibilityState, WorkspaceInfo,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -52,13 +53,17 @@ pub(crate) trait Backend: Send {
 pub type ActivityId = String;
 pub type ActivityStatus = ToolStatus;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActivityKind {
     Tool,
     ReadFile,
     WriteFile,
     RunCommand,
     Subagent,
+    /// 待办/计划类工具（TodoWrite/UpdatePlan）；单独成类避免被
+    /// `contains("write")` 误标为 WriteFile。
+    Todo,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +141,11 @@ pub enum SessionEvent {
     /// session state aggregation ignores it.
     CompactionBoundary {
         payload: serde_json::Value,
+    },
+    /// 待办/计划全量快照（[`Event::Todo`] 的会话层投影）。逐次事件整体
+    /// 覆盖上一份快照，会话状态聚合忽略它。
+    Todo {
+        snapshot: TodoSnapshot,
     },
     Finished(Finish),
 }
@@ -233,7 +243,10 @@ fn file_row_detail(path: &str) -> String {
 impl ActivityName for str {
     fn activity_kind(&self) -> ActivityKind {
         let name = self.to_ascii_lowercase();
-        if name.contains("agent") || name.contains("task") {
+        // todo/plan 类先判（TodoWrite 含 "write"，落后面会被误标 WriteFile）。
+        if crate::protocol::is_todo_plan_tool(&name) {
+            ActivityKind::Todo
+        } else if name.contains("agent") || name.contains("task") {
             ActivityKind::Subagent
         } else if name.contains("read")
             || name.contains("cat")
@@ -957,6 +970,9 @@ impl Session {
             Event::CompactionBoundary { payload } => Some(SessionEvent::CompactionBoundary {
                 payload: payload.clone(),
             }),
+            Event::Todo(snapshot) => Some(SessionEvent::Todo {
+                snapshot: snapshot.clone(),
+            }),
             Event::PermissionRequired { id, detail } => {
                 Some(SessionEvent::Permission(PermissionEvent {
                     id: id.clone(),
@@ -1019,6 +1035,9 @@ impl Session {
             // 外部引擎压缩 boundary 是透传事实，不改会话状态聚合（宿主在
             // 事件消费侧处理转写，见 design.md 压缩一节）。
             Event::CompactionBoundary { .. } => {}
+            // 待办快照同样是透传事实：GUI 侧整表替换即可，会话聚合
+            // （工具/文件/文本）不吸收其内容。
+            Event::Todo(_) => {}
             Event::Finished(finish) => {
                 let finish = if finish.text.is_empty() {
                     Finish::new(finish.status, self.text.clone())
@@ -1425,6 +1444,69 @@ mod tests {
             Some(SessionEvent::Finished(_))
         ));
         assert_eq!(session.result().unwrap().status, Status::Completed);
+    }
+
+    /// 待办快照一等事件：session_event 原样透传，apply 无副作用（与
+    /// CompactionBoundary 同款透传事实语义）。
+    #[tokio::test]
+    async fn todo_snapshot_surfaces_without_state_changes() {
+        let snapshot = TodoSnapshot {
+            entries: vec![
+                crate::protocol::TodoEntry {
+                    content: "调研".to_owned(),
+                    status: crate::protocol::TodoStatus::InProgress,
+                    priority: Some("high".to_owned()),
+                    active_form: Some("调研中".to_owned()),
+                },
+                crate::protocol::TodoEntry {
+                    content: "落实".to_owned(),
+                    status: crate::protocol::TodoStatus::Pending,
+                    priority: None,
+                    active_form: None,
+                },
+            ],
+            explanation: Some("先取证再动手".to_owned()),
+        };
+        let mut session = session([
+            Event::TextDelta("回答".to_owned()),
+            Event::Todo(snapshot.clone()),
+            Event::Finished(Finish::new(Status::Completed, "回答")),
+        ]);
+        session.send("请求", SendMode::Immediate).await.unwrap();
+        assert_eq!(
+            session.wait_event().await.unwrap(),
+            Some(SessionEvent::Message(MessageEvent {
+                text: "回答".to_owned(),
+                reasoning: false,
+            }))
+        );
+        // 快照逐字段原样透传给消费方
+        match session.wait_event().await.unwrap() {
+            Some(SessionEvent::Todo { snapshot: carried }) => {
+                assert_eq!(carried, snapshot, "快照原样透传");
+            }
+            other => panic!("expected SessionEvent::Todo, got {other:?}"),
+        }
+        // apply 忽略：不改会话状态聚合（文本/工具/终态均不受影响）
+        assert!(session.tool_calls.is_empty());
+        assert!(session.files_read.is_empty());
+        assert!(matches!(
+            session.wait_event().await.unwrap(),
+            Some(SessionEvent::Finished(_))
+        ));
+        assert_eq!(session.result().unwrap().status, Status::Completed);
+        assert_eq!(session.result().unwrap().text, "回答");
+    }
+
+    /// TodoWrite 活动行归为 ActivityKind::Todo，不再被 contains("write")
+    /// 误标为 WriteFile。
+    #[test]
+    fn todo_tool_activity_rows_are_typed_todo() {
+        assert_eq!("TodoWrite".activity_kind(), ActivityKind::Todo);
+        assert_eq!("todo_write".activity_kind(), ActivityKind::Todo);
+        assert_eq!("update_plan".activity_kind(), ActivityKind::Todo);
+        // 写类工具不受影响。
+        assert_eq!("Write".activity_kind(), ActivityKind::WriteFile);
     }
 
     #[tokio::test]

@@ -361,6 +361,62 @@ async fn channel_selection_entry_upsert() {
     assert!(db.find_channel_key("sess_none").await.unwrap().is_none());
 }
 
+// ---------- 6.5 待办状态 entry ----------
+
+#[tokio::test]
+async fn todo_state_entry_upsert_and_read_back() {
+    let db = fresh_db().await;
+    db.insert_project(&project("prj_1")).await.unwrap();
+    let sid = seed_session(&db, "prj_1", "/tmp/d", "ZCode|t|m", 1, 1).await;
+
+    // 未写过：None
+    assert!(db.find_todo_state(&sid).await.unwrap().is_none());
+
+    // 首写 → 读回一致（status snake_case / activeForm 经 TodoEntry 自身 serde）
+    let snapshot = channel::TodoSnapshot {
+        entries: vec![
+            channel::TodoEntry {
+                content: "第一步".into(),
+                status: channel::TodoStatus::Completed,
+                priority: Some("high".into()),
+                active_form: None,
+            },
+            channel::TodoEntry {
+                content: "第二步".into(),
+                status: channel::TodoStatus::InProgress,
+                priority: None,
+                active_form: Some("正在第二步".into()),
+            },
+        ],
+        explanation: Some("两步走".into()),
+    };
+    db.upsert_todo_state(&sid, &snapshot, 10).await.unwrap();
+    assert_eq!(db.find_todo_state(&sid).await.unwrap().unwrap(), snapshot);
+    assert_eq!(count(&db, "session_entry").await, 2, "渠道选择 + 待办各一行");
+
+    // 覆盖写：仍是同一行，内容整体换成新快照
+    let next = channel::TodoSnapshot {
+        entries: vec![channel::TodoEntry {
+            content: "唯一一步".into(),
+            status: channel::TodoStatus::Completed,
+            priority: None,
+            active_form: None,
+        }],
+        explanation: None,
+    };
+    db.upsert_todo_state(&sid, &next, 20).await.unwrap();
+    assert_eq!(count(&db, "session_entry").await, 2, "覆盖写不新增行");
+    assert_eq!(db.find_todo_state(&sid).await.unwrap().unwrap(), next);
+
+    // 会话隔离：另一会话读不到
+    let other = seed_session(&db, "prj_1", "/tmp/d", "ZCode|t|m", 1, 1).await;
+    assert!(db.find_todo_state(&other).await.unwrap().is_none());
+
+    // 级联删除覆盖 todo entry
+    db.delete_session_cascade(&sid).await.unwrap();
+    assert!(db.find_todo_state(&sid).await.unwrap().is_none());
+}
+
 // ---------- 7. 会话创建与重命名语义 ----------
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 use crate::protocol::{
     Confidence, Error, Event, FileChange, FileChangeKind, FileRead, FileReadSource, Finish,
-    HarnessKind, ObservationSource, Status, ToolCall, ToolStatus,
+    HarnessKind, ObservationSource, Status, TodoSnapshot, ToolCall, ToolStatus, is_todo_plan_tool,
 };
 use crate::session::{Backend, BackendFuture, SendMode};
 use crate::utils::json::JsonValueExt;
@@ -1006,6 +1006,26 @@ impl ToolEvent {
 }
 
 impl ToolEvent {
+    /// 从工具 input 里取 todo/plan 容器数组：input 可能已是 object（tool_use
+    /// 结构 / 已解析成功的流式增量），也可能是尚未解析成 JSON 的原始字符串
+    /// （流式聚合中间态）。按候选容器键 `todos|plan|steps|items` 取第一个
+    /// 数组容器，交给 [`TodoSnapshot::parse`] 归一化。
+    fn todo_snapshot(&self) -> Option<TodoSnapshot> {
+        let parsed;
+        let object = match &self.input {
+            Value::Object(object) => object,
+            Value::String(text) => {
+                parsed = serde_json::from_str::<Value>(text).ok()?;
+                parsed.as_object()?
+            }
+            _ => return None,
+        };
+        let container = ["todos", "plan", "steps", "items"].iter().find_map(|key| {
+            object.get(*key).filter(|value| value.is_array())
+        })?;
+        TodoSnapshot::parse(container, None)
+    }
+
     fn events(self) -> Vec<Event> {
         let status = self.status.tool_status();
         let mut events = vec![Event::ToolCall(ToolCall {
@@ -1017,6 +1037,14 @@ impl ToolEvent {
             error: None,
             sequence: 0,
         })];
+        // todo/plan 类工具（TodoWrite/UpdatePlan，不含 TodoRead）携带全量
+        // 待办快照时提升为一等 Event::Todo；`tool_input_start` 态无 input
+        // 天然跳过，`tool_input_end`/`tool_call` 两态各发一次由上游幂等覆盖。
+        if is_todo_plan_tool(&self.name) {
+            if let Some(snapshot) = self.todo_snapshot() {
+                events.push(Event::Todo(snapshot));
+            }
+        }
         let path = self
             .input
             .file_path()
@@ -1226,6 +1254,7 @@ impl CliStatus for str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::TodoStatus;
 
     /// 裸文本行路由回归（2026-10-23）：结构化 CLI 首行即裸文本仍快失败
     ///（没进 JSON 模式）；但已被 JSON 事件证明健康的会话中途混入的裸文本
@@ -1366,6 +1395,47 @@ mod tests {
             if file.path == "src/lib.rs"
                 && file.source == FileReadSource::ToolInput
                 && file.confidence == Confidence::Medium));
+    }
+
+    /// claude 非流式 assistant 行的 TodoWrite tool_use 提升为 Event::Todo，
+    /// activeForm 进行时文案原样保留。
+    #[test]
+    fn claude_assistant_todo_write_promotes_todo_snapshot() {
+        let mut backend = CliBackend::new_with_config(crate::protocol::SessionConfig::default_for(
+            HarnessKind::ClaudeCode,
+        ), None)
+        .unwrap();
+        let events = backend.parse_json(&serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    { "type": "tool_use", "id": "toolw-1", "name": "TodoWrite", "input": {
+                        "todos": [
+                            { "content": "抓证据", "status": "in_progress",
+                              "priority": "medium", "activeForm": "正在抓取证据" },
+                            { "content": "写结论", "status": "pending" }
+                        ]
+                    } }
+                ]
+            }
+        }));
+        assert!(matches!(&events[0], Event::ToolCall(call)
+            if call.id.as_deref() == Some("toolw-1") && call.name == "TodoWrite"));
+        let Some(snapshot) = events.iter().find_map(|event| match event {
+            Event::Todo(snapshot) => Some(snapshot),
+            _ => None,
+        }) else {
+            panic!("TodoWrite tool_use 应产出 Event::Todo");
+        };
+        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(snapshot.entries[0].status, TodoStatus::InProgress);
+        assert_eq!(snapshot.entries[0].priority.as_deref(), Some("medium"));
+        assert_eq!(
+            snapshot.entries[0].active_form.as_deref(),
+            Some("正在抓取证据")
+        );
+        assert_eq!(snapshot.entries[1].status, TodoStatus::Pending);
+        assert_eq!(snapshot.entries[1].active_form, None);
     }
 
     #[test]
@@ -1511,6 +1581,76 @@ mod tests {
         assert!(matches!(&events[0], Event::ToolCall(call)
             if call.status == ToolStatus::Completed && call.input.is_some()));
         assert!(matches!(&events[1], Event::FileRead(file) if file.path == "src/lib.rs"));
+    }
+
+    /// todo/plan 工具的完整 input（`tool_input_end`/`tool_call` 两态）在
+    /// ToolCall 之外提升出全量 Event::Todo 快照。
+    #[test]
+    fn zcode_todo_tool_input_promotes_todo_snapshot() {
+        let mut backend = zcode_backend();
+        for kind in ["tool_input_end", "tool_call"] {
+            let events = backend.parse_json(&serde_json::json!({
+                "type": "model.streaming",
+                "payload": {
+                    "kind": kind,
+                    "toolCallId": "tc-9",
+                    "toolName": "TodoWrite",
+                    "input": {
+                        "todos": [
+                            { "content": "调研", "status": "in_progress", "priority": "high" },
+                            { "content": "落实", "status": "pending", "activeForm": "落实中" }
+                        ]
+                    }
+                }
+            }));
+            assert!(matches!(&events[0], Event::ToolCall(call) if call.name == "TodoWrite"));
+            let Some(snapshot) = events.iter().find_map(|event| match event {
+                Event::Todo(snapshot) => Some(snapshot),
+                _ => None,
+            }) else {
+                panic!("{kind} 态应产出 Event::Todo");
+            };
+            assert_eq!(snapshot.entries.len(), 2);
+            assert_eq!(snapshot.entries[0].status, TodoStatus::InProgress);
+            assert_eq!(snapshot.entries[0].priority.as_deref(), Some("high"));
+            assert_eq!(snapshot.entries[1].active_form.as_deref(), Some("落实中"));
+        }
+    }
+
+    /// `tool_input_start` 态尚无 input，不产 Todo；TodoRead（读侧）与空
+    /// `{}` input 同样不产。
+    #[test]
+    fn zcode_todo_tool_without_todos_input_stays_tool_call_only() {
+        let mut backend = zcode_backend();
+        let events = backend.parse_json(&serde_json::json!({
+            "type": "model.streaming",
+            "payload": {
+                "kind": "tool_input_start",
+                "toolCallId": "tc-10",
+                "toolName": "TodoWrite"
+            }
+        }));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], Event::ToolCall(call)
+            if call.name == "TodoWrite" && call.input.is_none()));
+
+        // TodoRead 不在提升名单；空 object 无容器键也不提升。
+        for (name, input) in [
+            ("TodoRead", serde_json::json!({ "todos": [] })),
+            ("TodoWrite", serde_json::json!({})),
+        ] {
+            let events = backend.parse_json(&serde_json::json!({
+                "type": "model.streaming",
+                "payload": {
+                    "kind": "tool_call",
+                    "toolCallId": "tc-11",
+                    "toolName": name,
+                    "input": input
+                }
+            }));
+            assert_eq!(events.len(), 1, "{name} 不应产出 Todo 事件");
+            assert!(matches!(&events[0], Event::ToolCall(_)));
+        }
     }
 
     #[test]

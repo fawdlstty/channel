@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "channel"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "ashpd",
  "atspi",

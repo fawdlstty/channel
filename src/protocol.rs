@@ -1404,6 +1404,137 @@ impl FileRead {
     }
 }
 
+/// 归一化后的待办条目状态。各引擎的原始写法（`in_progress`/`inProgress`/
+/// `done` 等）统一收敛到这三个值。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// 待办快照中的一条条目。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoEntry {
+    pub content: String,
+    pub status: TodoStatus,
+    /// `"high"`/`"medium"`/`"low"`；源里没有或不合法则 `None`（统一小写存储）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    /// claude 风格的进行时文案（如 "Writing the parser"）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
+}
+
+/// 一次待办/计划的全量快照。所有已知来源（TodoWrite 工具 input、ACP
+/// `plan` 更新、Codex `turn/plan/updated`）都是整表快照，消费方逐次整体
+/// 覆盖即可，无需做增量合并。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TodoSnapshot {
+    pub entries: Vec<TodoEntry>,
+    /// codex `turn/plan/updated` 附带的计划解释；其他来源为 `None`。
+    pub explanation: Option<String>,
+}
+
+/// todo/plan 类工具名判定：小写并去掉 `_`/`-`/空格后等于 `todowrite` 或
+/// `updateplan`（不含 todoread——读侧不产生快照）。StructuredCli 提升点
+/// 与 session 活动分类共用同一判定，避免两处口径漂移。
+pub(crate) fn is_todo_plan_tool(name: &str) -> bool {
+    let normalized: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !matches!(ch, '_' | '-' | ' '))
+        .collect();
+    matches!(normalized.as_str(), "todowrite" | "updateplan")
+}
+
+impl TodoSnapshot {
+    /// 从工具 input / plan 容器 JSON 解析全量待办快照；无有效条目返回 `None`。
+    ///
+    /// `container` 必须是条目数组（调用方负责先按容器键取出，如
+    /// `todos`/`plan`/`steps`/`items`）；条目文本字段回退链
+    /// `content`/`step`/`title`/`text`/`activeForm` 取第一个非空字符串，
+    /// 全空跳过该条。status 归一化：小写、`-`→`_`，`in_progress`/`inprogress`/
+    /// `started`/`active`/`running` → 进行中，`completed`/`done`/`cancelled`
+    /// → 已完成，其余 → 待办；若所有条目都缺 status 键，则按 zcode 引擎
+    /// 外部 plan 摄取器同款语义取第 0 项进行中、其余待办。
+    pub fn parse(container: &serde_json::Value, explanation: Option<String>) -> Option<Self> {
+        let items = container.as_array()?;
+        let mut entries = Vec::new();
+        // status 缺失计数：全部缺失时启用「第 0 项进行中」推断。
+        let mut statuses: Vec<Option<TodoStatus>> = Vec::new();
+        for item in items {
+            let Some(object) = item.as_object() else {
+                statuses.push(None);
+                continue;
+            };
+            let field = |keys: &[&str]| -> Option<String> {
+                keys.iter().find_map(|key| {
+                    object
+                        .get(*key)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_owned)
+                })
+            };
+            let Some(content) =
+                field(&["content", "step", "title", "text", "activeForm"])
+            else {
+                statuses.push(None);
+                continue;
+            };
+            let raw_status = object
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(|status| status.replace('-', "_").to_ascii_lowercase());
+            let status = raw_status.as_deref().map(|status| match status {
+                "in_progress" | "inprogress" | "started" | "active" | "running" => {
+                    TodoStatus::InProgress
+                }
+                "completed" | "done" | "cancelled" => TodoStatus::Completed,
+                _ => TodoStatus::Pending,
+            });
+            let priority = object
+                .get("priority")
+                .and_then(serde_json::Value::as_str)
+                .map(|priority| priority.to_ascii_lowercase())
+                .filter(|priority| matches!(priority.as_str(), "high" | "medium" | "low"));
+            let active_form = object
+                .get("activeForm")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned);
+            entries.push(TodoEntry {
+                content,
+                status: status.unwrap_or(TodoStatus::Pending),
+                priority,
+                active_form,
+            });
+            statuses.push(status);
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        if statuses.iter().all(Option::is_none) {
+            // 全量缺 status：第 0 项进行中，其余待办（zcode 摄取器语义）。
+            for (index, entry) in entries.iter_mut().enumerate() {
+                entry.status = if index == 0 {
+                    TodoStatus::InProgress
+                } else {
+                    TodoStatus::Pending
+                };
+            }
+        }
+        Some(Self {
+            entries,
+            explanation,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     TextDelta(String),
@@ -1417,6 +1548,11 @@ pub enum Event {
     ToolCall(ToolCall),
     FileRead(FileRead),
     FileChange(FileChange),
+    /// 待办/计划一等事件：结构化 CLI 的 TodoWrite/UpdatePlan 工具调用、
+    /// ACP 的 `plan` 会话更新与 Codex 的 `turn/plan/updated` 通知统一
+    /// 归一到此变体。`TodoSnapshot` 是全量快照，逐次事件整体覆盖上一份，
+    /// 不做增量合并。
+    Todo(TodoSnapshot),
     PermissionRequired {
         id: String,
         detail: String,
@@ -1500,3 +1636,91 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn todo_snapshot_parse_normalizes_camel_case_and_keeps_extras() {
+        let snapshot = TodoSnapshot::parse(
+            &json!([
+                { "content": "调研", "status": "inProgress", "priority": "HIGH", "activeForm": "调研中" },
+                { "step": "落实", "status": "completed" }
+            ]),
+            Some("计划说明".to_owned()),
+        )
+        .expect("valid snapshot");
+        assert_eq!(snapshot.explanation.as_deref(), Some("计划说明"));
+        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(snapshot.entries[0].content, "调研");
+        assert_eq!(snapshot.entries[0].status, TodoStatus::InProgress);
+        assert_eq!(snapshot.entries[0].priority.as_deref(), Some("high"));
+        assert_eq!(snapshot.entries[0].active_form.as_deref(), Some("调研中"));
+        // 文本回退链：content 缺失时落到 step。
+        assert_eq!(snapshot.entries[1].content, "落实");
+        assert_eq!(snapshot.entries[1].status, TodoStatus::Completed);
+        assert_eq!(snapshot.entries[1].priority, None);
+    }
+
+    #[test]
+    fn todo_snapshot_parse_infers_status_when_all_missing() {
+        let snapshot = TodoSnapshot::parse(
+            &json!([
+                { "content": "第一步" },
+                { "content": "第二步", "priority": "urgent" },
+                { "title": "第三步" }
+            ]),
+            None,
+        )
+        .expect("valid snapshot");
+        // 全量缺 status：第 0 项进行中，其余待办；非法 priority 丢弃。
+        assert_eq!(snapshot.entries[0].status, TodoStatus::InProgress);
+        assert_eq!(snapshot.entries[1].status, TodoStatus::Pending);
+        assert_eq!(snapshot.entries[2].status, TodoStatus::Pending);
+        assert_eq!(snapshot.entries[1].priority, None);
+        assert_eq!(snapshot.explanation, None);
+    }
+
+    #[test]
+    fn todo_snapshot_parse_rejects_empty_and_textless_entries() {
+        // 空容器与全空条目都不构成快照。
+        assert_eq!(TodoSnapshot::parse(&json!([]), None), None);
+        assert_eq!(TodoSnapshot::parse(&json!([{}, {"content": ""}]), None), None);
+        // 非 object 条目无文本字段，跳过；剩余条目仍解析。
+        let snapshot = TodoSnapshot::parse(
+            &json!(["噪声", { "content": "有效条目", "status": "done" }]),
+            None,
+        )
+        .expect("one valid entry");
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].status, TodoStatus::Completed);
+    }
+
+    #[test]
+    fn todo_snapshot_parse_maps_dash_and_unknown_statuses() {
+        let snapshot = TodoSnapshot::parse(
+            &json!([
+                { "content": "a", "status": "in-progress" },
+                { "content": "b", "status": "weird" },
+                { "content": "c", "status": "cancelled" }
+            ]),
+            None,
+        )
+        .expect("valid snapshot");
+        assert_eq!(snapshot.entries[0].status, TodoStatus::InProgress);
+        assert_eq!(snapshot.entries[1].status, TodoStatus::Pending);
+        assert_eq!(snapshot.entries[2].status, TodoStatus::Completed);
+    }
+
+    #[test]
+    fn todo_plan_tool_name_matches_normalized_aliases() {
+        assert!(is_todo_plan_tool("TodoWrite"));
+        assert!(is_todo_plan_tool("todo_write"));
+        assert!(is_todo_plan_tool("update-plan"));
+        assert!(is_todo_plan_tool("Update Plan"));
+        assert!(!is_todo_plan_tool("TodoRead"));
+        assert!(!is_todo_plan_tool("write"));
+    }
+}

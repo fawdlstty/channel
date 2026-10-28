@@ -3,7 +3,8 @@
 > 维护规则见 [AGENTS.md](AGENTS.md)。每一项内容都标注来源：
 > 【用户要求】= 用户明确提出的改动/约束（含原始诉求语义）；
 > 【AI 演绎】= AI 为落实用户要求而自行推导补全的细节，尚未逐项确认。
-> 最近更新：2026-10-19（新增 §3.8 历史存储 `history` feature、ormer 依赖
+> 最近更新：2026-10-28（新增 Todo 待办一等事件，见 §3.1；
+> 此前 2026-10-19：新增 §3.8 历史存储 `history` feature、ormer 依赖
 > path 统一，见 §3.8/§4/§5；此前 2026-10-10：Session 附件传递、
 > ContextUsage 事件、ZCode CLI
 > `--mode`/`--attach`，见 §3.1/§3.2；此前 2026-09-28：ZCode Auto 后端
@@ -66,6 +67,19 @@
   `ContextUsage { used, total }`，后端流携带用量投影时透出（ZCode 取自
   result 行的 `projection.contextUsed`/`projection.contextWindow`，缺字段
   或非数值静默跳过），无该数据的后端不产出该事件。
+- 【用户要求，2026-10-28】Todo（待办/计划）一等事件归一化层：
+  `Event::Todo(TodoSnapshot)` / `SessionEvent::Todo { snapshot }`——
+  三个来源统一收敛：① StructuredCli（zcode/claude）的 TodoWrite/
+  UpdatePlan 工具调用在 ToolCall 之外按容器键 `todos|plan|steps|items`
+  提升快照（TodoRead 不提升）；② ACP `session/update` 的 `plan` 更新
+  （原先落未知分支被过滤）；③ Codex app-server `turn/plan/updated`
+  通知（`inProgress` 驼峰、explanation 解释字段，原先落 Raw 被过滤）。
+  快照语义为全量整表、逐次覆盖，不做增量合并；条目文本字段回退链
+  `content/step/title/text/activeForm`，status 归一化为
+  pending/in_progress/completed（全量缺省时第 0 项进行中、其余待办），
+  priority 仅收 high/medium/low。会话状态聚合忽略该事件（透传事实，
+  与 CompactionBoundary 同款）；活动分类新增 `ActivityKind::Todo`，
+  TodoWrite 活动行不再误标 WriteFile。
 - 【AI 演绎】`runtime`：harness 可执行文件发现（PATH + 平台特化探测）
   与 cwd 解析。
 

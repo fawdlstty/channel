@@ -91,6 +91,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SessionEvent::CompactionBoundary { .. } => {
                 println!("\n[t+{:.3}s] compaction boundary", at.as_secs_f64());
             }
+            SessionEvent::Todo { snapshot } => {
+                println!("\n[t+{:.3}s] todo snapshot: {} entries", at.as_secs_f64(), snapshot.entries.len());
+            }
             SessionEvent::Finished(finish) => {
                 println!("\n[t+{:.3}s] finished: {:?} text({} chars)",
                     at.as_secs_f64(), finish.status, finish.text.chars().count());
