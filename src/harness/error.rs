@@ -61,6 +61,24 @@ pub enum Error {
     #[error("unknown kind: {kind}（可用: {:?}）", crate::harness::serve::KNOWN_EVENT_KINDS)]
     UnknownEventKind { kind: String },
 
+    /// askUser 缺 questions 参数（反向提问载荷；questions 元素须为
+    /// protocol::UserQuestion 的 serde 形状，元素非法走 BadRequest）。
+    #[error("askUser 需要 {{\"questions\":[...]}}")]
+    AskQuestionsMissing,
+
+    /// answer 缺被应答的 ask id。
+    #[error("answer 需要 {{\"id\":\"ask-N\"}}")]
+    AnswerIdMissing,
+
+    /// answer 与任何未决 ask 不匹配（已超时/已应答/从未登记；迟到 answer
+    /// 不给原 id 写第二次响应）。
+    #[error("unknown ask: {id}（ask 已超时或已应答，或从未登记）")]
+    UnknownAsk { id: String },
+
+    /// askUser 反向等待超时（deadline 到点仍未收到 answer，已作废该提问）。
+    #[error("提问超时（上限 {limit_ms} ms）：客户端未在限时内回答，已作废该 ask")]
+    AskTimedOut { limit_ms: u64 },
+
     /* --- tools 工具面（src/tools；参数校验文案直出 serve 响应） ------------ */
 
     /// 感知类 op 在探测不可用（无 UIA / 非 Windows）时的失败闭合。
@@ -700,6 +718,28 @@ mod tests {
         assert_eq!(Error::UnknownOp("x".into()).code(), None);
         assert_eq!(Error::BadRequest(serde_json::from_str::<serde_json::Value>("{oops").unwrap_err()).code(), None);
         assert_eq!(Error::OpTimeout { limit_ms: 1 }.code(), None);
+    }
+
+    /// 反向提问（askUser/answer）协议层新变体：Display 文案为自拟新契约，
+    /// 用字面量锁定防无意识漂移；协议层错误一律不加机器码（与
+    /// BadRequest/OpTimeout 同类，`code` 键不出现在 ok:false 行）。
+    #[test]
+    fn ask_user_variants_display_and_code() {
+        assert_eq!(Error::AskQuestionsMissing.to_string(), r#"askUser 需要 {"questions":[...]}"#);
+        assert_eq!(Error::AnswerIdMissing.to_string(), r#"answer 需要 {"id":"ask-N"}"#);
+        assert_eq!(
+            Error::UnknownAsk { id: "ask-1".into() }.to_string(),
+            "unknown ask: ask-1（ask 已超时或已应答，或从未登记）"
+        );
+        assert_eq!(
+            Error::AskTimedOut { limit_ms: 200 }.to_string(),
+            "提问超时（上限 200 ms）：客户端未在限时内回答，已作废该 ask"
+        );
+        // 协议层错误无机器码。
+        assert_eq!(Error::AskQuestionsMissing.code(), None);
+        assert_eq!(Error::AnswerIdMissing.code(), None);
+        assert_eq!(Error::UnknownAsk { id: "ask-1".into() }.code(), None);
+        assert_eq!(Error::AskTimedOut { limit_ms: 1 }.code(), None);
     }
 
     /// Linux 平台扩展变体（upgrade.md §7.1/§7.3：X11/XTest/剪贴板/

@@ -777,8 +777,10 @@ impl crate::protocol::BackendSpec {
             }
             crate::protocol::BackendSpec::Auto => kind.cli_command(),
             crate::protocol::BackendSpec::CodexAppServer { .. }
+            | crate::protocol::BackendSpec::ZcodeAppServer { .. }
             | crate::protocol::BackendSpec::Acp { .. } => Err(Error::InvalidConfig(
-                "CLI backend cannot use an ACP or Codex App Server specification".to_owned(),
+                "CLI backend cannot use an ACP, Codex or Zcode App Server specification"
+                    .to_owned(),
             )),
         }
     }

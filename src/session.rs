@@ -3,10 +3,11 @@ use crate::protocol::{
     Confidence, ConversationSpec, Error, Event, FileChange, FileRead, FileReadSource, Finish,
     HarnessKind, HarnessState, ModelInfo, ObservationSource, PermissionInfo, Resumability,
     RuntimeInfo, SessionConfig, SessionInfo, Shareability, Status, TodoSnapshot, ToolCall,
-    ToolStatus, TransportKind, TurnInfo, VisibilityInfo, VisibilityState, WorkspaceInfo,
+    ToolStatus, TransportKind, TurnInfo, UserInputRequest, VisibilityInfo, VisibilityState,
+    WorkspaceInfo,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +46,23 @@ pub(crate) trait Backend: Send {
         Box::pin(async {
             Err(Error::UnsupportedCapability(
                 "this backend cannot respond to permission requests".to_owned(),
+            ))
+        })
+    }
+    /// Answers a pending user-input request emitted as
+    /// [`SessionEvent::UserInput`](SessionEvent::UserInput). The map keys are
+    /// the [`UserQuestion`](crate::protocol::UserQuestion) ids; values are
+    /// the picked option labels or free-form text. Backends that cannot
+    /// receive responses fail with `UnsupportedCapability`.
+    fn respond_user_input<'a>(
+        &'a mut self,
+        id: &'a str,
+        answers: BTreeMap<String, Vec<String>>,
+    ) -> BackendFuture<'a, ()> {
+        let _ = (id, answers);
+        Box::pin(async {
+            Err(Error::UnsupportedCapability(
+                "this backend cannot respond to user input requests".to_owned(),
             ))
         })
     }
@@ -130,6 +148,12 @@ pub enum SessionEvent {
     Activity(ActivityEvent),
     Message(MessageEvent),
     Permission(PermissionEvent),
+    /// 后端向用户提问（[`Event::UserInputRequired`] 的会话层投影）。宿主
+    /// 收集答案后经 [`Session::respond_user_input`] 以
+    /// [`UserInputRequest::id`](crate::protocol::UserInputRequest) 为句柄应答。
+    UserInput {
+        request: UserInputRequest,
+    },
     /// Context window occupancy reported by the provider for the current turn.
     ContextUsage {
         used: u64,
@@ -190,6 +214,7 @@ pub struct Session {
     session_info: SessionInfo,
     turns: Vec<TurnInfo>,
     pending_permissions: HashSet<String>,
+    pending_user_inputs: HashSet<String>,
     resources: crate::protocol::ResourcePolicy,
     last_error: Option<String>,
     /// Moment the backend last delivered an event, refreshed by every event
@@ -331,6 +356,7 @@ impl crate::protocol::BackendSpec {
     fn backend_kind(&self, kind: &HarnessKind) -> BackendKind {
         match self {
             Self::CodexAppServer { .. } => BackendKind::CodexAppServer,
+            Self::ZcodeAppServer { .. } => BackendKind::ZcodeAppServer,
             Self::Acp { .. } => BackendKind::Acp,
             Self::StructuredCli { .. } => BackendKind::StructuredCli,
             Self::PlainCli { .. } => BackendKind::PlainCli,
@@ -351,6 +377,7 @@ impl crate::protocol::BackendSpec {
     fn command(&self, kind: &HarnessKind) -> Option<String> {
         match self {
             Self::CodexAppServer { command, .. }
+            | Self::ZcodeAppServer { command, .. }
             | Self::Acp { command, .. }
             | Self::StructuredCli { command, .. }
             | Self::PlainCli { command, .. } => Some(command.clone()),
@@ -369,6 +396,7 @@ impl crate::protocol::BackendSpec {
     fn args(&self, kind: &HarnessKind) -> Vec<String> {
         match self {
             Self::CodexAppServer { args, .. }
+            | Self::ZcodeAppServer { args, .. }
             | Self::Acp { args, .. }
             | Self::StructuredCli { args, .. }
             | Self::PlainCli { args, .. } => args.clone(),
@@ -572,6 +600,7 @@ impl Session {
             session_info,
             turns: Vec::new(),
             pending_permissions: HashSet::new(),
+            pending_user_inputs: HashSet::new(),
             resources: config.runtime.resources,
             last_error: None,
             last_event_at: Instant::now(),
@@ -619,6 +648,7 @@ impl Session {
         self.next_sequence = 0;
         self.finish = None;
         self.pending_permissions.clear();
+        self.pending_user_inputs.clear();
         self.active_turn = true;
         self.status = Status::Running;
         let turn_id = format!(
@@ -881,6 +911,36 @@ impl Session {
         Ok(())
     }
 
+    /// Answers a pending user-input request emitted as
+    /// [`SessionEvent::UserInput`](SessionEvent::UserInput). The map keys are
+    /// the [`UserQuestion`](crate::protocol::UserQuestion) ids; values are
+    /// the picked option labels (or free-form text). Backends that cannot
+    /// receive responses fail with
+    /// [`Error::UnsupportedCapability`](crate::protocol::Error::UnsupportedCapability).
+    pub async fn respond_user_input(
+        &mut self,
+        id: impl AsRef<str> + Send,
+        answers: BTreeMap<String, Vec<String>>,
+    ) -> Result<(), Error> {
+        if self.status == Status::Closed {
+            return Err(Error::Closed);
+        }
+        let id = id.as_ref();
+        if !self.active_turn {
+            return Err(Error::NoActiveTurn);
+        }
+        if !matches!(self.status, Status::WaitingForUserInput | Status::Running) {
+            return Err(Error::NoActiveTurn);
+        }
+        self.backend.respond_user_input(id, answers).await?;
+        self.pending_user_inputs.remove(id);
+        if self.status == Status::WaitingForUserInput {
+            self.status = Status::Running;
+            self.touch_info();
+        }
+        Ok(())
+    }
+
     pub fn info(&self) -> &SessionInfo {
         &self.session_info
     }
@@ -979,6 +1039,9 @@ impl Session {
                     detail: detail.clone(),
                 }))
             }
+            Event::UserInputRequired(request) => Some(SessionEvent::UserInput {
+                request: request.clone(),
+            }),
             Event::Status(status) => {
                 if status.is_terminal() {
                     self.finish.clone().map(SessionEvent::Finished)
@@ -1029,6 +1092,10 @@ impl Session {
             Event::PermissionRequired { id, .. } => {
                 self.pending_permissions.insert(id.clone());
                 self.status = Status::WaitingForPermission;
+            }
+            Event::UserInputRequired(request) => {
+                self.pending_user_inputs.insert(request.id.clone());
+                self.status = Status::WaitingForUserInput;
             }
             Event::Status(status) => self.set_status(*status),
             Event::ContextUsage { .. } => {}
@@ -1709,5 +1776,137 @@ mod tests {
                 ("missing".to_owned(), PermissionResponse::Deny),
             ]
         );
+    }
+
+    /// 用户提问一等事件：状态进 WaitingForUserInput，应答透传 id 与答案，
+    /// 随后清理 pending 并回退 Running（与权限应答同款簿记）。
+    #[tokio::test]
+    async fn user_input_events_can_be_answered_and_tracked() {
+        type Answers = BTreeMap<String, Vec<String>>;
+        static ANSWERS: std::sync::Mutex<Vec<(String, Answers)>> =
+            std::sync::Mutex::new(Vec::new());
+        struct UserInputBackend;
+        impl Backend for UserInputBackend {
+            fn send<'a>(&'a mut self, _message: String) -> BackendFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn next_event<'a>(&'a mut self) -> BackendFuture<'a, Option<Event>> {
+                Box::pin(async {
+                    Ok(Some(Event::UserInputRequired(UserInputRequest {
+                        id: "req-1".to_owned(),
+                        source: None,
+                        questions: vec![crate::protocol::UserQuestion {
+                            id: "q1".to_owned(),
+                            header: Some("Auth".to_owned()),
+                            question: "用哪种认证?".to_owned(),
+                            options: vec![crate::protocol::UserQuestionOption {
+                                label: "OAuth".to_owned(),
+                                description: None,
+                            }],
+                            multi_select: false,
+                        }],
+                        payload: serde_json::json!({ "threadId": "th-1" }),
+                    })))
+                })
+            }
+            fn interrupt<'a>(&'a mut self) -> BackendFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn close<'a>(&'a mut self) -> BackendFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn respond_user_input<'a>(
+                &'a mut self,
+                id: &'a str,
+                answers: BTreeMap<String, Vec<String>>,
+            ) -> BackendFuture<'a, ()> {
+                Box::pin(async move {
+                    ANSWERS.lock().unwrap().push((id.to_owned(), answers));
+                    Ok(())
+                })
+            }
+        }
+
+        let mut session = Session::with_backend_config(
+            SessionConfig::default_for(HarnessKind::Codex),
+            Some("test-session".to_owned()),
+            Box::new(UserInputBackend),
+            None,
+        );
+        session.send("请求", SendMode::Immediate).await.unwrap();
+        let request = match session.wait_event().await.unwrap() {
+            Some(SessionEvent::UserInput { request }) => request,
+            other => panic!("expected SessionEvent::UserInput, got {other:?}"),
+        };
+        assert_eq!(request.id, "req-1");
+        assert_eq!(request.questions.len(), 1);
+        assert_eq!(request.questions[0].id, "q1");
+        assert_eq!(request.questions[0].options[0].label, "OAuth");
+        assert_eq!(session.state(), Status::WaitingForUserInput);
+        let mut answers = BTreeMap::new();
+        answers.insert("q1".to_owned(), vec!["OAuth".to_owned()]);
+        session
+            .respond_user_input("req-1", answers.clone())
+            .await
+            .unwrap();
+        assert_eq!(session.state(), Status::Running);
+        // 未在 pending 的 id 仍透传给后端，由后端自行报错（与权限应答一致）。
+        session
+            .respond_user_input("missing", BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            *ANSWERS.lock().unwrap(),
+            vec![
+                ("req-1".to_owned(), answers),
+                ("missing".to_owned(), BTreeMap::new()),
+            ]
+        );
+    }
+
+    /// 默认 Backend 实现（未覆写 respond_user_input）在 WaitingForUserInput
+    /// 下应答报 UnsupportedCapability 且簿记不被破坏；权限等待态不是用户
+    /// 提问的合法应答窗口，被状态门拒绝。
+    #[tokio::test]
+    async fn user_input_responses_default_to_unsupported_capability() {
+        let mut input_session = session([Event::UserInputRequired(UserInputRequest {
+            id: "req-1".to_owned(),
+            source: None,
+            questions: Vec::new(),
+            payload: serde_json::json!({}),
+        })]);
+        input_session.send("请求", SendMode::Immediate).await.unwrap();
+        assert!(matches!(
+            input_session.wait_event().await.unwrap(),
+            Some(SessionEvent::UserInput { .. })
+        ));
+        assert_eq!(input_session.state(), Status::WaitingForUserInput);
+        assert!(matches!(
+            input_session
+                .respond_user_input("req-1", BTreeMap::new())
+                .await,
+            Err(Error::UnsupportedCapability(_))
+        ));
+        // 默认实现报错路径不清理 pending、不改状态。
+        assert_eq!(input_session.state(), Status::WaitingForUserInput);
+
+        let mut permission_session = session([Event::PermissionRequired {
+            id: "perm-1".to_owned(),
+            detail: "run rm -rf".to_owned(),
+        }]);
+        permission_session
+            .send("请求", SendMode::Immediate)
+            .await
+            .unwrap();
+        assert!(matches!(
+            permission_session.wait_event().await.unwrap(),
+            Some(SessionEvent::Permission(_))
+        ));
+        assert!(matches!(
+            permission_session
+                .respond_user_input("perm-1", BTreeMap::new())
+                .await,
+            Err(Error::NoActiveTurn)
+        ));
     }
 }

@@ -50,6 +50,7 @@ use crate::session::Session;
 mod acp;
 mod cli;
 mod codex;
+mod zcode;
 
 /* ---- 桌面感知 harness（原 charness crate；feature `harness`） ----------------- */
 
@@ -92,6 +93,7 @@ pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone, Copy)]
 pub(crate) enum Adapter {
     Codex,
+    Zcode,
     Acp,
     Cli,
 }
@@ -100,6 +102,10 @@ impl Adapter {
     pub(crate) fn for_config(config: &SessionConfig) -> Self {
         match &config.backend {
             BackendSpec::CodexAppServer { .. } => Adapter::Codex,
+            // ZCode app-server (`zcode app-server`): resident two-way NDJSON
+            // sessions with first-class user-input/permission support. The
+            // headless structured CLI stays the Auto default for ZCode.
+            BackendSpec::ZcodeAppServer { .. } => Adapter::Zcode,
             BackendSpec::Acp { .. } => Adapter::Acp,
             BackendSpec::Auto => match config.kind {
                 HarnessKind::Codex => Adapter::Codex,
@@ -123,6 +129,18 @@ impl Adapter {
     ) -> Result<HarnessDiscovery, crate::protocol::Error> {
         match self {
             Self::Codex => self.initialize_codex(backend, init).await,
+            Self::Zcode => {
+                let initialization = zcode::ZcodeBackend::initialize(backend, init)?;
+                Ok(HarnessDiscovery::discover(
+                    &HarnessKind::ZCode,
+                    BackendKind::ZcodeAppServer,
+                    &initialization.command,
+                    &initialization.args,
+                    initialization.executable,
+                    TransportKind::Stdio,
+                    None,
+                ))
+            }
             Self::Acp => {
                 let initialization = acp::AcpBackend::initialize(&kind, backend, init).await?;
                 Ok(HarnessDiscovery::discover(
@@ -188,6 +206,12 @@ impl Adapter {
                 codex::CodexBackend::create_session_with_config(config, first_message, initialized)
                     .await
             }
+            // The verified app-server `session/send` carries plain text only;
+            // attachments are dropped silently (default Backend fallback).
+            Self::Zcode => {
+                zcode::ZcodeBackend::create_session_with_config(config, first_message, initialized)
+                    .await
+            }
             Self::Acp => {
                 acp::AcpBackend::create_session_with_config(config, first_message, initialized)
                     .await
@@ -215,6 +239,7 @@ impl BackendKind {
         match self {
             BackendKind::Acp => acp::AcpBackend::supported_capabilities(),
             BackendKind::CodexAppServer => codex::CodexBackend::supported_capabilities(),
+            BackendKind::ZcodeAppServer => zcode::ZcodeBackend::supported_capabilities(),
             BackendKind::StructuredCli => cli::CliBackend::structured_capabilities(kind),
             BackendKind::PlainCli => cli::CliBackend::plain_capabilities(),
         }

@@ -23,6 +23,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 is_newline = ev.text.ends_with('\n');
             }
             channel::SessionEvent::Permission(ev) => println!("Permission: {ev:?}"),
+            channel::SessionEvent::UserInput { request } => {
+                println!("UserInput: {request:?}")
+            }
             channel::SessionEvent::ContextUsage { used, total } => {
                 println!("ContextUsage: {used}/{total}")
             }

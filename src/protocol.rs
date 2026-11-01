@@ -590,6 +590,13 @@ pub enum BackendSpec {
         command: String,
         args: Vec<String>,
     },
+    /// ZCode app-server 子命令（`zcode app-server`，codex-cli 风格 NDJSON
+    /// JSON-RPC 但无 jsonrpc 信封字段）；command 支持多段启动形态的拆分
+    /// （如 `node` + `zcode.cjs`），`app-server` 由适配器兜底追加。
+    ZcodeAppServer {
+        command: String,
+        args: Vec<String>,
+    },
     Acp {
         command: String,
         args: Vec<String>,
@@ -635,6 +642,7 @@ pub enum TransportKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     CodexAppServer,
+    ZcodeAppServer,
     Acp,
     StructuredCli,
     PlainCli,
@@ -1128,6 +1136,8 @@ pub struct CapabilitySet {
     pub network_access_control: bool,
     pub permission_requests: bool,
     pub permission_responses: bool,
+    pub user_input_requests: bool,
+    pub user_input_responses: bool,
     pub turn_cancel: bool,
     pub session_close: bool,
     pub provider_persistence: bool,
@@ -1154,6 +1164,8 @@ impl CapabilitySet {
             network_access_control: true,
             permission_requests: true,
             permission_responses: true,
+            user_input_requests: true,
+            user_input_responses: true,
             turn_cancel: true,
             session_close: true,
             provider_persistence: true,
@@ -1189,6 +1201,8 @@ pub enum Capability {
     NetworkAccessControl,
     PermissionRequests,
     PermissionResponses,
+    UserInputRequests,
+    UserInputResponses,
     TurnCancel,
     SessionClose,
     ProviderPersistence,
@@ -1272,6 +1286,8 @@ pub enum Status {
     Idle,
     Running,
     WaitingForPermission,
+    /// 等待宿主应答用户提问（[`Event::UserInputRequired`]）。
+    WaitingForUserInput,
     Completed,
     Interrupted,
     Failed,
@@ -1535,6 +1551,51 @@ impl TodoSnapshot {
     }
 }
 
+/// 一次用户提问里的单个可选项。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionOption {
+    pub label: String,
+    /// 选项的补充说明文案；来源未提供时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// 归一化后的单个问题。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestion {
+    /// 归一化应答键：应答时以该值为键回传答案（Codex 用协议侧的
+    /// `question.id`；未来 ZCode 后端用题干文本）。
+    pub id: String,
+    /// 短标签（UI 侧的分组标题）；来源未提供时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// 题干。
+    pub question: String,
+    /// 可选项列表；为空表示纯自由文本（来源未提供任何选项）。
+    #[serde(default)]
+    pub options: Vec<UserQuestionOption>,
+    /// 是否允许多选；来源没有该字段时恒为单选（`false`，如 Codex）。
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+/// 归一化后的"向用户提问"请求（[`Event::UserInputRequired`] 的载荷）。
+/// 宿主收集答案后以 `id` 为句柄经 `Session::respond_user_input` 回传后端。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UserInputRequest {
+    /// 应答句柄：原样传回 `Session::respond_user_input`（Codex 侧为
+    /// JSON-RPC server request id 的字符串化）。
+    pub id: String,
+    /// 来源标签（工具名 / MCP server 名等）；Codex 侧为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub questions: Vec<UserQuestion>,
+    /// 后端原始 params 原样透传（先例：[`Event::CompactionBoundary`]），
+    /// 供宿主读取 `threadId`/`turnId`/`itemId` 等未归一化字段。
+    pub payload: serde_json::Value,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     TextDelta(String),
@@ -1557,6 +1618,11 @@ pub enum Event {
         id: String,
         detail: String,
     },
+    /// 后端向用户提问的一等事件（Codex `item/tool/requestUserInput` 归一化；
+    /// 其他后端暂无该事件源）。宿主收集答案后经 `Session::respond_user_input`
+    /// 以 `UserInputRequest.id` 为句柄应答；后端不支持应答时该方法报
+    /// `UnsupportedCapability`。
+    UserInputRequired(UserInputRequest),
     Status(Status),
     /// Provider-reported context window occupancy (tokens used / window
     /// total). Emitted by backends whose stream carries usage projections

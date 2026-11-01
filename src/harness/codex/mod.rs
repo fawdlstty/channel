@@ -1,12 +1,12 @@
 use crate::process::JsonlProcess;
 use crate::protocol::{
     Confidence, Error, Event, FileRead, FileReadSource, Finish, Status, TodoSnapshot, ToolCall,
-    ToolStatus,
+    ToolStatus, UserInputRequest, UserQuestion, UserQuestionOption,
 };
 use crate::runtime::HarnessDiscovery;
 use crate::session::{Backend, BackendFuture, PermissionResponse, SendMode};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
 // ws 传输由常驻编译的 potato 承载（HTTP + ws 客户端栈，无独立传输 feature）。
@@ -109,6 +109,9 @@ pub(crate) struct CodexBackend {
     next_request_id: u64,
     queued: VecDeque<Event>,
     pending_permissions: HashMap<String, Value>,
+    /// 未应答用户提问的平行簿记（键为 JSON-RPC id 字符串化，值为原始 id），
+    /// 与 pending_permissions 互不混用：审批流只认 requestApproval 类。
+    pending_user_inputs: HashMap<String, Value>,
     pending_responses: HashMap<u64, String>,
     text: String,
     kill_grace_period: Duration,
@@ -170,6 +173,7 @@ impl CodexBackend {
             next_request_id: 1,
             queued: VecDeque::new(),
             pending_permissions: HashMap::new(),
+            pending_user_inputs: HashMap::new(),
             pending_responses: HashMap::new(),
             text: String::new(),
             kill_grace_period: config.runtime.process.kill_grace_period,
@@ -287,6 +291,14 @@ impl CodexBackend {
             .get("id")
             .cloned()
             .ok_or_else(|| Error::Backend("Codex server request has no id".to_owned()))?;
+        // 用户提问归一化为一等事件；解析不出问题列表时回落通用拒绝路径。
+        if method.ends_with("requestUserInput") {
+            if let Some(request) = user_input_request(message) {
+                self.queued.push_back(Event::UserInputRequired(request));
+                self.pending_user_inputs.insert(id.to_string(), id.clone());
+                return Ok(());
+            }
+        }
         let detail = message
             .get("params")
             .map(Value::to_string)
@@ -323,6 +335,20 @@ impl CodexBackend {
             .await
     }
 
+    async fn respond_user_input(
+        &mut self,
+        id: &str,
+        answers: BTreeMap<String, Vec<String>>,
+    ) -> Result<(), Error> {
+        let id = self
+            .pending_user_inputs
+            .remove(id)
+            .ok_or_else(|| Error::Backend(format!("unknown user input request id: {id}")))?;
+        self.transport
+            .write(&json!({ "id": id, "result": user_input_response(&answers) }))
+            .await
+    }
+
     async fn deny_pending_permissions(&mut self) {
         let ids: Vec<Value> = self.pending_permissions.values().cloned().collect();
         self.pending_permissions.clear();
@@ -330,6 +356,19 @@ impl CodexBackend {
             let _ = self
                 .transport
                 .write(&json!({ "id": id, "result": { "decision": "decline" } }))
+                .await;
+        }
+        // 未应答的用户提问按空答案冲刷（schema 允许空 answers 对象）：codex
+        // 把未答问题按空答案收场，回合得以结束而不是悬挂在等待应答上。
+        let inputs: Vec<Value> = self.pending_user_inputs.values().cloned().collect();
+        self.pending_user_inputs.clear();
+        for id in inputs {
+            let _ = self
+                .transport
+                .write(&json!({
+                    "id": id,
+                    "result": user_input_response(&BTreeMap::new())
+                }))
                 .await;
         }
     }
@@ -501,6 +540,14 @@ impl Backend for CodexBackend {
     ) -> BackendFuture<'a, ()> {
         Box::pin(async move { self.respond(id, response).await })
     }
+
+    fn respond_user_input<'a>(
+        &'a mut self,
+        id: &'a str,
+        answers: BTreeMap<String, Vec<String>>,
+    ) -> BackendFuture<'a, ()> {
+        Box::pin(async move { self.respond_user_input(id, answers).await })
+    }
 }
 
 pub(crate) struct CodexInitialization {
@@ -587,6 +634,8 @@ impl CodexBackend {
             command_execution: true,
             permission_requests: true,
             permission_responses: true,
+            user_input_requests: true,
+            user_input_responses: true,
             turn_cancel: true,
             session_close: true,
             provider_persistence: true,
@@ -1050,16 +1099,77 @@ impl CodexText for Value {
     }
 }
 
+/// 从 `item/tool/requestUserInput` server request 归一化出
+/// [`UserInputRequest`]：`id` 取 JSON-RPC server request id（应答句柄），
+/// `options` 为 `null`（纯自由文本）归一为空 Vec，`payload` 原样透传，
+/// `multi_select` 恒为 `false`（codex wire 无多选字段）。缺 questions 数组
+/// 或解析不出任何问题时返回 `None`，调用方回落 Raw + -32601 拒绝路径。
+fn user_input_request(message: &Value) -> Option<UserInputRequest> {
+    let params = message.get("params")?;
+    let questions = params.get("questions")?.as_array()?;
+    let questions: Vec<UserQuestion> = questions
+        .iter()
+        .filter_map(|question| {
+            Some(UserQuestion {
+                id: question.get("id")?.as_str()?.to_owned(),
+                header: question
+                    .get("header")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                question: question.get("question")?.as_str()?.to_owned(),
+                options: question
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|options| {
+                        options
+                            .iter()
+                            .filter_map(|option| {
+                                Some(UserQuestionOption {
+                                    label: option.get("label")?.as_str()?.to_owned(),
+                                    description: option
+                                        .get("description")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                multi_select: false,
+            })
+        })
+        .collect();
+    if questions.is_empty() {
+        return None;
+    }
+    Some(UserInputRequest {
+        id: message.get("id")?.to_string(),
+        source: None,
+        questions,
+        payload: params.clone(),
+    })
+}
+
+/// 归一化应答 → codex wire 的 result 形状：
+/// `{"answers": {"<question.id>": {"answers": ["<label 或自由文本>"]}}}`。
+/// close 冲刷未答提问时传空 map，得到 schema 允许的空 `{"answers": {}}`。
+fn user_input_response(answers: &BTreeMap<String, Vec<String>>) -> Value {
+    let answers: serde_json::Map<String, Value> = answers
+        .iter()
+        .map(|(question, picked)| (question.clone(), json!({ "answers": picked })))
+        .collect();
+    json!({ "answers": answers })
+}
+
 trait PermissionMethod {
     fn is_permission_request(&self) -> bool;
 }
 
 impl PermissionMethod for str {
+    /// 审批判定只认 requestApproval 类；`item/tool/requestUserInput` 已拆为
+    /// 一等用户提问流（见 `user_input_request`），不再混入审批。
     fn is_permission_request(&self) -> bool {
-        self.contains("requestApproval")
-            || self.contains("approval")
-            || self.contains("requestUserInput")
-            || self.contains("userInput")
+        self.contains("requestApproval") || self.contains("approval")
     }
 }
 
@@ -1500,14 +1610,98 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_approval_and_user_input_requests_without_treating_unknowns_as_permission() {
+    fn recognizes_approval_requests_without_treating_unknowns_or_user_input_as_permission() {
         for method in [
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
-            "item/tool/requestUserInput",
         ] {
             assert!(method.is_permission_request());
         }
+        // requestUserInput 已拆为一等用户提问流，不再算审批。
+        assert!(!"item/tool/requestUserInput".is_permission_request());
         assert!(!"item/newFutureRequest".is_permission_request());
+    }
+
+    /// requestUserInput 归一化：questions 逐字段归一（options null → 空
+    /// Vec，multi_select 恒 false），payload 原样透传，id 为 JSON-RPC
+    /// request id 字符串化；缺/空 questions 返回 None（回落拒绝路径）。
+    #[test]
+    fn normalizes_user_input_requests_from_server_requests() {
+        let message = json!({
+            "id": 17,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "th-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "isBlocking": true,
+                "questions": [
+                    {
+                        "id": "q1",
+                        "header": "Auth",
+                        "question": "用哪种认证?",
+                        "options": [
+                            { "label": "OAuth", "description": "跳转授权" },
+                            { "label": "API key", "description": null }
+                        ]
+                    },
+                    {
+                        "id": "q2",
+                        "header": "Note",
+                        "question": "补充说明?",
+                        "options": null
+                    }
+                ]
+            }
+        });
+        let request = user_input_request(&message).expect("valid user input request");
+        assert_eq!(request.id, "17");
+        assert_eq!(request.source, None);
+        assert_eq!(request.payload, message["params"]);
+        assert_eq!(request.questions.len(), 2);
+        assert_eq!(request.questions[0].id, "q1");
+        assert_eq!(request.questions[0].header.as_deref(), Some("Auth"));
+        assert_eq!(request.questions[0].question, "用哪种认证?");
+        assert_eq!(request.questions[0].options.len(), 2);
+        assert_eq!(request.questions[0].options[0].label, "OAuth");
+        assert_eq!(
+            request.questions[0].options[0].description.as_deref(),
+            Some("跳转授权")
+        );
+        assert_eq!(request.questions[0].options[1].description, None);
+        assert!(!request.questions[0].multi_select, "codex 无多选字段");
+        // options 为 null（纯自由文本）归一为空 Vec。
+        assert_eq!(request.questions[1].options, Vec::new());
+
+        assert_eq!(
+            user_input_request(&json!({ "id": 1, "params": {} })),
+            None
+        );
+        assert_eq!(
+            user_input_request(&json!({ "id": 1, "params": { "questions": [] } })),
+            None
+        );
+    }
+
+    /// 归一化应答 → codex wire 形状：answers 键控 question.id →
+    /// {answers: [label...]}；空 map 得到 close 冲刷用的空答案对象。
+    #[test]
+    fn user_input_responses_map_to_codex_answer_shape() {
+        let mut answers = BTreeMap::new();
+        answers.insert("q1".to_owned(), vec!["OAuth".to_owned()]);
+        answers.insert("q2".to_owned(), vec!["随便写写".to_owned()]);
+        assert_eq!(
+            user_input_response(&answers),
+            json!({
+                "answers": {
+                    "q1": { "answers": ["OAuth"] },
+                    "q2": { "answers": ["随便写写"] }
+                }
+            })
+        );
+        assert_eq!(
+            user_input_response(&BTreeMap::new()),
+            json!({ "answers": {} })
+        );
     }
 }

@@ -172,6 +172,11 @@ impl ToolRegistry {
                     "actuation": self.actuator.is_some(),
                     "tools": self.tool_names(),
                     "platform": std::env::consts::OS,
+                    // 反向提问能力键（纯加法，PROTOCOL_VERSION 不递增）：宿主
+                    // 据此决定是否实现 answer 应答路径。askUser/answer 是
+                    // serve 层 op，不进工具清单（不出现在 tools 数组与
+                    // unknown-op 文案里）。
+                    "askUser": true,
                 });
                 #[cfg(target_os = "linux")]
                 if let Ok(backends) =
@@ -684,6 +689,9 @@ mod tests {
         assert_eq!(version["name"], json!("harness"));
         assert_eq!(version["protocol"], json!(crate::harness::PROTOCOL_VERSION));
         assert_eq!(version["snapshotAvailable"], json!(false));
+        // 反向提问能力键恒 true（serve 层 op；askUser/answer 不进工具清单）。
+        assert_eq!(version["askUser"], json!(true));
+        assert!(!version["tools"].as_array().unwrap().iter().any(|t| t == "askUser"));
     }
 
     #[test]

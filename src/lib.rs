@@ -29,8 +29,8 @@ pub use protocol::{
     SecretAccess, SecretPermission, SecurityOptions, SessionConfig, SessionInfo, SessionState,
     ShareAudience, Shareability, Status, StderrPolicy, SwitchProvider, TempPolicy, TodoEntry,
     TodoSnapshot, TodoStatus, ToolCall, ToolStatus, TransportKind, TriState, TurnInfo, Usage,
-    VisibilityInfo, VisibilityLimitation, VisibilityRequest, VisibilityState, WorkspaceInfo,
-    WorkspaceOptions, WorkspaceRoot,
+    UserInputRequest, UserQuestion, UserQuestionOption, VisibilityInfo, VisibilityLimitation,
+    VisibilityRequest, VisibilityState, WorkspaceInfo, WorkspaceOptions, WorkspaceRoot,
 };
 pub use session::{
     ActivityCounts, ActivityEvent, ActivityId, ActivityKind, ActivityStatus, ActivitySummary,
@@ -148,6 +148,10 @@ impl Harness {
 
         config.backend = match discovery.backend.kind {
             crate::protocol::BackendKind::CodexAppServer => BackendSpec::CodexAppServer {
+                command: discovery.backend.command.clone().unwrap_or_default(),
+                args: discovery.runtime.args.clone(),
+            },
+            crate::protocol::BackendKind::ZcodeAppServer => BackendSpec::ZcodeAppServer {
                 command: discovery.backend.command.clone().unwrap_or_default(),
                 args: discovery.runtime.args.clone(),
             },

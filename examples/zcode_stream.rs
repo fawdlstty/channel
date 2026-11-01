@@ -85,6 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SessionEvent::Permission(ev) => {
                 println!("\n[t+{:.3}s] permission: {}", at.as_secs_f64(), ev.detail);
             }
+            SessionEvent::UserInput { request } => {
+                println!("\n[t+{:.3}s] user input: {} questions", at.as_secs_f64(), request.questions.len());
+            }
             SessionEvent::ContextUsage { used, total } => {
                 println!("\n[t+{:.3}s] context usage: {used}/{total}", at.as_secs_f64());
             }

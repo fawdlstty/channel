@@ -9,6 +9,8 @@
 //! {"id":1,"op":"version","args":{}}
 //! {"id":2,"op":"get_control","args":{"x":100,"y":200}}
 //! {"id":3,"op":"subscribe","args":{"kinds":["focus"]}}
+//! {"id":4,"op":"askUser","args":{"questions":[...],"timeoutMs":120000}}
+//! {"id":5,"op":"answer","args":{"id":"ask-1","answers":{...}}}
 //! stop                                                       （温和退出）
 //! ```
 //!
@@ -19,7 +21,39 @@
 //! {"id":2,"ok":false,"error":"..."}
 //! {"id":3,"ok":false,"error":"...","code":"actuation-locked"}   code 仅平台/能力级错误携带（加法式）
 //! {"event":"focus","data":{...}}          订阅事件行（生产者见 bin --poll-focus-ms）
+//! {"id":"ask-1","op":"askUser","args":{...}}                    服务端请求行（反向提问，见下节）
 //! ```
+//!
+//! # 反向提问（askUser/answer）
+//!
+//! 服务端可向宿主客户端发起反向提问——第三种 wire 形态「服务端请求行」。
+//! 三条新行形态（`questions` 元素 = [`crate::protocol::UserQuestion`] 的
+//! serde 形状原样嵌入，`multi_select` 为 snake_case）：
+//!
+//! ```text
+//! // ① 宿主发起 askUser op：服务端登记 pending 后，原 id 的响应**延迟**
+//! //    到 answer / 超时才写（timeoutMs 缺省 120000；source 可选）。
+//! {"id":10,"op":"askUser","args":{"questions":[{"id":"q1","question":"…","options":[{"label":"甲","description":"…"}],"multi_select":false}],"timeoutMs":120000}}
+//! // ② 服务端请求行（stdout）：id 为服务端自增 "ask-N"（独立命名空间）。
+//! {"id":"ask-1","op":"askUser","args":{"questions":[…],"timeoutMs":120000}}
+//! // ③ 宿主应答 answer op：服务端先写 10 的最终响应行，再写 11 的 ack 行。
+//! {"id":11,"op":"answer","args":{"id":"ask-1","answers":{"q1":["甲"]}}}
+//! {"id":10,"ok":true,"result":{"answers":{"q1":["甲"]},"cancelled":false}}
+//! {"id":11,"ok":true,"result":null}
+//! ```
+//!
+//! 取消与超时：answer 行顶层加法式 `"cancelled":true`（缺省 false）→ 最终
+//! 响应 `{"answers":{},"cancelled":true}`；timeoutMs 到点未答 → 原 id 回
+//! ok:false（ask 超时），迟到 answer 落 unknown ask 错误、不给原 id 写
+//! 第二次响应。pending 非空时主循环的阻塞等待时限取「最早 deadline」——
+//! 反向等待绝不冻结主循环对其余 stdin 行/事件的消费；askUser/answer 均
+//! 为内联轻量 op（不 spawn 工作线程、不受 30s op_timeout 影响），等待由
+//! pending 表 + 等待预算承载。所有退出路径（Eof/stop/写失败）返回前清空
+//! pending 表（drop 未写出的延迟响应——进程退出后无意义，仅需等待方不
+//! 悬挂）；stop 退出另对每条未答 ask 补一行
+//! `{"id":"ask-N","op":"askUser","args":{…},"cancelled":true}` 作废通知
+//! （加法式可选键，best-effort）。`version` 结果加法式补 `"askUser":true`
+//! 能力键（宿主据此决定是否实现 answer 路径；PROTOCOL_VERSION 不递增）。
 //!
 //! 生命周期：stdin EOF 或 `stop` 行退出（不留孤儿进程，宿主死亡同收）；
 //! 退出时置位调用方传入的进程级关停标志（后台事件生产者轮询检查后收线，
@@ -37,8 +71,9 @@
 //! 自然失败收线）。默认 30s，环境变量 `HARNESS_OP_TIMEOUT_MS`（>0 毫秒）
 //! 可覆盖。请求-响应保持严格按序：主循环一次只处理一条消息，当前响应写完
 //! 才取下一条（[`run_with_timeout`] 的 `timeout` 参数供测试注入短超时）。
-//! 纯协议层轻量 op（ping/version/subscribe/unsubscribe 与坏行）内联执行
-//! 不 spawn 线程；工作线程 panic 经 `catch_unwind` 捕获后按 `op panicked`
+//! 纯协议层轻量 op（ping/version/subscribe/unsubscribe/askUser/answer 与
+//! 坏行）内联执行不 spawn 线程；工作线程 panic 经 `catch_unwind` 捕获后按
+//! `op panicked`
 //! 归因上报（与超时区分）；超时放弃的线程累计计数，每满 10 个经 tracing
 //! warn 一次（P3-13：慢性病现场走结构化日志，stderr，不进协议通道）。
 //!
@@ -56,17 +91,18 @@
 //! 事件行透传前按 [`ServeState::subscribed_kinds`] 过滤（bin 焦点轮询已自行
 //! 过滤，此处兜底）：未订阅/无法解析 `event` 字段的事件静默丢弃。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::harness::tools::ToolRegistry;
 use crate::harness::Error;
+use crate::protocol::UserQuestion;
 
 /// 可订阅事件种类（`subscribe` args.kinds 白名单）：
 /// - `focus` = 焦点控件观测（bin `--poll-focus-ms` 轮询生产者）；
@@ -99,6 +135,10 @@ const WRITE_FAILURE_LIMIT: u32 = 3;
 /// 慢性病可见性；tracing 结构化日志，stderr）。
 const ABANDONED_WARN_STEP: u64 = 10;
 
+/// askUser 反向等待的缺省上限（毫秒）：宿主未带 `timeoutMs` 时的兜底，
+/// 到点未收到 answer 即回 ask 超时并作废该提问。
+pub const DEFAULT_ASK_TIMEOUT_MS: u64 = 120_000;
+
 /// stdin 请求行。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Request {
@@ -108,17 +148,32 @@ pub struct Request {
     pub op: String,
     #[serde(default)]
     pub args: Value,
+    /// answer op 的用户取消语义（顶层加法式可选键，缺省 false；非 answer
+    /// op 忽略）——与 stop 退出的作废通知行 `{"id":"ask-N",…,"cancelled":true}`
+    /// 同一顶层键位，宿主两侧对接同一形状。
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
-/// serve 共享状态：工具注册表 + 订阅表。
+/// serve 共享状态：工具注册表 + 订阅表 + 未答 askUser pending 表。
 pub struct ServeState {
     pub registry: ToolRegistry,
     subscriptions: Mutex<HashSet<String>>,
+    /// 未答 askUser pending 表（ask id → 条目）：answer 命中移除、超时到期
+    /// 移除。BTreeMap 保证同批到期/作废行按 ask id 稳定输出。
+    asks: Mutex<BTreeMap<String, PendingAsk>>,
+    /// 服务端 ask id 计数（`ask-1` 起，独立于宿主请求 id 命名空间）。
+    next_ask_id: AtomicU64,
 }
 
 impl ServeState {
     pub fn new(registry: ToolRegistry) -> Self {
-        Self { registry, subscriptions: Mutex::new(HashSet::new()) }
+        Self {
+            registry,
+            subscriptions: Mutex::new(HashSet::new()),
+            asks: Mutex::new(BTreeMap::new()),
+            next_ask_id: AtomicU64::new(1),
+        }
     }
 
     /// 当前订阅种类（观测用）。
@@ -132,11 +187,106 @@ impl ServeState {
         self.lock().contains(kind)
     }
 
+    /// 登记一条待答 ask：分配服务端 ask id（ask-N 自增）并记录 deadline
+    /// （askUser 路径；返回 id 供服务端请求行回带）。
+    fn register_ask(&self, original_request_id: Value, timeout_ms: u64, server_args: Value) -> String {
+        let ask_id = format!("ask-{}", self.next_ask_id.fetch_add(1, Ordering::Relaxed));
+        let pending = PendingAsk {
+            original_request_id,
+            timeout_ms,
+            deadline: Instant::now() + Duration::from_millis(timeout_ms),
+            server_args,
+        };
+        self.asks_lock().insert(ask_id.clone(), pending);
+        ask_id
+    }
+
+    /// answer 命中路径：按 id 取走 pending（查无 → None → unknown ask）。
+    fn take_ask(&self, ask_id: &str) -> Option<PendingAsk> {
+        self.asks_lock().remove(ask_id)
+    }
+
+    /// 取走全部已到期 ask（调用方逐条回 ask 超时响应；迟到 answer 事后落
+    /// unknown ask，不会给原 id 写第二次响应）。
+    fn take_due_asks(&self) -> Vec<(Value, u64)> {
+        let now = Instant::now();
+        let mut asks = self.asks_lock();
+        let due: Vec<String> = asks
+            .iter()
+            .filter(|(_, pending)| pending.deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        due.into_iter()
+            .filter_map(|id| asks.remove(&id))
+            .map(|pending| (pending.original_request_id, pending.timeout_ms))
+            .collect()
+    }
+
+    /// 距最早未答 ask deadline 的等待预算（None = 无 pending，无限期等待）：
+    /// 主循环阻塞等待的时限取它与常规超时的较小者——反向等待到点醒来冲
+    /// 超时，不冻结主循环对其余消息的消费。
+    fn ask_wait_budget(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.asks_lock()
+            .values()
+            .map(|pending| pending.deadline.saturating_duration_since(now))
+            .min()
+    }
+
+    /// 未答 ask 数（单测观测用；生产路径经 deadline 预算与到期冲刷消费）。
+    #[cfg(test)]
+    fn pending_ask_count(&self) -> usize {
+        self.asks_lock().len()
+    }
+
+    /// stop 退出的作废通知行：对每条未答 ask 产出一行
+    /// `{"id":"ask-N","op":"askUser","args":{…},"cancelled":true}`（加法式
+    /// 可选键；取走即清表，调用方 best-effort 写出）。
+    fn take_cancelled_ask_lines(&self) -> Vec<String> {
+        let asks = std::mem::take(&mut *self.asks_lock());
+        asks.into_iter()
+            .map(|(id, pending)| {
+                json!({
+                    "id": id,
+                    "op": "askUser",
+                    "args": pending.server_args,
+                    "cancelled": true,
+                })
+                .to_string()
+            })
+            .collect()
+    }
+
+    /// 退出冲刷：清空 pending 表（stop 路径已经由 [`Self::take_cancelled_ask_lines`]
+    /// 清过，此处幂等兜底；drop 未写出的延迟响应，等待方不悬挂）。
+    fn clear_asks(&self) {
+        self.asks_lock().clear();
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
         self.subscriptions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn asks_lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, PendingAsk>> {
+        self.asks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// 单条待答 ask（服务端反向提问的 pending 表条目）。
+#[derive(Debug, Clone)]
+struct PendingAsk {
+    /// 原 askUser 请求的宿主 id（延迟应答与超时响应回带）。
+    original_request_id: Value,
+    /// 登记时的 timeoutMs（ask 超时文案回带）。
+    timeout_ms: u64,
+    /// 反向等待截止时刻（主循环等待预算取各 ask 最早者）。
+    deadline: Instant,
+    /// 服务端请求行的 args 载荷（stop 作废通知行重建用）。
+    server_args: Value,
 }
 
 /// 单行处理结果。
@@ -146,6 +296,12 @@ pub enum LineOutcome {
     None,
     /// 一行响应（逐行 flush）。
     Reply(String),
+    /// askUser 已受理：先向客户端写携带的服务端请求行；原请求 id 的最终
+    /// 响应延迟到 answer / 超时（Deferred 应答，主循环跳过立即应答）。
+    Ask { server_line: String },
+    /// answer 命中 pending：先写原 askUser 请求 id 的最终响应行，再写
+    /// answer 自己的 ack 行（顺序契约：延迟应答先于 ack）。
+    Answered { original_line: String, ack_line: String },
     /// `stop`：温和退出（不回响应）。
     Stop,
 }
@@ -166,7 +322,14 @@ pub fn handle_line(state: &ServeState, line: &str) -> LineOutcome {
         }
     };
     let id = request.id.clone();
-    LineOutcome::Reply(reply(id, dispatch(state, request)))
+    match dispatch(state, request) {
+        Dispatch::Now(outcome) => LineOutcome::Reply(reply(id, outcome)),
+        Dispatch::Ask { server_line } => LineOutcome::Ask { server_line },
+        Dispatch::Answered { original_request_id, result } => LineOutcome::Answered {
+            original_line: reply(original_request_id, Ok(result)),
+            ack_line: reply(id, Ok(Value::Null)),
+        },
+    }
 }
 
 /// 循环消息：stdin 请求行 / 订阅事件行 / 超限行（P3-6b）/ stdin EOF 信号。
@@ -188,7 +351,9 @@ pub enum ServeMessage {
 /// serve 主循环：消费 [`ServeMessage`] 流，响应/事件逐行写 `writer`，
 /// 收到 `stop`、消息通道关闭（stdin EOF + 事件生产者全部退出）或 stdout
 /// 连续写失败（[`WRITE_FAILURE_LIMIT`]）即返回。op 执行超时取
-/// [`op_timeout`]（默认 30s，`HARNESS_OP_TIMEOUT_MS` 可覆盖）。
+/// [`op_timeout`]（默认 30s，`HARNESS_OP_TIMEOUT_MS` 可覆盖）。pending
+/// askUser 的反向等待由等待预算 + 到期冲刷承载，任何退出路径返回前清空
+/// pending 表（stop 另补 cancelled 作废通知行，见模块文档「反向提问」）。
 ///
 /// `tx`/`rx` 为同一有界通道（容量 [`CHANNEL_CAPACITY`]）的两端（调用方
 /// 创建）：`tx` 交给 stdin 读线程与事件生产者（bin / 测试），`rx` 由本循环
@@ -212,7 +377,10 @@ pub fn run<W: Write>(
 ///
 /// 语义注记（请求-响应按序不变）：主循环一次只从通道取一条消息，当前
 /// 响应写完后才取下一条——请求严格按到达序逐个执行，无并发 dispatch；
-/// 超时隔离只是把重 op 的执行挪到工作线程并限时等待。
+/// 超时隔离只是把重 op 的执行挪到工作线程并限时等待。pending askUser
+/// 非空时阻塞等待的时限取「最早 ask deadline 与常规超时的较小者」，到点
+/// 先冲已到期 ask 再继续——反向等待绝不冻结主循环（见模块文档
+/// 「反向提问」）。
 pub fn run_with_timeout<W: Write>(
     reader: impl BufRead + Send + 'static,
     mut writer: W,
@@ -225,17 +393,45 @@ pub fn run_with_timeout<W: Write>(
     spawn_reader(reader, tx);
     let mut consecutive_write_failures: u32 = 0;
     let mut abandoned_workers: u64 = 0;
-    while let Ok(message) = rx.recv() {
-        let outcome = match message {
+    'serve: loop {
+        // 到期冲刷：任何阻塞等待前先把已过 deadline 的 ask 逐条回 ask 超时
+        // 响应（写失败共用同一连续计数路径）。
+        if flush_expired_asks(&state, &mut writer, &mut consecutive_write_failures) {
+            break 'serve;
+        }
+        // pending ask 非空时阻塞等待限流为最早 deadline 的预算：到点醒来
+        // 冲超时，其余 stdin 行/事件照常消费；无 pending 退回无限期阻塞
+        // （语义与既往一致）。
+        let message = match state.ask_wait_budget() {
+            None => match rx.recv() {
+                Ok(message) => message,
+                Err(_) => break 'serve,
+            },
+            Some(budget) => match rx.recv_timeout(budget) {
+                Ok(message) => message,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue 'serve,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break 'serve,
+            },
+        };
+        let mut stop = false;
+        let lines: Vec<String> = match message {
             ServeMessage::Request(line) => {
-                // 轻量 op（纯协议层 ping/version/subscribe/unsubscribe）与
-                // 坏行不可能挂起：内联执行不 spawn 线程（P3-4，高频 ping 不
-                // 再一线程一请求）；其余走超时隔离。
+                // 轻量 op（纯协议层 ping/version/subscribe/unsubscribe/
+                // askUser/answer）与坏行不可能挂起：内联执行不 spawn 线程
+                // （P3-4，高频 ping 不再一线程一请求；askUser/answer 的反向
+                // 等待由 pending 表 + 等待预算承载，不占线程）；其余走超时
+                // 隔离。
                 let lightweight = serde_json::from_str::<Request>(line.trim())
-                    .map(|r| matches!(r.op.as_str(), "ping" | "version" | "subscribe" | "unsubscribe"))
+                    .map(|r| {
+                        matches!(
+                            r.op.as_str(),
+                            "ping" | "version" | "subscribe" | "unsubscribe" | "askUser" | "answer"
+                        )
+                    })
                     .unwrap_or(true);
                 if lightweight {
-                    handle_line(&state, &line)
+                    let outcome = handle_line(&state, &line);
+                    outcome_lines(outcome, &mut stop)
                 } else {
                     // 超时隔离：handle_line（含 registry.call——UIA 调用可能无限
                     // 挂起）放一次性工作线程执行，主循环限时等待结果。超时即回
@@ -258,88 +454,163 @@ pub fn run_with_timeout<W: Write>(
                             });
                         let _ = result_tx.send(outcome);
                     });
-                    match result_rx.recv_timeout(timeout) {
-                        Ok(WorkerOutcome::Done(outcome)) => outcome,
-                        Ok(WorkerOutcome::Panicked(reason)) => {
-                            // panic 归因 error 级（P3-5/P3-13）：wire 上另有
-                            // ok:false 响应，此处是 stderr 侧的结构化证据
-                            // （op + panic 载荷，不拼纯文本消息）。
-                            tracing::error!(
-                                op = %request_op_of(&line),
-                                panic = %reason,
-                                "重 op 工作线程 panic"
-                            );
-                            LineOutcome::Reply(reply(
-                                request_id_of(&line),
-                                Err(Error::OpPanicked(reason)),
-                            ))
-                        }
-                        Err(_) => {
-                            // result_rx 在此丢弃：迟到的工作线程 send 失败，响应不留痕。
-                            abandoned_workers += 1;
-                            if abandoned_workers.is_multiple_of(ABANDONED_WARN_STEP) {
-                                // 超时线程累积（P3-4 慢性病）：warn 级结构化
-                                // 字段带累计数/op/超时上限，去 stderr。
-                                tracing::warn!(
-                                    abandoned = abandoned_workers,
+                    // 等待预算 = min(op 超时预算, 最早 ask deadline)：到点先冲
+                    // 到期 ask（ask 超时响应与 op 超时响应回带不同 id，互不
+                    // 干扰），op 预算同时耗尽才放弃工作线程。
+                    let started = Instant::now();
+                    let outcome = 'worker_wait: loop {
+                        let op_left = timeout.saturating_sub(started.elapsed());
+                        let budget = match state.ask_wait_budget() {
+                            Some(ask_left) => op_left.min(ask_left),
+                            None => op_left,
+                        };
+                        match result_rx.recv_timeout(budget) {
+                            Ok(WorkerOutcome::Done(outcome)) => break 'worker_wait outcome,
+                            Ok(WorkerOutcome::Panicked(reason)) => {
+                                // panic 归因 error 级（P3-5/P3-13）：wire 上另有
+                                // ok:false 响应，此处是 stderr 侧的结构化证据
+                                // （op + panic 载荷，不拼纯文本消息）。
+                                tracing::error!(
                                     op = %request_op_of(&line),
-                                    timeout_ms = timeout.as_millis() as u64,
-                                    "超时工作线程累计放弃（op 疑似持续挂起）"
+                                    panic = %reason,
+                                    "重 op 工作线程 panic"
                                 );
+                                break 'worker_wait LineOutcome::Reply(reply(
+                                    request_id_of(&line),
+                                    Err(Error::OpPanicked(reason)),
+                                ));
                             }
-                            LineOutcome::Reply(timeout_reply(&line, timeout))
+                            Err(e) => {
+                                // 到点先冲到期 ask；result_rx 在超时放弃后
+                                // 丢弃——迟到的工作线程 send 失败，响应不留痕。
+                                // Disconnected（工作线程异常消失）与预算耗尽
+                                // 同走放弃路径。
+                                if flush_expired_asks(
+                                    &state,
+                                    &mut writer,
+                                    &mut consecutive_write_failures,
+                                ) {
+                                    break 'serve;
+                                }
+                                let exhausted = matches!(e, mpsc::RecvTimeoutError::Disconnected)
+                                    || started.elapsed() >= timeout;
+                                if !exhausted {
+                                    continue 'worker_wait;
+                                }
+                                abandoned_workers += 1;
+                                if abandoned_workers.is_multiple_of(ABANDONED_WARN_STEP) {
+                                    // 超时线程累积（P3-4 慢性病）：warn 级结构化
+                                    // 字段带累计数/op/超时上限，去 stderr。
+                                    tracing::warn!(
+                                        abandoned = abandoned_workers,
+                                        op = %request_op_of(&line),
+                                        timeout_ms = timeout.as_millis() as u64,
+                                        "超时工作线程累计放弃（op 疑似持续挂起）"
+                                    );
+                                }
+                                break 'worker_wait LineOutcome::Reply(timeout_reply(&line, timeout));
+                            }
                         }
-                    }
+                    };
+                    outcome_lines(outcome, &mut stop)
                 }
             }
             ServeMessage::Event(line) => {
                 // 双保险过滤：bin 焦点轮询已按订阅过滤，此处按订阅表兜底——
-                // 未订阅/解析不出 event 种类的事件静默丢弃（LineOutcome::None）。
+                // 未订阅/解析不出 event 种类的事件静默丢弃（空行集）。
                 let subscribed = event_kind_of(&line)
                     .is_some_and(|kind| state.subscribed_kinds().iter().any(|k| k == &kind));
                 if subscribed {
-                    LineOutcome::Reply(line)
+                    vec![line]
                 } else {
-                    LineOutcome::None
+                    Vec::new()
                 }
             }
-            ServeMessage::Oversize => LineOutcome::Reply(reply(
+            ServeMessage::Oversize => vec![reply(
                 Value::Null,
                 Err(Error::OversizeLine { limit: MAX_LINE_BYTES }),
-            )),
+            )],
             // stdin EOF（读线程显式信号）：立即退出（常驻事件 sender 不再
             // 阻止退出，见 [`ServeMessage::Eof`] 文档）。
-            ServeMessage::Eof => break,
+            ServeMessage::Eof => break 'serve,
         };
-        let stop = outcome == LineOutcome::Stop;
-        if let LineOutcome::Reply(line) = outcome {
-            if writeln!(writer, "{line}").is_ok() {
-                let _ = writer.flush();
-                consecutive_write_failures = 0;
-            } else {
-                // stdout 写失败（客户端管道断开）：跳过 flush 继续服务；连续
-                // WRITE_FAILURE_LIMIT 次说明客户端已死 → 退出（P1-1：防无
-                // 订阅轮询「收事件 → 写失败 → 继续」的空转循环）。写失败
-                // 现场经 tracing warn 留痕（P3-13：连续计数 + 行字节数）。
-                consecutive_write_failures += 1;
-                tracing::warn!(
-                    consecutive = consecutive_write_failures,
-                    limit = WRITE_FAILURE_LIMIT,
-                    line_bytes = line.len(),
-                    "stdout 响应写失败（客户端管道疑似已断）"
-                );
-                if consecutive_write_failures >= WRITE_FAILURE_LIMIT {
-                    break;
-                }
+        for line in &lines {
+            if write_response_line(&mut writer, line, &mut consecutive_write_failures) {
+                break 'serve;
             }
         }
         if stop {
-            break;
+            // stop 退出的作废通知：客户端仍在读——对每条未答 ask 补一行
+            // cancelled:true（顶层加法式可选键；best-effort，写失败不影响
+            // 退出），取走即清表。
+            for line in state.take_cancelled_ask_lines() {
+                let _ = writeln!(writer, "{line}");
+            }
+            let _ = writer.flush();
+            break 'serve;
         }
     }
+    // 退出冲刷：清空 pending ask 表（stop 路径已在上面清过，此处幂等兜底；
+    // 未写出的延迟响应随退出 drop——进程退出后无意义，仅需等待方不悬挂、
+    // 无 panic，对齐 codex 适配器 close 空答案冲刷先例）。
+    state.clear_asks();
     // 任何退出路径（stop/通道关闭/写失败关停）统一置位关停标志：后台事件
     // 生产者（bin 焦点轮询）每轮检查后收线（P1-1）。
     shutdown.store(true, Ordering::SeqCst);
+}
+
+/// 写一行响应（逐行 flush；连续写失败计数，达到 [`WRITE_FAILURE_LIMIT`]
+/// 返回 true 表示应退出主循环——P1-1：客户端管道已断，防「收事件 →
+/// 写失败 → 继续」的空转循环。写失败现场经 tracing warn 留痕，P3-13）。
+fn write_response_line<W: Write>(
+    writer: &mut W,
+    line: &str,
+    consecutive_write_failures: &mut u32,
+) -> bool {
+    if writeln!(writer, "{line}").is_ok() {
+        let _ = writer.flush();
+        *consecutive_write_failures = 0;
+        return false;
+    }
+    *consecutive_write_failures += 1;
+    tracing::warn!(
+        consecutive = *consecutive_write_failures,
+        limit = WRITE_FAILURE_LIMIT,
+        line_bytes = line.len(),
+        "stdout 响应写失败（客户端管道疑似已断）"
+    );
+    *consecutive_write_failures >= WRITE_FAILURE_LIMIT
+}
+
+/// 把已到期的 ask 逐条回 ask 超时响应（id 回带原 askUser 请求 id）；返回
+/// true 表示写失败达到上限应退出。主循环每次阻塞等待前与工作线程等待
+/// 到点时调用。
+fn flush_expired_asks<W: Write>(
+    state: &ServeState,
+    writer: &mut W,
+    consecutive_write_failures: &mut u32,
+) -> bool {
+    for (request_id, limit_ms) in state.take_due_asks() {
+        let line = reply(request_id, Err(Error::AskTimedOut { limit_ms }));
+        if write_response_line(writer, &line, consecutive_write_failures) {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`LineOutcome`] → 待写行序（[`LineOutcome::Answered`] 保持「原 askUser id
+/// 终响应在前、answer ack 在后」顺序；Stop 经 `stop` 标志带出）。
+fn outcome_lines(outcome: LineOutcome, stop: &mut bool) -> Vec<String> {
+    match outcome {
+        LineOutcome::None => Vec::new(),
+        LineOutcome::Reply(line) | LineOutcome::Ask { server_line: line } => vec![line],
+        LineOutcome::Answered { original_line, ack_line } => vec![original_line, ack_line],
+        LineOutcome::Stop => {
+            *stop = true;
+            Vec::new()
+        }
+    }
 }
 
 /// 单 op 执行超时（serve 进程启动时读取一次）：默认 30s；环境变量
@@ -503,25 +774,89 @@ fn decode_line(bytes: &mut Vec<u8>) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// 分发一个请求（订阅登记 / 工具调用）。
-fn dispatch(state: &ServeState, request: Request) -> Result<Value, Error> {
+/// dispatch 结果：单行处理的三形态出口（handle_line 转 [`LineOutcome`]）。
+#[derive(Debug)]
+enum Dispatch {
+    /// 常规 op：立即以 [`reply`] 回一行。
+    Now(Result<Value, Error>),
+    /// askUser：已登记 pending，先向客户端写服务端请求行；原请求 id 的
+    /// 最终响应延迟到 answer / 超时（Deferred 应答，主循环跳过立即应答）。
+    Ask { server_line: String },
+    /// answer 命中 pending：先写原 askUser 请求 id 的最终响应行，再写
+    /// answer 自己的 ack 行（顺序契约）。
+    Answered { original_request_id: Value, result: Value },
+}
+
+/// 分发一个请求（订阅登记 / 反向提问 / 工具调用）。
+fn dispatch(state: &ServeState, request: Request) -> Dispatch {
     match request.op.as_str() {
-        "subscribe" => subscribe(state, &request.args, true),
-        "unsubscribe" => subscribe(state, &request.args, false),
+        "subscribe" => Dispatch::Now(subscribe(state, &request.args, true)),
+        "unsubscribe" => Dispatch::Now(subscribe(state, &request.args, false)),
+        "askUser" => ask_user(state, &request),
+        "answer" => answer(state, &request),
         // 仅 crate 内单测可触达的延迟假 op（模拟 UIA 挂起，验证超时隔离）；
         // 不进工具清单/协议文档，真 bin 进程里编译期即不存在。
         #[cfg(test)]
         "_test_sleep" => {
             let ms = request.args.get("ms").and_then(Value::as_u64).unwrap_or(0);
             std::thread::sleep(Duration::from_millis(ms));
-            Ok(json!({ "slept": ms }))
+            Dispatch::Now(Ok(json!({ "slept": ms })))
         }
         // 仅 crate 内单测可触达的 panic 假 op（验证 panic 归因与超时区分，
         // P3-5）；同样不进工具清单/协议文档。
         #[cfg(test)]
         "_test_panic" => panic!("测试 panic（_test_panic）"),
-        op => state.registry.call(op, &request.args),
+        op => Dispatch::Now(state.registry.call(op, &request.args)),
     }
+}
+
+/// askUser（宿主发起的反向提问）：questions 复用 [`UserQuestion`] 的 serde
+/// 形状原样嵌入服务端请求行（serve wire 与归一化类型同构，snake_case，不
+/// 另造形状）；登记 pending 后返回 [`Dispatch::Ask`]——原请求 id 的响应
+/// 延迟到 answer / 超时（Deferred 应答）。timeoutMs 缺省
+/// [`DEFAULT_ASK_TIMEOUT_MS`]；source 可选，提供才随行下发。
+fn ask_user(state: &ServeState, request: &Request) -> Dispatch {
+    let questions: Vec<UserQuestion> = match request.args.get("questions") {
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(questions) => questions,
+            Err(e) => return Dispatch::Now(Err(Error::BadRequest(e))),
+        },
+        None => return Dispatch::Now(Err(Error::AskQuestionsMissing)),
+    };
+    let timeout_ms = request
+        .args
+        .get("timeoutMs")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_ASK_TIMEOUT_MS);
+    let mut server_args = json!({ "questions": questions, "timeoutMs": timeout_ms });
+    if let Some(source) = request.args.get("source").and_then(Value::as_str) {
+        server_args["source"] = json!(source);
+    }
+    let ask_id = state.register_ask(request.id.clone(), timeout_ms, server_args.clone());
+    Dispatch::Ask {
+        server_line: json!({ "id": ask_id, "op": "askUser", "args": server_args }).to_string(),
+    }
+}
+
+/// answer（宿主应答）：按 args.id 取走 pending，产出两条线——先原 askUser
+/// 请求 id 的最终响应（answers 原样透传 + cancelled 语义；顶层
+/// `"cancelled":true` 时 answers 按空表作废），后 answer 自己的 ack
+/// （result:null，回显宿主任取的 answer id）。查无该 id → unknown ask 错误
+/// （已超时/已应答/从未登记；不给原 id 写第二次响应）。
+fn answer(state: &ServeState, request: &Request) -> Dispatch {
+    let Some(ask_id) = request.args.get("id").and_then(Value::as_str) else {
+        return Dispatch::Now(Err(Error::AnswerIdMissing));
+    };
+    let Some(pending) = state.take_ask(ask_id) else {
+        return Dispatch::Now(Err(Error::UnknownAsk { id: ask_id.to_string() }));
+    };
+    let result = if request.cancelled {
+        json!({ "answers": {}, "cancelled": true })
+    } else {
+        let answers = request.args.get("answers").cloned().unwrap_or_else(|| json!({}));
+        json!({ "answers": answers, "cancelled": false })
+    };
+    Dispatch::Answered { original_request_id: pending.original_request_id, result }
 }
 
 /// 订阅/退订（kinds 白名单校验；ack 回当前订阅清单）。
@@ -931,5 +1266,251 @@ mod tests {
             Arc::clone(&shutdown),
         );
         assert!(shutdown.load(Ordering::SeqCst), "写失败退出同样置位关停（P1-1）");
+    }
+
+    /* --- 反向提问（askUser/answer）------------------------------------- */
+
+    /// askUser（dispatch 层）：登记 pending + 产出服务端请求行（id ask-N
+    /// 自增、questions 保持 UserQuestion serde 形状、timeoutMs 缺省回填）；
+    /// 原请求 id 无立即响应（Deferred 应答）。
+    #[test]
+    fn ask_user_defers_reply_and_registers_pending() {
+        let state = state();
+        let questions = r#"[{"id":"q1","question":"选哪个？","header":"分组","options":[{"label":"甲","description":"说明"}],"multi_select":false}]"#;
+        let line = format!(r#"{{"id":10,"op":"askUser","args":{{"questions":{questions},"timeoutMs":5000}}}}"#);
+        let LineOutcome::Ask { server_line } = handle_line(&state, &line) else {
+            panic!("askUser 应产出服务端请求行")
+        };
+        let value: Value = serde_json::from_str(&server_line).unwrap();
+        assert_eq!(value["id"], json!("ask-1"), "服务端 ask id 自 ask-1 起独立命名空间");
+        assert_eq!(value["op"], json!("askUser"));
+        assert_eq!(value["args"]["timeoutMs"], json!(5000));
+        // questions 与 UserQuestion serde 形状逐字段一致（snake_case
+        // multi_select；header/description 可选项原样保留）。
+        assert_eq!(value["args"]["questions"], serde_json::from_str::<Value>(questions).unwrap());
+        assert_eq!(state.pending_ask_count(), 1, "pending 登记且无立即响应");
+
+        // 并发多问：id 自增（ask-2）；timeoutMs 缺省 120000；预算取最早 deadline。
+        let second = r#"{"id":11,"op":"askUser","args":{"questions":[{"id":"q2","question":"继续？"}]}}"#;
+        let LineOutcome::Ask { server_line } = handle_line(&state, second) else {
+            panic!("第二条 askUser 应产出服务端请求行")
+        };
+        let value: Value = serde_json::from_str(&server_line).unwrap();
+        assert_eq!(value["id"], json!("ask-2"));
+        assert_eq!(value["args"]["timeoutMs"], json!(DEFAULT_ASK_TIMEOUT_MS));
+        assert_eq!(state.pending_ask_count(), 2);
+        assert!(state.ask_wait_budget().is_some());
+    }
+
+    /// answer（dispatch 层）：命中 pending 后产出两条线——先原 askUser 请求
+    /// id 的最终响应（answers 透传 + cancelled:false），再 answer 自己的
+    /// ack（result:null，回显宿主任取的 id）；pending 命中即移除。
+    #[test]
+    fn answer_writes_deferred_reply_then_ack() {
+        let state = state();
+        let ask_line = r#"{"id":10,"op":"askUser","args":{"questions":[{"id":"q1","question":"选哪个？","options":[{"label":"甲"}]}]}}"#;
+        let LineOutcome::Ask { .. } = handle_line(&state, ask_line) else {
+            panic!("askUser 应产出服务端请求行")
+        };
+        let out = handle_line(
+            &state,
+            r#"{"id":11,"op":"answer","args":{"id":"ask-1","answers":{"q1":["甲"]}}}"#,
+        );
+        let LineOutcome::Answered { original_line, ack_line } = out else {
+            panic!("answer 应产出两条线")
+        };
+        // 顺序契约：原 askUser id 的最终响应在前。
+        let original: Value = serde_json::from_str(&original_line).unwrap();
+        assert_eq!(original["id"], json!(10));
+        assert_eq!(original["ok"], json!(true));
+        assert_eq!(original["result"]["answers"], json!({"q1": ["甲"]}));
+        assert_eq!(original["result"]["cancelled"], json!(false));
+        let ack: Value = serde_json::from_str(&ack_line).unwrap();
+        assert_eq!(ack["id"], json!(11));
+        assert_eq!(ack["ok"], json!(true));
+        assert_eq!(ack["result"], json!(null));
+        assert_eq!(state.pending_ask_count(), 0, "answer 命中即移除 pending");
+    }
+
+    /// answer 异常路径：查无该 id / 已消费后再答 → unknown ask；缺 id 参数
+    /// → 参数缺失文案；均不登记/不残留 pending。
+    #[test]
+    fn answer_unknown_or_missing_ask_id_is_error() {
+        let state = state();
+        // 从未登记：unknown ask。
+        let out = handle_line(&state, r#"{"id":1,"op":"answer","args":{"id":"ask-9"}}"#);
+        let LineOutcome::Reply(line) = out else { panic!("应有响应") };
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["ok"], json!(false));
+        assert!(value["error"].as_str().unwrap().contains("unknown ask: ask-9"), "{value}");
+        // 缺 id 参数。
+        let out = handle_line(&state, r#"{"id":2,"op":"answer","args":{}}"#);
+        let LineOutcome::Reply(line) = out else { panic!("应有响应") };
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert!(value["error"].as_str().unwrap().contains("answer 需要"), "{value}");
+        // 已消费的 ask 再次应答：同一 unknown ask 路径（不给原 id 写第二次响应）。
+        let _ = handle_line(&state, r#"{"id":10,"op":"askUser","args":{"questions":[{"id":"q1","question":"？"}]}}"#);
+        let _ = handle_line(&state, r#"{"id":11,"op":"answer","args":{"id":"ask-1","answers":{}}}"#);
+        let out = handle_line(&state, r#"{"id":12,"op":"answer","args":{"id":"ask-1"}}"#);
+        let LineOutcome::Reply(line) = out else { panic!("应有响应") };
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert!(value["error"].as_str().unwrap().contains("unknown ask"), "{value}");
+        assert_eq!(state.pending_ask_count(), 0);
+    }
+
+    /// askUser 参数校验：缺 questions → 专用文案；元素非法 → bad request；
+    /// 失败路径不登记 pending；source 提供时随服务端请求行下发。
+    #[test]
+    fn ask_user_rejects_missing_or_malformed_questions() {
+        let state = state();
+        let out = handle_line(&state, r#"{"id":1,"op":"askUser","args":{}}"#);
+        let LineOutcome::Reply(line) = out else { panic!("应有响应") };
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["ok"], json!(false));
+        assert!(value["error"].as_str().unwrap().contains("askUser 需要"), "{value}");
+        assert_eq!(state.pending_ask_count(), 0, "失败路径不登记 pending");
+
+        // questions 元素不是合法 UserQuestion（缺 id/题干）→ bad request。
+        let out = handle_line(&state, r#"{"id":2,"op":"askUser","args":{"questions":[{"label":"不是问题"}]}}"#);
+        let LineOutcome::Reply(line) = out else { panic!("应有响应") };
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["ok"], json!(false));
+        assert!(value["error"].as_str().unwrap().contains("bad request"), "{value}");
+
+        // source 可选：提供才随行下发。
+        let out = handle_line(
+            &state,
+            r#"{"id":3,"op":"askUser","args":{"questions":[{"id":"q1","question":"？"}],"source":"工具名"}}"#,
+        );
+        let LineOutcome::Ask { server_line } = out else { panic!("应有服务端请求行") };
+        let value: Value = serde_json::from_str(&server_line).unwrap();
+        assert_eq!(value["args"]["source"], json!("工具名"));
+    }
+
+    /// answer 顶层 `"cancelled":true`：最终响应 cancelled:true 且 answers 按
+    /// 空表作废（顶层加法式键，缺省 false 由 Request serde 兜底）。
+    #[test]
+    fn cancelled_answer_reports_cancelled_with_empty_answers() {
+        let state = state();
+        let _ = handle_line(&state, r#"{"id":10,"op":"askUser","args":{"questions":[{"id":"q1","question":"？"}]}}"#);
+        let out = handle_line(&state, r#"{"id":11,"op":"answer","args":{"id":"ask-1"},"cancelled":true}"#);
+        let LineOutcome::Answered { original_line, ack_line } = out else {
+            panic!("answer 应产出两条线")
+        };
+        let original: Value = serde_json::from_str(&original_line).unwrap();
+        assert_eq!(original["result"]["cancelled"], json!(true));
+        assert_eq!(original["result"]["answers"], json!({}), "取消时 answers 按空表作废");
+        let ack: Value = serde_json::from_str(&ack_line).unwrap();
+        assert_eq!(ack["ok"], json!(true));
+    }
+
+    /// 到期冲刷（dispatch 层）：timeoutMs:0 的 ask 立即到期、被
+    /// take_due_asks 取走（携带原请求 id 与 timeoutMs）；迟到 answer 落
+    /// unknown ask，不给原 id 写第二次响应。
+    #[test]
+    fn due_ask_expires_and_late_answer_is_unknown() {
+        let state = state();
+        let _ = handle_line(&state, r#"{"id":10,"op":"askUser","args":{"questions":[{"id":"q1","question":"？"}],"timeoutMs":0}}"#);
+        assert_eq!(state.pending_ask_count(), 1);
+        let due = state.take_due_asks();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, json!(10), "到期条目携带原 askUser 请求 id");
+        assert_eq!(due[0].1, 0);
+        assert_eq!(state.pending_ask_count(), 0);
+        let out = handle_line(&state, r#"{"id":11,"op":"answer","args":{"id":"ask-1","answers":{"q1":["甲"]}}}"#);
+        let LineOutcome::Reply(line) = out else { panic!("应有响应") };
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert!(value["error"].as_str().unwrap().contains("unknown ask"), "{value}");
+    }
+
+    /// 等待预算取各 pending ask 最早 deadline（并发多问各自独立计时；
+    /// 无 pending → None = 无限期等待）。
+    #[test]
+    fn ask_wait_budget_takes_earliest_deadline() {
+        let state = state();
+        assert_eq!(state.ask_wait_budget(), None, "无 pending 无预算");
+        let _ = handle_line(&state, r#"{"id":1,"op":"askUser","args":{"questions":[{"id":"q1","question":"？"}],"timeoutMs":5000}}"#);
+        let first = state.ask_wait_budget().unwrap();
+        let _ = handle_line(&state, r#"{"id":2,"op":"askUser","args":{"questions":[{"id":"q2","question":"？"}],"timeoutMs":50}}"#);
+        let second = state.ask_wait_budget().unwrap();
+        assert!(second < first, "预算取最早 deadline: {second:?} vs {first:?}");
+        assert!(second <= Duration::from_millis(50));
+        assert!(first <= Duration::from_millis(5000));
+    }
+
+    /// run 回环：askUser → 服务端请求行 → answer → 「原 id 终响应 + ack」
+    /// 依序写出，随后 stop 干净退出（pending 已清空 → 无作废通知行）。
+    #[test]
+    fn run_loop_ask_answer_and_stop_writes_lines_in_order() {
+        let state = state();
+        let input = concat!(
+            r#"{"id":10,"op":"askUser","args":{"questions":[{"id":"q1","question":"选哪个？","options":[{"label":"甲"},{"label":"乙"}],"multi_select":false}],"timeoutMs":60000}}"#, "\n",
+            r#"{"id":11,"op":"answer","args":{"id":"ask-1","answers":{"q1":["乙"]}}}"#, "\n",
+            "stop", "\n",
+        );
+        let lines = serve_roundtrip(state, input.as_bytes().to_vec(), Duration::from_secs(30));
+        assert_eq!(lines.len(), 3, "服务端请求行 + 终响应 + ack（stop 不回）: {lines:?}");
+        let ask: Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(ask["id"], json!("ask-1"));
+        assert_eq!(ask["op"], json!("askUser"));
+        let original: Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(original["id"], json!(10));
+        assert_eq!(original["ok"], json!(true));
+        assert_eq!(original["result"]["answers"], json!({"q1": ["乙"]}));
+        let ack: Value = serde_json::from_str(&lines[2]).unwrap();
+        assert_eq!(ack["id"], json!(11));
+        assert_eq!(ack["result"], json!(null));
+    }
+
+    /// run 回环：pending 未答时 stop——对每条未答 ask 补一行 cancelled:true
+    /// 作废通知（顶层加法式可选键，args 原样重建）后退出。
+    #[test]
+    fn run_loop_stop_cancels_pending_asks() {
+        let state = state();
+        let input = concat!(
+            r#"{"id":10,"op":"askUser","args":{"questions":[{"id":"q1","question":"？"}]}}"#, "\n",
+            "stop", "\n",
+        );
+        let lines = serve_roundtrip(state, input.as_bytes().to_vec(), Duration::from_secs(30));
+        assert_eq!(lines.len(), 2, "服务端请求行 + 作废通知行: {lines:?}");
+        let cancel: Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(cancel["id"], json!("ask-1"));
+        assert_eq!(cancel["op"], json!("askUser"));
+        assert_eq!(cancel["cancelled"], json!(true));
+        assert_eq!(cancel["args"]["timeoutMs"], json!(DEFAULT_ASK_TIMEOUT_MS));
+    }
+
+    /// run 回环：pending 未答时 stdin EOF——直接清表退出（无作废通知行），
+    /// 服务收场不悬挂。
+    #[test]
+    fn run_loop_eof_with_pending_asks_exits_cleanly() {
+        let state = state();
+        let mut input = r#"{"id":10,"op":"askUser","args":{"questions":[{"id":"q1","question":"？"}]}}"#.to_string().into_bytes();
+        input.push(b'\n');
+        let lines = serve_roundtrip(state, input, Duration::from_secs(30));
+        assert_eq!(lines.len(), 1, "EOF 只留服务端请求行，清表退出: {lines:?}");
+        let ask: Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(ask["id"], json!("ask-1"));
+    }
+
+    /// run 回环：timeoutMs:0 的 ask 在下一轮等待前即到期冲刷（原 id 回 ask
+    /// 超时响应），后续 ping 照常应答——反向等待不冻结主循环。
+    #[test]
+    fn run_loop_expires_due_ask_without_blocking_follow_ups() {
+        let state = state();
+        let input = concat!(
+            r#"{"id":10,"op":"askUser","args":{"questions":[{"id":"q1","question":"？"}],"timeoutMs":0}}"#, "\n",
+            r#"{"id":2,"op":"ping"}"#, "\n",
+            "stop", "\n",
+        );
+        let lines = serve_roundtrip(state, input.as_bytes().to_vec(), Duration::from_secs(30));
+        assert_eq!(lines.len(), 3, "服务端请求行 + ask 超时响应 + ping 应答: {lines:?}");
+        let timed_out: Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(timed_out["id"], json!(10), "ask 超时响应回带原 askUser 请求 id");
+        assert_eq!(timed_out["ok"], json!(false));
+        assert!(timed_out["error"].as_str().unwrap().contains("提问超时"), "{timed_out}");
+        let ping: Value = serde_json::from_str(&lines[2]).unwrap();
+        assert_eq!(ping["id"], json!(2));
+        assert_eq!(ping["ok"], json!(true), "ask 超时不阻塞后续请求");
     }
 }

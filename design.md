@@ -3,7 +3,9 @@
 > 维护规则见 [AGENTS.md](AGENTS.md)。每一项内容都标注来源：
 > 【用户要求】= 用户明确提出的改动/约束（含原始诉求语义）；
 > 【AI 演绎】= AI 为落实用户要求而自行推导补全的细节，尚未逐项确认。
-> 最近更新：2026-10-28（新增 Todo 待办一等事件，见 §3.1；
+> 最近更新：2026-10-30（新增询问用户一等支持：协议层/Session/Codex 拆分/
+> ZCode app-server 适配器/serve 反向询问，见 §3.1/§3.2/§3.6）；
+> 此前 2026-10-28：新增 Todo 待办一等事件，见 §3.1；
 > 此前 2026-10-19：新增 §3.8 历史存储 `history` feature、ormer 依赖
 > path 统一，见 §3.8/§4/§5；此前 2026-10-10：Session 附件传递、
 > ContextUsage 事件、ZCode CLI
@@ -84,6 +86,23 @@
   priority 仅收 high/medium/low。会话状态聚合忽略该事件（透传事实，
   与 CompactionBoundary 同款）；活动分类新增 `ActivityKind::Todo`，
   TodoWrite 活动行不再误标 WriteFile。
+- 【用户要求，2026-10-30】询问用户（user input）一等支持：AI 后端向用户
+  提问（ZCode AskUserQuestion / Codex requestUserInput）归一化为一等
+  事件与应答通道——`Event::UserInputRequired(UserInputRequest)` /
+  `SessionEvent::UserInput { request }`；归一化类型
+  `UserInputRequest { id, source, questions, payload }`（id 为应答句柄、
+  payload 为后端 params 原样透传，同 CompactionBoundary 先例）与
+  `UserQuestion { id, header, question, options[{label,description}],
+  multi_select }`（id 为归一化应答键：Codex 用协议侧 question.id、ZCode
+  用题干文本）；`Status::WaitingForUserInput`（非终态）；CapabilitySet
+  新增 `user_input_requests`/`user_input_responses` 位（含 `all()`、
+  Capability 枚举与 runtime 证据/补集清单同步）。Session 新增
+  `respond_user_input(id, BTreeMap<String, Vec<String>>)`（校验链镜像
+  respond_permission，状态窗 {WaitingForUserInput, Running}，成功清
+  pending 并回退 Running）；Backend trait 默认实现返回
+  UnsupportedCapability。【AI 演绎，落实上一条】类型形状、方法签名、
+  能力位两枚（requests/responses 对齐 permission 惯例）与
+  `waitingOnUserInput` 到独立 Status 的映射均为 AI 推导细节。
 - 【AI 演绎】`runtime`：harness 可执行文件发现（PATH + 平台特化探测）
   与 cwd 解析。
 
@@ -106,6 +125,48 @@
   「完全访问」配置映射 yolo；zcode 对 `-p` 无头模式默认即 yolo，故常规
   回合显式传 `--mode build` 回到标准权限模式。附件（见 §3.1）以逐文件
   `--attach <path>` 附加在回合参数上。
+- 【用户要求，2026-10-30】Codex 适配器把 `item/tool/requestUserInput`
+  从审批流拆为一等用户提问路由（此前 is_permission_request 误把
+  requestUserInput 混入审批、回 `{"decision":..}` 错误形状）：归一化为
+  Event::UserInputRequired（options null → 空 Vec、multi_select 恒
+  false、payload 原样），应答写
+  `{"answers":{"<question.id>":{"answers":[...]}}}`（codex 0.153.2
+  schema 实测形状；答案值为字符串数组）；close 冲刷未答提问回空
+  answers 对象（response schema 的 answers 无 minProperties，实测
+  合法）；`mcpServer/elicitation/request` 维持 -32601 拒绝（本次不
+  纳入，待用户后续拍板）。
+- 【用户要求，2026-10-30】新增 ZCode app-server 后端适配器
+  （src/harness/zcode.rs；`BackendSpec::ZcodeAppServer{command,args}`
+  显式选择；Auto 下 ZCode 仍路由 StructuredCli，既有行为不变）：
+  常驻 stdio NDJSON JSON-RPC（argv = 可执行 + `app-server`，可执行经
+  HarnessDiscovery 解析；**不带 jsonrpc 字段**——带即 -32600）。会话
+  面：session/create（workspaceKey=路径、mode 按 full_access→yolo /
+  常规→build 同 CLI --mode 规则）→ subscribe（desktop-continuous）→
+  连接时按请求模型 setModel → session/send（-32010→Busy）→
+  session/stop 中断 → close（先冲刷 pending：权限 deny、提问
+  decline，用最新 wire id，再 session/close）。事件归一化：
+  model.streaming 文本/推理增量；tool.updated 四 kind（工具名按
+  name|toolName|title|displayName→toolCallId 回退链）；turn.completed
+  （success→Completed、cancelled→Interrupted、error_*→Failed）；
+  turn.failed→Error；事件镜像类（permission.requested/userInput.*
+  等）忽略防重复上报；未知 type→Raw。反向请求按 params.requestId
+  簿记（服务端 reannounce 周期重发，只刷新最新 wire id 不重发事件）：
+  `interaction/requestUserInput` → UserInputRequired（题干即应答键；
+  应答 `{"action":"accept","content":{"answers":{题干:值}}}`，单选
+  字符串、多选数组、全空 decline）；`interaction/requestPermission` →
+  PermissionRequired（allow/deny）；`session/requestRuntimePreferences`
+  与 `interaction/requestOfficialMcpAuthHeaders` 自动应答；其余反向
+  方法回 -32601。能力位 streaming/permission 双向/user_input 双向/
+  interrupt/resume = true。wire 契约来源：2026-10-30 本机
+  /opt/ZCode/resources/glm/zcode.cjs 0.17.1 实测 + 静态分析；【AI 演绎】
+  标注三处静态推断：多选 answers 数组形态、"provider/model" 拆分、
+  runtime preferences 字段语义。
+- 【用户要求，2026-10-30（调研结论）】headless `-p`（StructuredCli）
+  下 ZCode 对 AskUserQuestion 无条件自动拒绝（requiresUserInteraction
+  先于 yolo bypass，"No permission client configured for
+  AskUserQuestion"，回合继续；无 --input-format，stdin 不承载协议，
+  无应答通道），故 StructuredCli 路径维持现状、user_input 能力位
+  false；zcode 的完整提问支持只能经上述 app-server 常驻后端。
 
 ### 3.3 `llm`（feature `llm`）
 
@@ -252,6 +313,26 @@
   会挂；fork 本地构建 Switch 经兜底落 Custom）。上游合并 PR #384 并
   发布 0.31 后：版本要求收紧为 `0.31`，删除 `_` 与 allow、恢复
   `Role::Switch => "Button"` 分支。
+- 【用户要求，2026-10-30】serve 协议新增反向询问（ask user）通道，
+  纯加法（PROTOCOL_VERSION 保持 1，version 结果加 `"askUser": true`
+  能力键，宿主据此实现 answer 路径）：① 宿主 op `askUser`
+  （args `{questions:[UserQuestion serde 形状], timeoutMs?=120000,
+  source?}`）→ 登记 `ask-<n>` 独立命名空间待答表 + 发服务端请求行
+  `{"id":"ask-N","op":"askUser","args":{...}}`（stdout），该 op 响应
+  延迟；② 宿主 op `answer`（args `{id, answers:{qid:[...]}}`，
+  cancelled 为 Request 顶层加法式可选键）→ 完成待答：先写原 askUser
+  请求 id 的终响应（`{"answers":...,"cancelled":false}`；
+  cancelled:true 按空表作废、不透传部分答案）再写 answer ack
+  （result:null）；③ 超时/退出：到期逐条回 AskTimedOut（ok:false，
+  回带原请求 id）、迟到 answer 报 UnknownAsk；stop 退出对未答 ask 补
+  `cancelled:true` 作废行；所有退出路径清空待答表。askUser/answer 为
+  内联轻量 op（不占 30s op 工作线程）且等待不阻塞主循环——回答行与
+  普通请求走同一消息通道，阻塞等待会死锁，故采用延迟应答模型
+  【AI 演绎，落实上一条：延迟应答模型、超时缺省 120s、ask-<n> 命名、
+  ack 形状】。error.rs 新变体 AskQuestionsMissing/AnswerIdMissing/
+  UnknownAsk/AskTimedOut（协议层错误，无机器码，字面量锁定测试）；
+  golden fixture 无需更新（不锁协议信封）；进程级回环回归在
+  tests/bin_protocol.rs。
 
 ### 3.7 ws 传输层（2026-09-12 重构，本次变更）
 

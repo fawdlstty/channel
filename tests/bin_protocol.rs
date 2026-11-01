@@ -47,6 +47,8 @@ fn bin_responds_to_version_and_exits_on_stop() {
         value["result"]["protocol"],
         serde_json::json!(channel::harness::PROTOCOL_VERSION)
     );
+    // 反向提问能力键（纯加法；宿主据此决定是否实现 answer 路径）。
+    assert_eq!(value["result"]["askUser"], serde_json::json!(true));
 
     // 第二行：操作类工具未授权（进程未带 --actuation，§22.7 授权门）
     // → ok:false，错误文案指明授权开关；不崩协议（错误隔离）。
@@ -226,4 +228,213 @@ fn bin_serve_positional_subcommand_accepts_runtime_argv() {
 
     let status = child.wait().expect("等待退出");
     assert!(status.success(), "stop 后应干净退出: {status:?}");
+}
+
+/* --- 反向提问（askUser/answer）进程级回环 ---------------------------------- */
+
+/// 拉起 harness serve 进程 + stdout 行通道，返回（子进程、行接收端、stdin
+/// 句柄——交互式场景需在读取响应期间保持 stdin 打开，防 EOF 抢跑）。
+fn spawn_serve() -> (std::process::Child, mpsc::Receiver<String>, std::process::ChildStdin) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("拉起 harness.exe");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let stdin = child.stdin.take().expect("stdin");
+    (child, rx, stdin)
+}
+
+/// 回环主轨：宿主 askUser → 读服务端请求行（id ask-1、questions 与
+/// protocol::UserQuestion serde 形状一致）→ answer → 两条响应行依序到达
+/// （askUser id 的最终 result.answers + answer 自己的 ack）；随后未知 ask
+/// 落 ok:false、stop 干净退出。
+#[test]
+fn bin_ask_user_roundtrip_answer_and_unknown_ask() {
+    let (mut child, rx, mut stdin) = spawn_serve();
+
+    writeln!(
+        stdin,
+        r#"{{"id":10,"op":"askUser","args":{{"questions":[{{"id":"q1","question":"用哪个？","options":[{{"label":"甲","description":"说明"}}]}}]}}}}"#
+    )
+    .expect("写 askUser");
+    // 服务端请求行：id 为服务端自增 ask-1，questions 原样嵌 UserQuestion
+    // serde 形状（snake_case multi_select，缺省 false 也序列化）。
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到服务端请求行");
+    let ask: serde_json::Value = serde_json::from_str(&line).expect("服务端请求行必须是 JSON");
+    assert_eq!(ask["id"], serde_json::json!("ask-1"));
+    assert_eq!(ask["op"], serde_json::json!("askUser"));
+    assert_eq!(ask["args"]["timeoutMs"], serde_json::json!(120_000), "timeoutMs 缺省 120000");
+    assert_eq!(
+        ask["args"]["questions"],
+        serde_json::json!([{
+            "id": "q1",
+            "question": "用哪个？",
+            "options": [{ "label": "甲", "description": "说明" }],
+            "multi_select": false
+        }])
+    );
+
+    // answer → 两条响应行：askUser id 10 的最终响应在前，ack 11 在后。
+    writeln!(stdin, r#"{{"id":11,"op":"answer","args":{{"id":"ask-1","answers":{{"q1":["甲"]}}}}}}"#)
+        .expect("写 answer");
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到 askUser 最终响应");
+    let original: serde_json::Value = serde_json::from_str(&line).expect("响应必须是 JSON");
+    assert_eq!(original["id"], serde_json::json!(10));
+    assert_eq!(original["ok"], serde_json::json!(true));
+    assert_eq!(original["result"]["answers"], serde_json::json!({"q1": ["甲"]}));
+    assert_eq!(original["result"]["cancelled"], serde_json::json!(false));
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到 answer ack");
+    let ack: serde_json::Value = serde_json::from_str(&line).expect("响应必须是 JSON");
+    assert_eq!(ack["id"], serde_json::json!(11));
+    assert_eq!(ack["ok"], serde_json::json!(true));
+    assert_eq!(ack["result"], serde_json::json!(null));
+
+    // 未知 ask → ok:false（unknown ask），协议不崩（错误隔离）。
+    writeln!(stdin, r#"{{"id":12,"op":"answer","args":{{"id":"ask-999"}}}}"#).expect("写未知 answer");
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到 unknown ask 错误");
+    let value: serde_json::Value = serde_json::from_str(&line).expect("响应必须是 JSON");
+    assert_eq!(value["id"], serde_json::json!(12));
+    assert_eq!(value["ok"], serde_json::json!(false));
+    assert!(
+        value["error"].as_str().unwrap().contains("unknown ask"),
+        "{}",
+        value["error"]
+    );
+
+    writeln!(stdin, "stop").expect("写 stop");
+    stdin.flush().ok();
+    drop(stdin);
+    let status = child.wait().expect("等待退出");
+    assert!(status.success(), "stop 后应干净退出: {status:?}");
+}
+
+/// 取消路径：answer 行顶层加法式 `"cancelled":true` → askUser 终响应
+/// cancelled:true 且 answers 按空表作废；ack 照常；stop 干净退出。
+#[test]
+fn bin_ask_user_cancelled_answer_reports_cancelled() {
+    let (mut child, rx, mut stdin) = spawn_serve();
+    writeln!(
+        stdin,
+        r#"{{"id":10,"op":"askUser","args":{{"questions":[{{"id":"q1","question":"？","options":[{{"label":"甲"}}]}}]}}}}"#
+    )
+    .expect("写 askUser");
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到服务端请求行");
+    let ask: serde_json::Value = serde_json::from_str(&line).expect("服务端请求行必须是 JSON");
+    assert_eq!(ask["id"], serde_json::json!("ask-1"));
+
+    writeln!(stdin, r#"{{"id":11,"op":"answer","args":{{"id":"ask-1"}},"cancelled":true}}"#)
+        .expect("写取消 answer");
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到取消终响应");
+    let value: serde_json::Value = serde_json::from_str(&line).expect("响应必须是 JSON");
+    assert_eq!(value["id"], serde_json::json!(10));
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["result"]["cancelled"], serde_json::json!(true));
+    assert_eq!(value["result"]["answers"], serde_json::json!({}));
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到 ack");
+    let ack: serde_json::Value = serde_json::from_str(&line).expect("响应必须是 JSON");
+    assert_eq!(ack["id"], serde_json::json!(11));
+    assert_eq!(ack["ok"], serde_json::json!(true));
+
+    writeln!(stdin, "stop").expect("写 stop");
+    drop(stdin);
+    let status = child.wait().expect("等待退出");
+    assert!(status.success(), "stop 后应干净退出: {status:?}");
+}
+
+/// 短 timeoutMs 超时路径：服务端请求行后不回答，deadline 到点原 askUser id
+/// 回 ok:false（上限毫秒数进文案）；迟到 answer 落 unknown ask、不给原 id
+/// 写第二次响应；stdin 保持打开（无 EOF 抢跑 deadline）。
+#[test]
+fn bin_ask_user_times_out_without_answer() {
+    let (mut child, rx, mut stdin) = spawn_serve();
+    writeln!(
+        stdin,
+        r#"{{"id":10,"op":"askUser","args":{{"questions":[{{"id":"q1","question":"？"}}],"timeoutMs":200}}}}"#
+    )
+    .expect("写 askUser");
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到服务端请求行");
+    let ask: serde_json::Value = serde_json::from_str(&line).expect("服务端请求行必须是 JSON");
+    assert_eq!(ask["id"], serde_json::json!("ask-1"));
+    assert_eq!(ask["args"]["timeoutMs"], serde_json::json!(200));
+
+    // deadline 200ms 到点：原 id 10 回 ok:false。
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到 ask 超时响应");
+    let value: serde_json::Value = serde_json::from_str(&line).expect("响应必须是 JSON");
+    assert_eq!(value["id"], serde_json::json!(10));
+    assert_eq!(value["ok"], serde_json::json!(false));
+    assert!(value["error"].as_str().unwrap().contains("200"), "{}", value["error"]);
+
+    // 迟到 answer：unknown ask。
+    writeln!(stdin, r#"{{"id":11,"op":"answer","args":{{"id":"ask-1","answers":{{"q1":["甲"]}}}}}}"#)
+        .expect("写迟到 answer");
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到 unknown ask 错误");
+    let value: serde_json::Value = serde_json::from_str(&line).expect("响应必须是 JSON");
+    assert_eq!(value["id"], serde_json::json!(11));
+    assert_eq!(value["ok"], serde_json::json!(false));
+    assert!(
+        value["error"].as_str().unwrap().contains("unknown ask"),
+        "{}",
+        value["error"]
+    );
+
+    writeln!(stdin, "stop").expect("写 stop");
+    drop(stdin);
+    let status = child.wait().expect("等待退出");
+    assert!(status.success(), "stop 后应干净退出: {status:?}");
+}
+
+/// pending 未答时 stop：作废通知行（`cancelled:true`，args 原样重建）随后
+/// 进程干净退出。
+#[test]
+fn bin_ask_user_pending_stop_emits_cancelled_line() {
+    let (mut child, rx, mut stdin) = spawn_serve();
+    writeln!(
+        stdin,
+        r#"{{"id":10,"op":"askUser","args":{{"questions":[{{"id":"q1","question":"？"}}]}}}}"#
+    )
+    .expect("写 askUser");
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到服务端请求行");
+    let ask: serde_json::Value = serde_json::from_str(&line).expect("服务端请求行必须是 JSON");
+    assert_eq!(ask["id"], serde_json::json!("ask-1"));
+
+    writeln!(stdin, "stop").expect("写 stop");
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到作废通知行");
+    let cancel: serde_json::Value = serde_json::from_str(&line).expect("作废通知行必须是 JSON");
+    assert_eq!(cancel["id"], serde_json::json!("ask-1"));
+    assert_eq!(cancel["op"], serde_json::json!("askUser"));
+    assert_eq!(cancel["cancelled"], serde_json::json!(true));
+
+    drop(stdin);
+    let status = child.wait().expect("等待退出");
+    assert!(status.success(), "stop 后应干净退出: {status:?}");
+}
+
+/// pending 未答时关 stdin（EOF 退出路径）：进程干净退出（清空 pending，
+/// 不写延迟响应），不留孤儿、不悬挂。
+#[test]
+fn bin_ask_user_pending_exits_cleanly_on_stdin_eof() {
+    let (mut child, rx, mut stdin) = spawn_serve();
+    writeln!(
+        stdin,
+        r#"{{"id":10,"op":"askUser","args":{{"questions":[{{"id":"q1","question":"？"}}]}}}}"#
+    )
+    .expect("写 askUser");
+    let line = rx.recv_timeout(Duration::from_secs(30)).expect("应收到服务端请求行");
+    let ask: serde_json::Value = serde_json::from_str(&line).expect("服务端请求行必须是 JSON");
+    assert_eq!(ask["id"], serde_json::json!("ask-1"));
+
+    // 直接关 stdin：EOF 清表退出。
+    drop(stdin);
+    let status = child.wait().expect("等待退出");
+    assert!(status.success(), "EOF 后应干净退出: {status:?}");
 }

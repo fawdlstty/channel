@@ -133,6 +133,11 @@ impl CapabilityReport {
                 Capability::PermissionResponses,
                 declared.permission_responses,
             ),
+            (Capability::UserInputRequests, declared.user_input_requests),
+            (
+                Capability::UserInputResponses,
+                declared.user_input_responses,
+            ),
             (Capability::TurnCancel, declared.turn_cancel),
             (Capability::SessionClose, declared.session_close),
             (
@@ -188,6 +193,8 @@ impl CapabilitySet {
         complement_field!(network_access_control);
         complement_field!(permission_requests);
         complement_field!(permission_responses);
+        complement_field!(user_input_requests);
+        complement_field!(user_input_responses);
         complement_field!(turn_cancel);
         complement_field!(session_close);
         complement_field!(provider_persistence);
