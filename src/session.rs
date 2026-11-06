@@ -2,9 +2,9 @@ use crate::protocol::{
     AuthInfo, AuthState, BackendInfo, BackendKind, Capabilities, CapabilityReport, CapabilitySet,
     Confidence, ConversationSpec, Error, Event, FileChange, FileRead, FileReadSource, Finish,
     HarnessKind, HarnessState, ModelInfo, ObservationSource, PermissionInfo, Resumability,
-    RuntimeInfo, SessionConfig, SessionInfo, Shareability, Status, TodoSnapshot, ToolCall,
-    ToolStatus, TransportKind, TurnInfo, UserInputRequest, VisibilityInfo, VisibilityState,
-    WorkspaceInfo,
+    RuntimeInfo, SessionConfig, SessionInfo, Shareability, Status, SubagentsSnapshot,
+    TodoSnapshot, ToolCall, ToolStatus, TransportKind, TurnInfo, UserInputRequest, VisibilityInfo,
+    VisibilityState, WorkspaceInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -170,6 +170,11 @@ pub enum SessionEvent {
     /// 覆盖上一份快照，会话状态聚合忽略它。
     Todo {
         snapshot: TodoSnapshot,
+    },
+    /// 子代理（worker）名单全量快照（[`Event::Subagents`] 的会话层投影）。
+    /// 逐次事件整体覆盖上一份快照，会话状态聚合忽略它。
+    Subagents {
+        snapshot: SubagentsSnapshot,
     },
     Finished(Finish),
 }
@@ -1033,6 +1038,9 @@ impl Session {
             Event::Todo(snapshot) => Some(SessionEvent::Todo {
                 snapshot: snapshot.clone(),
             }),
+            Event::Subagents(snapshot) => Some(SessionEvent::Subagents {
+                snapshot: snapshot.clone(),
+            }),
             Event::PermissionRequired { id, detail } => {
                 Some(SessionEvent::Permission(PermissionEvent {
                     id: id.clone(),
@@ -1105,6 +1113,8 @@ impl Session {
             // 待办快照同样是透传事实：GUI 侧整表替换即可，会话聚合
             // （工具/文件/文本）不吸收其内容。
             Event::Todo(_) => {}
+            // 子代理名单快照同上：透传事实，聚合不吸收。
+            Event::Subagents(_) => {}
             Event::Finished(finish) => {
                 let finish = if finish.text.is_empty() {
                     Finish::new(finish.status, self.text.clone())

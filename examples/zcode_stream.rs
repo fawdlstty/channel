@@ -97,6 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SessionEvent::Todo { snapshot } => {
                 println!("\n[t+{:.3}s] todo snapshot: {} entries", at.as_secs_f64(), snapshot.entries.len());
             }
+            SessionEvent::Subagents { snapshot } => {
+                println!("\n[t+{:.3}s] subagents snapshot: rev {} running {} ended {}",
+                    at.as_secs_f64(), snapshot.revision, snapshot.running.len(), snapshot.ended_total);
+            }
             SessionEvent::Finished(finish) => {
                 println!("\n[t+{:.3}s] finished: {:?} text({} chars)",
                     at.as_secs_f64(), finish.status, finish.text.chars().count());

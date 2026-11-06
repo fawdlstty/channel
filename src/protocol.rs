@@ -1453,6 +1453,36 @@ pub struct TodoSnapshot {
     pub explanation: Option<String>,
 }
 
+/// 运行中子代理（worker）条目：ZCode 会话状态 `subagents.running[]` 的
+/// 投影。ended 名单带游标分页（量大），只投影总数。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentRunning {
+    /// 子会话 id（`sess_subagent_<agentId>` 形态）。
+    pub child_session_id: String,
+    /// worker 实例 id（`agent_<uuid>`）；引擎旧版缺省为 `None`。
+    pub agent_id: Option<String>,
+    /// worker 类型名（general-purpose / Explore / 自定义 agent 名）。
+    pub subagent_type: String,
+    /// 任务短标题（派发 prompt 首行截断）。
+    pub title: String,
+    /// running | waiting | blocked。
+    pub status: String,
+}
+
+/// 子代理（worker）名单全量快照：ZCode `state.updated` 的
+/// `patch.subagents` 投影。整表快照语义同 [`TodoSnapshot`]，消费方逐次
+/// 整体覆盖；`revision` 随名单变化单调递增可作去重键。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentsSnapshot {
+    pub revision: u64,
+    /// 本会话全部子会话 id（含已结束）。
+    pub child_session_ids: Vec<String>,
+    /// 当前运行中的 worker（含 waiting/blocked）。
+    pub running: Vec<SubagentRunning>,
+    /// 已结束 worker 总数。
+    pub ended_total: u64,
+}
+
 /// todo/plan 类工具名判定：小写并去掉 `_`/`-`/空格后等于 `todowrite` 或
 /// `updateplan`（不含 todoread——读侧不产生快照）。StructuredCli 提升点
 /// 与 session 活动分类共用同一判定，避免两处口径漂移。
@@ -1611,9 +1641,13 @@ pub enum Event {
     FileChange(FileChange),
     /// 待办/计划一等事件：结构化 CLI 的 TodoWrite/UpdatePlan 工具调用、
     /// ACP 的 `plan` 会话更新与 Codex 的 `turn/plan/updated` 通知统一
-    /// 归一到此变体。`TodoSnapshot` 是全量快照，逐次事件整体覆盖上一份，
+    /// 归到此变体。`TodoSnapshot` 是全量快照，逐次事件整体覆盖上一份，
     /// 不做增量合并。
     Todo(TodoSnapshot),
+    /// 子代理（worker）名单一等事件：ZCode `state.updated` 的
+    /// `patch.subagents` 归一（目前唯一事件源）。全量快照，逐次整体覆盖；
+    /// 名单不变引擎不推，收到即有变化。
+    Subagents(SubagentsSnapshot),
     PermissionRequired {
         id: String,
         detail: String,

@@ -27,10 +27,11 @@ pub use protocol::{
     ReasoningEffort, RepositoryDetection, RepositoryInfo, RepositoryKind, ResourcePolicy,
     Resumability, ResumeTarget, RetentionPolicy, RuntimeInfo, RuntimeOptions, RuntimeSpec,
     SecretAccess, SecretPermission, SecurityOptions, SessionConfig, SessionInfo, SessionState,
-    ShareAudience, Shareability, Status, StderrPolicy, SwitchProvider, TempPolicy, TodoEntry,
-    TodoSnapshot, TodoStatus, ToolCall, ToolStatus, TransportKind, TriState, TurnInfo, Usage,
-    UserInputRequest, UserQuestion, UserQuestionOption, VisibilityInfo, VisibilityLimitation,
-    VisibilityRequest, VisibilityState, WorkspaceInfo, WorkspaceOptions, WorkspaceRoot,
+    ShareAudience, Shareability, Status, StderrPolicy, SubagentRunning, SubagentsSnapshot,
+    SwitchProvider, TempPolicy, TodoEntry, TodoSnapshot, TodoStatus, ToolCall, ToolStatus,
+    TransportKind, TriState, TurnInfo, Usage, UserInputRequest, UserQuestion, UserQuestionOption,
+    VisibilityInfo, VisibilityLimitation, VisibilityRequest, VisibilityState, WorkspaceInfo,
+    WorkspaceOptions, WorkspaceRoot,
 };
 pub use session::{
     ActivityCounts, ActivityEvent, ActivityId, ActivityKind, ActivityStatus, ActivitySummary,
@@ -62,9 +63,13 @@ pub use history::{
     new_event_id, new_session_id, slugify,
     // 常量
     DB_FILE_NAME, DEFAULT_TITLE, ENTRY_SUFFIX_CHANNEL_SELECTION,
-    ENTRY_TYPE_CHANNEL_SELECTION, SETTING_SCOPE, SETTING_SCOPE_ID,
+    ENTRY_SUFFIX_PROVIDER_SESSION, ENTRY_SUFFIX_TODO_STATE,
+    ENTRY_TYPE_CHANNEL_SELECTION, ENTRY_TYPE_PROVIDER_SESSION,
+    ENTRY_TYPE_TODO_STATE, SETTING_SCOPE, SETTING_SCOPE_ID,
     TASK_TYPE_INTERACTIVE, TITLE_SOURCE_CUSTOM, TITLE_SOURCE_DEFAULT,
     TITLE_SOURCE_FIRST_INPUT,
+    // 引擎会话续接（provider resume）
+    ProviderSessionRecord,
 };
 
 // Types shared by the HTTP protocol clients (`llm`) and the local-model

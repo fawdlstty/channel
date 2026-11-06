@@ -48,6 +48,11 @@ pub const ENTRY_SUFFIX_CHANNEL_SELECTION: &str = ":channel-selection";
 /// 待办快照 entry（`{session_id}:todo-state`，覆盖式 upsert）。
 pub const ENTRY_TYPE_TODO_STATE: &str = "runtime/todo_state";
 pub const ENTRY_SUFFIX_TODO_STATE: &str = ":todo-state";
+/// 引擎会话续接 entry（`{session_id}:provider-session`，覆盖式 upsert）：
+/// 底层引擎会话的 provider 侧 id 及创建时的渠道/权限快照，宿主丢弃运行态
+/// 会话后可据此走 provider resume 重建，避免引擎侧上下文丢失。
+pub const ENTRY_TYPE_PROVIDER_SESSION: &str = "runtime/provider_session";
+pub const ENTRY_SUFFIX_PROVIDER_SESSION: &str = ":provider-session";
 /// local_setting ownership (scope/scope_id are fixed to the single-user
 /// layout; the namespace parameter keeps host namespaces isolated).
 pub const SETTING_SCOPE: &str = "user";
@@ -987,6 +992,24 @@ impl ChatHistoryDatabase {
         find_todo_state(&*self.inner.lock().await, session_id).await
     }
 
+    /// 覆盖式写入会话的引擎会话续接记录（每轮收尾由宿主调用；幂等）。
+    pub async fn upsert_provider_session(
+        &self,
+        session_id: &str,
+        record: &ProviderSessionRecord,
+        now: i64,
+    ) -> Result<(), Error> {
+        upsert_provider_session(&*self.inner.lock().await, session_id, record, now).await
+    }
+
+    /// 单会话的引擎会话续接记录（runtime/provider_session）；无则 None。
+    pub async fn find_provider_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ProviderSessionRecord>, Error> {
+        find_provider_session(&*self.inner.lock().await, session_id).await
+    }
+
     // ----- messages -----
 
     /// 落盘用户消息：message 行（data=user_message_data）+ 单 text part
@@ -1641,6 +1664,102 @@ async fn find_todo_state(
         .await
         .db_error("failed to query the todo state")?;
     Ok(row.and_then(|row| parse_todo_state(&row.data)))
+}
+
+// ---------- provider session (session_entry) ----------
+
+/// 引擎会话续接记录：provider 侧会话 id（zcode session id / codex thread id
+/// / claudecode session id，各 backend 的 resume 均按此 id 续接）+ 记录时刻
+/// 的渠道 key 与权限模式快照。宿主重建底层会话时，仅当渠道与权限模式都与
+/// 快照一致才 resume（跨引擎 id 不可续接；权限模式在引擎会话创建时烙进配
+/// 置，resume 不改写）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderSessionRecord {
+    pub provider_session_id: String,
+    pub channel_key: String,
+    pub perm_mode: String,
+}
+
+/// `runtime/provider_session` 行的 data 载荷（camelCase，对齐 ZCode 格式）。
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderSessionData {
+    provider_session_id: String,
+    channel_key: String,
+    perm_mode: String,
+}
+
+fn provider_session_data(record: &ProviderSessionRecord) -> String {
+    let data = ProviderSessionData {
+        provider_session_id: record.provider_session_id.clone(),
+        channel_key: record.channel_key.clone(),
+        perm_mode: record.perm_mode.clone(),
+    };
+    serde_json::to_string(&data).unwrap_or_else(|_| "{}".into())
+}
+
+fn parse_provider_session(data: &str) -> Option<ProviderSessionRecord> {
+    serde_json::from_str::<ProviderSessionData>(data).ok().map(
+        |data| ProviderSessionRecord {
+            provider_session_id: data.provider_session_id,
+            channel_key: data.channel_key,
+            perm_mode: data.perm_mode,
+        },
+    )
+}
+
+/// 覆盖式写入会话的引擎会话续接记录（entry 固定 id，存在改写、不存在新
+/// 建；模式同 todo state）。空 id 拒绝写入（create 失败的轮无 id 可记）。
+async fn upsert_provider_session(
+    db: &ormer::Database,
+    session_id: &str,
+    record: &ProviderSessionRecord,
+    now: i64,
+) -> Result<(), Error> {
+    if record.provider_session_id.is_empty() {
+        return Ok(());
+    }
+    let id = format!("{session_id}{ENTRY_SUFFIX_PROVIDER_SESSION}");
+    let data = provider_session_data(record);
+    let updated = db
+        .update::<SessionEntryRow>()
+        .filter(|m| m.id.eq(id.clone()))
+        .set(|m| {
+            m.data = m.data.set(data.clone());
+            m.time_updated = m.time_updated.set(now);
+        })
+        .execute()
+        .await
+        .db_error("failed to update the provider session")?;
+    if updated == 0 {
+        db.insert(&SessionEntryRow {
+            id,
+            session_id: session_id.to_string(),
+            entry_type: ENTRY_TYPE_PROVIDER_SESSION.to_string(),
+            time_created: now,
+            time_updated: now,
+            data,
+        })
+        .execute()
+        .await
+        .db_error("failed to insert the provider session")?;
+    }
+    Ok(())
+}
+
+/// 单会话的引擎会话续接记录（runtime/provider_session entry）；无则 None。
+async fn find_provider_session(
+    db: &ormer::Database,
+    session_id: &str,
+) -> Result<Option<ProviderSessionRecord>, Error> {
+    let row: Option<SessionEntryRow> = db
+        .select::<SessionEntryRow>()
+        .filter(|m| m.session_id.eq(session_id.to_string()))
+        .filter(|m| m.entry_type.eq(ENTRY_TYPE_PROVIDER_SESSION.to_string()))
+        .first()
+        .await
+        .db_error("failed to query the provider session")?;
+    Ok(row.and_then(|row| parse_provider_session(&row.data)))
 }
 
 // ---------- messages ----------

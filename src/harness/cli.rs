@@ -1,6 +1,7 @@
 use crate::protocol::{
     Confidence, Error, Event, FileChange, FileChangeKind, FileRead, FileReadSource, Finish,
-    HarnessKind, ObservationSource, Status, TodoSnapshot, ToolCall, ToolStatus, is_todo_plan_tool,
+    HarnessKind, ObservationSource, Status, SubagentRunning, SubagentsSnapshot, TodoSnapshot,
+    ToolCall, ToolStatus, is_todo_plan_tool,
 };
 use crate::session::{Backend, BackendFuture, SendMode};
 use crate::utils::json::JsonValueExt;
@@ -125,6 +126,19 @@ pub(crate) struct CliBackend {
     pending_attachments: Vec<String>,
     /// 上一轮超限降级产生的临时附件文件；下一轮 spawn 或后端关闭时删除。
     overflow_file: Option<PathBuf>,
+    /// 子代理（worker）名单投影：CLI 形态下引擎不推 subagents 快照（那是
+    /// 桌面 UI 从事件流本地算的投影，不经 wire），channel 从 Agent/Task
+    /// 派生工具事件现场推导——requested/running 加入名单、completed 移除
+    /// 并计入结束。镜像子工具调用（toolCallId 前缀 `tool_subagent_`）不进
+    /// 名单。revision 随名单变化递增。
+    worker_revision: u64,
+    /// 派生工具 toolCallId → 名单条目（running 中的 worker）。
+    workers_running: Vec<(String, SubagentRunning)>,
+    worker_ended_total: u64,
+    /// toolCallId → 流式入参累积缓冲：CLI 流的入参 JSON 经 tool_input_delta
+    /// 块送达（tool_input_start/end 帧的 input 恒为 null），worker 投影在
+    /// 入参收齐时从缓冲提取类型与标题；completed 随手清理。
+    worker_input_bufs: std::collections::HashMap<String, String>,
 }
 
 impl CliBackend {
@@ -179,6 +193,10 @@ impl CliBackend {
             pending_attachments: Vec::new(),
             overflow_file: None,
             resources,
+            worker_revision: 0,
+            workers_running: Vec::new(),
+            worker_ended_total: 0,
+            worker_input_bufs: std::collections::HashMap::new(),
         })
     }
 
@@ -563,6 +581,7 @@ impl CliBackend {
                 })
                 .unwrap_or_default(),
             "tool_input_start" => self.zcode_tool_events(payload, "requested"),
+            "tool_input_delta" => self.zcode_tool_input_delta(payload),
             "tool_input_end" => self.zcode_tool_events(payload, "running"),
             "tool_call" => self.zcode_tool_events(payload, "completed"),
             _ => Vec::new(),
@@ -577,7 +596,7 @@ impl CliBackend {
             .map(str::to_owned)
     }
 
-    fn zcode_tool_events(&self, payload: &Value, status: &'static str) -> Vec<Event> {
+    fn zcode_tool_events(&mut self, payload: &Value, status: &'static str) -> Vec<Event> {
         let id = payload
             .get("toolCallId")
             .or_else(|| payload.get("tool_call_id"))
@@ -597,7 +616,194 @@ impl CliBackend {
             .get("output")
             .or_else(|| payload.get("result"))
             .filter(|output| !output.is_null());
-        ToolEvent::new(id, name, input, status, output, false).events()
+        let mut events = ToolEvent::new(id.clone(), name.clone(), input.clone(), status, output, false)
+            .events();
+        // 子代理名单投影：worker 派生工具的requested/running/completed 状态
+        // 翻译成名单全量快照（引擎 wire 不推该投影，见结构体字段注）。
+        // 帧内 input 为 null 时回退流式缓冲（CLI 流的入参 JSON 在 delta 块
+        // 里攒齐，tool_input_end 帧本身不带 input）。
+        if status == "requested" {
+            if let Some(id) = id.as_ref() {
+                self.worker_input_bufs.remove(id);
+            }
+        }
+        let projected_input = if input.is_null() {
+            id.as_ref()
+                .and_then(|id| self.worker_input_bufs.get(id))
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .unwrap_or(Value::Null)
+        } else {
+            input.clone()
+        };
+        if let Some(event) = self.project_subagent_event(&id, &name, &projected_input, status) {
+            events.push(event);
+        }
+        if status == "completed" {
+            if let Some(id) = id.as_ref() {
+                self.worker_input_bufs.remove(id);
+            }
+        }
+        events
+    }
+
+    /// tool_input_delta 帧入参块累积：把 delta 文本按 toolCallId 攒进缓冲，
+    /// 供投影在入参收齐（tool_input_end）时提取 worker 类型与标题。镜像子
+    /// 工具调用的 delta 一并累积（键隔离、completed 清理，无副作用）。
+    fn zcode_tool_input_delta(&mut self, payload: &Value) -> Vec<Event> {
+        let id = payload
+            .get("toolCallId")
+            .or_else(|| payload.get("tool_call_id"))
+            .and_then(JsonValueExt::string_value);
+        if let Some(id) = id {
+            if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                self.worker_input_bufs
+                    .entry(id.to_owned())
+                    .or_default()
+                    .push_str(delta);
+            }
+        }
+        Vec::new()
+    }
+
+    /// Agent/Task 派生工具事件 → 子代理名单快照变化。按 toolCallId 匹配：
+    /// 已在名单的条目随 input 流式补全刷新（tool_input_end 帧常丢工具名，
+    /// 只能按键回配），completed 移除并计入结束；不在名单时仅 Agent/Task/
+    /// SendMessage 派生工具入名单。返回 `Some` 表示名单有变化（附最新
+    /// 快照事件），`None` 表示无关工具或名单未变。
+    fn project_subagent_event(
+        &mut self,
+        id: &Option<String>,
+        name: &str,
+        input: &Value,
+        status: &'static str,
+    ) -> Option<Event> {
+        // 镜像子工具调用（父会话里 worker 内部工具的镜像）不进名单：其
+        // toolCallId 带固定前缀，名字是 worker 内部的 Bash/Read 等。
+        if id.as_deref().is_some_and(|value| value.starts_with("tool_subagent_")) {
+            return None;
+        }
+        // TEMP-PROBE: 定位实况投影不渲染问题，验证后移除
+        eprintln!(
+            "[worker-probe] frame name={name} status={status} id={:?} known={} input={}",
+            id,
+            self.workers_running.iter().any(|(existing, _)| Some(existing) == id.as_ref()),
+            &input.to_string()[..input.to_string().len().min(400)]
+        );
+        let key = id.clone().unwrap_or_else(|| format!("worker-{}", self.workers_running.len()));
+        let known = self.workers_running.iter().any(|(existing, _)| *existing == key);
+        if !known {
+            let lower = name.to_ascii_lowercase();
+            let is_spawn_tool = lower == "agent" || lower == "task" || lower == "sendmessage";
+            if !is_spawn_tool {
+                return None;
+            }
+        }
+        match status {
+            // requested/running：名单加入或刷新（input 随帧流式补全，按
+            // key 幂等）
+            "requested" | "running" => {
+                let entry = subagent_entry_from_input(input);
+                let slot = self
+                    .workers_running
+                    .iter_mut()
+                    .find(|(existing, _)| *existing == key);
+                match slot {
+                    Some((_, existing)) if *existing == entry => return None,
+                    Some((_, existing)) => *existing = entry,
+                    None => self.workers_running.push((key, entry)),
+                }
+            }
+            // completed：移出名单并计入结束（failed 不经此路径——CLI 流里
+            // 工具失败随 turn.failed 收场，整轮名单随下轮 spawn_turn 保留）
+            "completed" | "failed" => {
+                let before = self.workers_running.len();
+                self.workers_running.retain(|(existing, _)| *existing != key);
+                if before == self.workers_running.len() {
+                    return None; // 未入过名单（如缺 tool_input_start 的孤儿完成帧）
+                }
+                self.worker_ended_total += 1;
+            }
+            _ => return None,
+        }
+        self.worker_revision += 1;
+        // TEMP-PROBE: 验证后移除
+        let entries = self
+            .workers_running
+            .iter()
+            .map(|(_, entry)| format!("{}:{}", entry.subagent_type, entry.title))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "[worker-probe] emit revision={} running={} ended={} entries=[{}]",
+            self.worker_revision, self.workers_running.len(), self.worker_ended_total, entries
+        );
+        Some(Event::Subagents(SubagentsSnapshot {
+            revision: self.worker_revision,
+            child_session_ids: Vec::new(),
+            running: self
+                .workers_running
+                .iter()
+                .map(|(_, entry)| entry.clone())
+                .collect(),
+            ended_total: self.worker_ended_total,
+        }))
+    }
+}
+
+/// 从派生工具 input 提取 worker 名单条目：类型取 subagent_type/subagentType/
+/// name/agent/profile 候选链（缺省回落 "worker"），标题取 description/prompt/
+/// task/task 首行（截 60 字符，全缺回落类型名）。
+fn subagent_entry_from_input(input: &Value) -> SubagentRunning {
+    let parsed;
+    let object = match input {
+        Value::Object(object) => Some(object),
+        Value::String(text) => {
+            parsed = serde_json::from_str::<Value>(text).ok();
+            parsed.as_ref().and_then(Value::as_object)
+        }
+        _ => None,
+    };
+    let field = |keys: &[&str]| -> Option<String> {
+        object.and_then(|object| {
+            keys.iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        })
+    };
+    let agent_id = field(&["agentId", "agent_id"]);
+    let kind = field(&[
+        "subagent_type",
+        "subagentType",
+        "name",
+        "agentType",
+        "profile",
+        "profileId",
+    ])
+    .unwrap_or_else(|| "worker".to_owned());
+    let title = field(&["description", "prompt", "task", "message"])
+        .and_then(|text| {
+            text.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_owned)
+        })
+        .map(|line| {
+            let mut chars = line.chars().take(60);
+            let mut truncated = chars.by_ref().collect::<String>();
+            if truncated.chars().count() == 60 && line.chars().count() > 60 {
+                truncated.push('…');
+            }
+            truncated
+        })
+        .unwrap_or_else(|| kind.clone());
+    SubagentRunning {
+        child_session_id: String::new(),
+        agent_id,
+        subagent_type: kind,
+        title,
+        status: "running".to_owned(),
     }
 }
 
@@ -1464,6 +1670,92 @@ mod tests {
             HarnessKind::ZCode,
         ), None)
         .unwrap()
+    }
+
+    /// 子代理名单投影回归（2026-11-06）：Agent 工具 requested→running 加入
+    /// 名单、completed 移除并计入结束；镜像子工具调用（tool_subagent_ 前缀）
+    /// 不进名单；无关工具不产出快照。CLI 实况帧形：requested/end 帧 input
+    /// 恒为 null，入参 JSON 经 tool_input_delta 块送达，入参收齐（end）时
+    /// 从缓冲提取真实类型/标题刷新名单。
+    #[test]
+    fn agent_tool_events_project_subagents_snapshots() {
+        let mut backend = zcode_backend();
+        // spawn：requested 先以兜底条目入名单（delta 未攒齐，input null）
+        backend
+            .route_line(r#"{"type":"model.streaming","payload":{"kind":"tool_input_start","toolCallId":"call_abc","toolName":"Agent"}}"#.to_owned())
+            .unwrap();
+        let mut first_snapshot = None;
+        while let Some(event) = backend.queued.pop_front() {
+            if let Event::Subagents(snapshot) = event {
+                first_snapshot = Some(snapshot);
+            }
+        }
+        let snapshot = first_snapshot.expect("spawn start must emit a subagents snapshot");
+        assert_eq!(snapshot.running.len(), 1);
+        assert_eq!(snapshot.running[0].subagent_type, "worker");
+
+        // delta 块攒入参（不产快照），收齐后 end 帧提取真实类型/标题刷新
+        backend
+            .route_line(r#"{"type":"model.streaming","payload":{"kind":"tool_input_delta","toolCallId":"call_abc","delta":"{\"agentType\":\"general"}}"#.to_owned())
+            .unwrap();
+        assert!(!backend
+            .queued
+            .iter()
+            .any(|event| matches!(event, Event::Subagents(_))));
+        backend
+            .route_line(r#"{"type":"model.streaming","payload":{"kind":"tool_input_delta","toolCallId":"call_abc","delta":"-purpose\",\"description\":\"数文件\",\"prompt\":\"count files\"}"}}"#.to_owned())
+            .unwrap();
+        assert!(!backend
+            .queued
+            .iter()
+            .any(|event| matches!(event, Event::Subagents(_))));
+        backend
+            .route_line(r#"{"type":"model.streaming","payload":{"kind":"tool_input_end","toolCallId":"call_abc","toolName":"tool"}}"#.to_owned())
+            .unwrap();
+        let mut refreshed = None;
+        while let Some(event) = backend.queued.pop_front() {
+            if let Event::Subagents(snapshot) = event {
+                refreshed = Some(snapshot);
+            }
+        }
+        let snapshot = refreshed.expect("input end must refresh the subagents snapshot");
+        assert_eq!(snapshot.running.len(), 1);
+        assert_eq!(snapshot.running[0].subagent_type, "general-purpose");
+        assert_eq!(snapshot.running[0].title, "数文件");
+
+        // 无关工具：不产出快照（普通 ToolCall 事件照常入队，清掉再继续）
+        backend
+            .route_line(r#"{"type":"model.streaming","payload":{"kind":"tool_input_start","toolCallId":"call_x","toolName":"Bash","input":"{}"}}"#.to_owned())
+            .unwrap();
+        assert!(!backend
+            .queued
+            .iter()
+            .any(|event| matches!(event, Event::Subagents(_))));
+        backend.queued.clear();
+
+        // 镜像子工具调用：不产出快照
+        backend
+            .route_line(r#"{"type":"model.streaming","payload":{"kind":"tool_call","toolCallId":"tool_subagent_agent_1_call_z","toolName":"Bash","input":"{}","output":"ok"}}"#.to_owned())
+            .unwrap();
+        assert!(!backend
+            .queued
+            .iter()
+            .any(|event| matches!(event, Event::Subagents(_))));
+        backend.queued.clear();
+
+        // 完成：移出名单并计入结束
+        backend
+            .route_line(r#"{"type":"model.streaming","payload":{"kind":"tool_call","toolCallId":"call_abc","toolName":"Agent","input":"{\"agentType\":\"general-purpose\",\"description\":\"数文件\"}","output":"done"}}"#.to_owned())
+            .unwrap();
+        let mut ended_snapshot = None;
+        while let Some(event) = backend.queued.pop_front() {
+            if let Event::Subagents(snapshot) = event {
+                ended_snapshot = Some(snapshot);
+            }
+        }
+        let snapshot = ended_snapshot.expect("completion must emit a subagents snapshot");
+        assert!(snapshot.running.is_empty());
+        assert_eq!(snapshot.ended_total, 1);
     }
 
     #[test]

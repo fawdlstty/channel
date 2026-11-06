@@ -23,8 +23,8 @@
 
 use crate::process::JsonlProcess;
 use crate::protocol::{
-    Error, Event, Finish, Status, ToolCall, ToolStatus, UserInputRequest, UserQuestion,
-    UserQuestionOption,
+    Error, Event, Finish, Status, SubagentRunning, SubagentsSnapshot, ToolCall, ToolStatus,
+    UserInputRequest, UserQuestion, UserQuestionOption,
 };
 use crate::runtime::HarnessDiscovery;
 use crate::session::{Backend, BackendFuture, PermissionResponse, SendMode};
@@ -751,6 +751,12 @@ impl<'a> ZcodeNotification<'a> {
             // 订阅后事件单条一帧：params {type, payload, eventId, sessionId,
             // turnId?, seq, traceId, timestamp, deliveryKind}，按 type 分派。
             "session/event" => Self::session_events(self.0),
+            // 会话状态补丁：引擎以独立 method 推（wire 实测 2026-11-06，不经
+            // session/event 封装），params {type:"state.updated", scope,
+            // revision, reason?, patch}。patch.subagents 归一为一等子代理
+            // 名单事件，其余 patch 键（status/mode/model/todo/goal/plan/
+            // workflowRuns 等）各有消费者，channel 不关心。
+            "state.updated" => subagents_events(self.0.get("params").unwrap_or(&Value::Null)),
             // 启动即推的存储状态噪声，契约注明可忽略。
             "startup/storageState" => Vec::new(),
             _ => vec![Event::Raw(self.0.clone())],
@@ -772,19 +778,20 @@ impl<'a> ZcodeNotification<'a> {
             // 失败终态镜像 codex 的产出方式：Event::Error 触发 Session 的
             // fail()（终态 Failed + termination 记录），不追加 Finished。
             "turn.failed" => vec![Event::Error(turn_failed_message(&payload))],
+            // 会话状态补丁：patch.subagents 是子代理（worker）名单全量投影
+            // （名单变化才推），归一为一等 Event::Subagents。
+            "state.updated" => subagents_events(&payload),
             // 服务端反向请求的事件镜像（permission/userInput requested/
             // resolved）：真实交互走反向请求通道，忽略防止重复上报。
             // turn.started 不映射（send 已同步置 Running）；message.upserted/
             // part.* 是整条消息/部件落地，忽略避免与增量重复；session.*、
-            // state.updated、checkpoint、rewind、streamRecovery、steer 暂无
-            // 归一化目标。
+            // checkpoint、rewind、streamRecovery、steer 暂无归一化目标。
             "turn.started"
             | "message.upserted"
             | "permission.requested"
             | "permission.resolved"
             | "userInput.requested"
             | "userInput.resolved"
-            | "state.updated"
             | "checkpoint"
             | "rewind"
             | "streamRecovery"
@@ -852,6 +859,67 @@ fn tool_events(payload: &Value) -> Vec<Event> {
         error: error.map(JsonValueExt::value_text),
         sequence: 0,
     })]
+}
+
+/// state.updated → patch.subagents 子代理名单全量快照。两个入口共用：独立
+/// method（wire 实测主路径，入参为 params 本体）与 session/event 封装形态
+/// （入参为 params.payload，防御性保留）。subagents 形状经引擎 bundle
+/// schema 核实（2026-11-06）：{revision, childSessionIds[], running[]
+/// [{childSessionId, agentId?, toolCallId?, subagentType, title, summary?,
+/// status, startedAt?}], endedTotal}。patch 缺 subagents 键（status/mode/
+/// model/todo/goal/plan/workflowRuns 等其余状态各有消费者）或字段畸形时
+/// 静默忽略，不产出事件。
+fn subagents_events(payload: &Value) -> Vec<Event> {
+    let subagents = match payload.get("patch").and_then(|patch| patch.get("subagents")) {
+        Some(subagents) => subagents,
+        None => return Vec::new(),
+    };
+    let revision = subagents.get("revision").and_then(Value::as_u64);
+    let ended_total = subagents.get("endedTotal").and_then(Value::as_u64);
+    let child_ids: Option<Vec<String>> = subagents
+        .get("childSessionIds")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|id| id.as_str().map(str::to_owned))
+                .collect()
+        });
+    let running: Option<Vec<SubagentRunning>> = subagents
+        .get("running")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| {
+                    // childSessionId/subagentType/title 是名单条目的最小可
+                    // 显示集，缺一放弃该条目；status 缺省按 running 处理。
+                    let child = entry.get("childSessionId").and_then(Value::as_str)?;
+                    let kind = entry.get("subagentType").and_then(Value::as_str)?;
+                    let title = entry.get("title").and_then(Value::as_str)?;
+                    Some(SubagentRunning {
+                        child_session_id: child.to_owned(),
+                        agent_id: entry.get("agentId").and_then(Value::as_str).map(str::to_owned),
+                        subagent_type: kind.to_owned(),
+                        title: title.to_owned(),
+                        status: entry
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("running")
+                            .to_owned(),
+                    })
+                })
+                .collect()
+        });
+    match (revision, ended_total, child_ids, running) {
+        (Some(revision), Some(ended_total), Some(child_session_ids), Some(running)) => {
+            vec![Event::Subagents(SubagentsSnapshot {
+                revision,
+                child_session_ids,
+                running,
+                ended_total,
+            })]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// `turn.completed` payload {response, tokenCount, toolCallCount, duration,

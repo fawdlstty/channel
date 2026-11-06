@@ -417,6 +417,56 @@ async fn todo_state_entry_upsert_and_read_back() {
     assert!(db.find_todo_state(&sid).await.unwrap().is_none());
 }
 
+// ---------- 6.6 引擎会话续接 entry ----------
+
+#[tokio::test]
+async fn provider_session_entry_upsert_and_read_back() {
+    let db = fresh_db().await;
+    db.insert_project(&project("prj_1")).await.unwrap();
+    let sid = seed_session(&db, "prj_1", "/tmp/d", "ZCode|t|m", 1, 1).await;
+
+    // 未写过：None
+    assert!(db.find_provider_session(&sid).await.unwrap().is_none());
+
+    // 首写 → 读回一致（camelCase 载荷经 ProviderSessionData 往返）
+    let record = channel::ProviderSessionRecord {
+        provider_session_id: "sess_engine_1".into(),
+        channel_key: "ZCode|t|m".into(),
+        perm_mode: "confirm".into(),
+    };
+    db.upsert_provider_session(&sid, &record, 10).await.unwrap();
+    assert_eq!(db.find_provider_session(&sid).await.unwrap().unwrap(), record);
+    assert_eq!(count(&db, "session_entry").await, 2, "渠道选择 + 续接记录各一行");
+
+    // 覆盖写：仍是同一行，内容整体换成新记录（失败轮后重建也会改写）
+    let next = channel::ProviderSessionRecord {
+        provider_session_id: "sess_engine_2".into(),
+        channel_key: "ZCode|t|m".into(),
+        perm_mode: "confirm".into(),
+    };
+    db.upsert_provider_session(&sid, &next, 20).await.unwrap();
+    assert_eq!(count(&db, "session_entry").await, 2, "覆盖写不新增行");
+    assert_eq!(db.find_provider_session(&sid).await.unwrap().unwrap(), next);
+
+    // 空 id 拒写：不新增行、原记录不动（create 失败的轮无 id 可记）
+    let empty = channel::ProviderSessionRecord {
+        provider_session_id: String::new(),
+        channel_key: "ZCode|t|m".into(),
+        perm_mode: "confirm".into(),
+    };
+    db.upsert_provider_session(&sid, &empty, 30).await.unwrap();
+    assert_eq!(count(&db, "session_entry").await, 2, "空 id 不新增行");
+    assert_eq!(db.find_provider_session(&sid).await.unwrap().unwrap(), next);
+
+    // 会话隔离：另一会话读不到
+    let other = seed_session(&db, "prj_1", "/tmp/d", "ZCode|t|m", 1, 1).await;
+    assert!(db.find_provider_session(&other).await.unwrap().is_none());
+
+    // 级联删除覆盖 provider session entry
+    db.delete_session_cascade(&sid).await.unwrap();
+    assert!(db.find_provider_session(&sid).await.unwrap().is_none());
+}
+
 // ---------- 7. 会话创建与重命名语义 ----------
 
 #[tokio::test]
