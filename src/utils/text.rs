@@ -116,12 +116,26 @@ extern "system" {
 mod tests {
     use super::*;
 
-    /// GBK 字节（"中文" = D6 D0 CE C4）按码页解回原文本。Windows 专属：
-    /// Unix 无码表，回落 lossy。
+    /// 当前系统 OEM 码页。码页转换按系统码表工作，同一批字节的期望值随
+    /// 码页不同：zh-CN（936）解出 GBK 原文，en-US（437，GitHub Actions
+    /// Windows runner 的默认码页）解出盒线字符。
+    #[cfg(windows)]
+    fn oem_code_page() -> u32 {
+        static PAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *PAGE.get_or_init(|| unsafe { GetOEMCP() })
+    }
+
+    /// GBK 字节（"中文" = D6 D0 CE C4）按系统码页解码。Windows 专属：
+    /// 期望值随实际码页取，其余码页无既知映射则跳过。Unix 无码表，不测。
     #[cfg(windows)]
     #[test]
     fn decodes_gbk_child_output() {
-        assert_eq!(decode_child_output(&[0xD6, 0xD0, 0xCE, 0xC4]), "中文");
+        let bytes = [0xD6, 0xD0, 0xCE, 0xC4];
+        match oem_code_page() {
+            936 => assert_eq!(decode_child_output(&bytes), "中文"),
+            437 => assert_eq!(decode_child_output(&bytes), "╓╨╬─"),
+            page => eprintln!("skipped: OEM code page {page} has no known mapping for these bytes"),
+        }
     }
 
     #[cfg(windows)]
@@ -139,7 +153,12 @@ mod tests {
             0xC3, 0xFC, // 命
             0xC1, 0xEE, // 令
         ];
-        assert_eq!(decode_child_output(&bytes), "不是内部或外部命令");
+        match oem_code_page() {
+            936 => assert_eq!(decode_child_output(&bytes), "不是内部或外部命令"),
+            // CP437 下同一批字节的解码结果（CI en-US runner 实测）。
+            437 => assert_eq!(decode_child_output(&bytes), "▓╗╩╟─┌▓┐╗≥═Γ▓┐├ⁿ┴ε"),
+            page => eprintln!("skipped: OEM code page {page} has no known mapping for these bytes"),
+        }
     }
 
     #[test]
