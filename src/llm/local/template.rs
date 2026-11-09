@@ -110,7 +110,6 @@ pub(crate) fn render_chat(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::MessageRole;
     use super::*;
 
     const CHATML: &str = concat!(
@@ -121,27 +120,13 @@ mod tests {
     );
 
     fn history() -> Vec<ChatMessage> {
+        // 用构造器而非结构体字面量：构造器会同步填好 tool_call_id/
+        // tool_calls 等扩展字段，新增字段时此处不再连坐。
         vec![
-            ChatMessage {
-                role: MessageRole::System,
-                ts_micros: 0,
-                content: "be brief".to_owned(),
-            },
-            ChatMessage {
-                role: MessageRole::User,
-                ts_micros: 1,
-                content: "hello".to_owned(),
-            },
-            ChatMessage {
-                role: MessageRole::Assistant,
-                ts_micros: 2,
-                content: "hi".to_owned(),
-            },
-            ChatMessage {
-                role: MessageRole::User,
-                ts_micros: 3,
-                content: "again".to_owned(),
-            },
+            ChatMessage::system("be brief"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user("again"),
         ]
     }
 

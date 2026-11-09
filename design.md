@@ -173,6 +173,12 @@
 - 【AI 演绎】四种直连协议客户端：OpenAI Chat Completions、OpenAI
   Responses、Anthropic Messages、Ollama（HTTP 传输 = potato Session），
   附 SSE/NDJSON 服务端流发射器。
+- 【AI 演绎，2026-11-08 真机报障】Chat Completions 出站 system 归一化
+  （`normalize_system_first`）：请求载荷里全部 system 条目折叠为首条单一
+  system（相同内容去重、不同内容按序空行拼接），其余消息保序、消息日志
+  不动。Qwen 系严格 chat template 对 messages[0] 之后的 system 一律
+  raise_exception（HTTP 500 "System message must be at the beginning"），
+  该防线兜住任何写入路径/历史脏状态产生的中段 system。
 - 【用户要求 U，2026-09-12】BYOK 复用桥（原 `harness::llm_bridge`）随
   harness 瘦身迁出至 WorkRecorder 仓 `wr-harness-ext`（见 §3.6）。
 
@@ -432,6 +438,13 @@
   的 typed copy（仍在演化；转写层再解析为 `channel::CompactionBoundary`）；
   会话状态聚合忽略该事件（透传事实，不改状态机），由宿主在事件消费侧
   处理转写。
+- 【AI 演绎，2026-11-09 落实宿主要求「错误信息均持久化」】轮错误记录
+  entry（`runtime/turn_errors`，`{session_id}:turn-errors`，单行 JSON
+  数组追加式）：`TurnErrorRecord{text,turn,time}`（time 为 epoch 毫秒，
+  回载时与消息按时间归位）+ 句柄方法 `append_turn_error`（读-改-写
+  upsert，同会话轮收尾在宿主侧串行无竞态）/`find_turn_errors`（追加序
+  即时间升序）；宿主在每轮失败收尾追加、回载会话时恢复错误卡（切会话/
+  重启后错误信息不丢）。删除会话走既有 session_entry 级联清理。
 - 【AI 演绎】回归：`tests/history.rs`（CRUD/投影/级联/标题/存档）、
   `tests/history_compaction.rs`（自压落库键名快照、幂等、切片语义、
   观察标记、外部转写真实 payload fixture、ormer 建库的引擎库只读

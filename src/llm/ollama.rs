@@ -432,15 +432,18 @@ mod tests {
         let stream = "{\"message\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"done\":false}\n\
                       {\"message\":{\"role\":\"assistant\",\"content\":\"lo\"},\"done\":false}\n\
                       {\"done\":true}\n";
-        let mut buffer = stream.to_owned();
+        let mut buffer = stream.to_owned().into_bytes();
         let mut collected = String::new();
         let mut saw_done = false;
-        while let Some(line) = super::super::next_ndjson_line(&mut buffer) {
+        while let Some(line) = super::super::next_ndjson_line_bytes(&mut buffer) {
             match parse_ndjson_line(&line) {
                 SseAction::Content(content) => collected.push_str(&content),
                 SseAction::Done => saw_done = true,
                 SseAction::Error(message) => panic!("unexpected error: {message}"),
                 SseAction::Ignore => {}
+                SseAction::ToolCallDelta(_)
+                | SseAction::FinishReason(_)
+                | SseAction::Usage(_) => {}
             }
         }
         assert_eq!(collected, "Hello");
@@ -500,6 +503,7 @@ mod tests {
                     chunks.push(StreamChunk::Content(content));
                 }
                 StreamChunk::Error(message) => panic!("unexpected error: {message}"),
+                StreamChunk::ToolCalls(_) | StreamChunk::Usage(_) => {}
                 StreamChunk::Done => {
                     chunks.push(StreamChunk::Done);
                     break;

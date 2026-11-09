@@ -34,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match chunk {
             channel::StreamChunk::Content(text) => print!("{text}"),
             channel::StreamChunk::Error(message) => eprintln!("\n[error: {message}]"),
+            channel::StreamChunk::ToolCalls(_) | channel::StreamChunk::Usage(_) => {}
             channel::StreamChunk::Done => println!(),
         }
     }

@@ -53,6 +53,11 @@ pub const ENTRY_SUFFIX_TODO_STATE: &str = ":todo-state";
 /// 会话后可据此走 provider resume 重建，避免引擎侧上下文丢失。
 pub const ENTRY_TYPE_PROVIDER_SESSION: &str = "runtime/provider_session";
 pub const ENTRY_SUFFIX_PROVIDER_SESSION: &str = ":provider-session";
+/// 轮错误记录 entry（`{session_id}:turn-errors`，追加式 JSON 数组）：
+/// 每轮失败的错误文本按时间追加，宿主回载会话时恢复错误卡——切换会话
+/// 或重启应用后错误信息不丢（2026-11-09 主人要求错误信息持久化）。
+pub const ENTRY_TYPE_TURN_ERRORS: &str = "runtime/turn_errors";
+pub const ENTRY_SUFFIX_TURN_ERRORS: &str = ":turn-errors";
 /// local_setting ownership (scope/scope_id are fixed to the single-user
 /// layout; the namespace parameter keeps host namespaces isolated).
 pub const SETTING_SCOPE: &str = "user";
@@ -1010,6 +1015,25 @@ impl ChatHistoryDatabase {
         find_provider_session(&*self.inner.lock().await, session_id).await
     }
 
+    /// 追加一条轮错误记录（每轮失败收尾由宿主调用）。
+    pub async fn append_turn_error(
+        &self,
+        session_id: &str,
+        record: &TurnErrorRecord,
+        now: i64,
+    ) -> Result<(), Error> {
+        append_turn_error(&*self.inner.lock().await, session_id, record, now).await
+    }
+
+    /// 单会话的轮错误记录（runtime/turn_errors，追加序即时间升序）；
+    /// 无则空表。
+    pub async fn find_turn_errors(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TurnErrorRecord>, Error> {
+        find_turn_errors(&*self.inner.lock().await, session_id).await
+    }
+
     // ----- messages -----
 
     /// 落盘用户消息：message 行（data=user_message_data）+ 单 text part
@@ -1760,6 +1784,105 @@ async fn find_provider_session(
         .await
         .db_error("failed to query the provider session")?;
     Ok(row.and_then(|row| parse_provider_session(&row.data)))
+}
+
+// ---------- turn errors (session_entry) ----------
+
+/// 单轮失败的错误记录（宿主每轮失败收尾追加；回载会话时恢复错误卡）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnErrorRecord {
+    /// 完整错误文本（原样展示给用户）。
+    pub text: String,
+    /// UI 会话内的轮次序号（宿主 send_message 的 turn 计数）。
+    pub turn: u64,
+    /// 记录时刻（epoch 毫秒），回载时与消息按时间归位排序。
+    pub time: i64,
+}
+
+/// `runtime/turn_errors` 行的 data 载荷（记录数组，camelCase 键）。
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnErrorData {
+    text: String,
+    turn: u64,
+    time: i64,
+}
+
+fn turn_errors_data(records: &[TurnErrorRecord]) -> String {
+    let data: Vec<TurnErrorData> = records
+        .iter()
+        .map(|record| TurnErrorData {
+            text: record.text.clone(),
+            turn: record.turn,
+            time: record.time,
+        })
+        .collect();
+    serde_json::to_string(&data).unwrap_or_else(|_| "[]".into())
+}
+
+fn parse_turn_errors(data: &str) -> Vec<TurnErrorRecord> {
+    serde_json::from_str::<Vec<TurnErrorData>>(data)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|data| TurnErrorRecord {
+            text: data.text,
+            turn: data.turn,
+            time: data.time,
+        })
+        .collect()
+}
+
+/// 追加一条轮错误记录（entry 单行 JSON 数组读-改-写；同一会话的轮收尾
+/// 在宿主侧串行发生，无并发竞态）。
+async fn append_turn_error(
+    db: &ormer::Database,
+    session_id: &str,
+    record: &TurnErrorRecord,
+    now: i64,
+) -> Result<(), Error> {
+    let mut records = find_turn_errors(db, session_id).await?;
+    records.push(record.clone());
+    let id = format!("{session_id}{ENTRY_SUFFIX_TURN_ERRORS}");
+    let data = turn_errors_data(&records);
+    let updated = db
+        .update::<SessionEntryRow>()
+        .filter(|m| m.id.eq(id.clone()))
+        .set(|m| {
+            m.data = m.data.set(data.clone());
+            m.time_updated = m.time_updated.set(now);
+        })
+        .execute()
+        .await
+        .db_error("failed to update the turn errors")?;
+    if updated == 0 {
+        db.insert(&SessionEntryRow {
+            id,
+            session_id: session_id.to_string(),
+            entry_type: ENTRY_TYPE_TURN_ERRORS.to_string(),
+            time_created: now,
+            time_updated: now,
+            data,
+        })
+        .execute()
+        .await
+        .db_error("failed to insert the turn errors")?;
+    }
+    Ok(())
+}
+
+/// 单会话的轮错误记录（追加序，即时间升序）；无则空表。
+async fn find_turn_errors(
+    db: &ormer::Database,
+    session_id: &str,
+) -> Result<Vec<TurnErrorRecord>, Error> {
+    let row: Option<SessionEntryRow> = db
+        .select::<SessionEntryRow>()
+        .filter(|m| m.session_id.eq(session_id.to_string()))
+        .filter(|m| m.entry_type.eq(ENTRY_TYPE_TURN_ERRORS.to_string()))
+        .first()
+        .await
+        .db_error("failed to query the turn errors")?;
+    Ok(row.map(|row| parse_turn_errors(&row.data)).unwrap_or_default())
 }
 
 // ---------- messages ----------

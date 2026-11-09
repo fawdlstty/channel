@@ -112,6 +112,7 @@ fn command_of(kind: &HarnessKind) -> &'static str {
         HarnessKind::ZCode => "zcode",
         HarnessKind::DeepSeek => "deepseek",
         HarnessKind::Hermes => "hermes",
+        HarnessKind::BlackAgentEngine => "in-process",
     }
 }
 
@@ -163,6 +164,9 @@ pub async fn list_channels(kind: HarnessKind) -> Result<Vec<ChannelInfo>, Error>
         #[cfg(not(feature = "ccswitch"))]
         HarnessKind::OpenCode => Vec::new(),
         HarnessKind::ZedAcp | HarnessKind::DeepSeek | HarnessKind::Hermes => Vec::new(),
+        // The engine's channels come from the host configuration (API
+        // direct / Ollama / local models), not a config file in here.
+        HarnessKind::BlackAgentEngine => Vec::new(),
     };
     Ok(if channels.is_empty() {
         vec![default_channel()]
@@ -228,9 +232,9 @@ async fn probe_version(program: &Path, args: &[&str]) -> Option<String> {
         .kill_on_drop(true);
     let attempt = async { command.output().await };
     let output = tokio::time::timeout(VERSION_PROBE_TIMEOUT, attempt).await.ok()?.ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = crate::utils::text::decode_child_output(&output.stdout);
     let output = if stdout.trim().is_empty() {
-        String::from_utf8_lossy(&output.stderr)
+        crate::utils::text::decode_child_output(&output.stderr)
     } else {
         stdout
     };

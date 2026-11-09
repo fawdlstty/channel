@@ -28,6 +28,7 @@ fn display(kind: &HarnessKind) -> &'static str {
         HarnessKind::ZCode => "ZCode",
         HarnessKind::DeepSeek => "DeepSeek",
         HarnessKind::Hermes => "Hermes",
+        HarnessKind::BlackAgentEngine => "BlackAgentEngine",
     }
 }
 

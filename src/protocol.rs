@@ -14,6 +14,9 @@ pub enum HarnessKind {
     ZCode,
     DeepSeek,
     Hermes,
+    /// In-process ZCode-style agent-loop executor (BlackAgent 自研引擎)：
+    /// 直连 OpenAI Chat Completions 兼容端点，工具执行面由 channel 承担。
+    BlackAgentEngine,
 }
 
 /// The registry used to resolve switch-managed provider keys.
@@ -609,6 +612,21 @@ pub enum BackendSpec {
         command: String,
         args: Vec<String>,
     },
+    /// In-process agent-loop executor: an OpenAI Chat Completions compatible
+    /// endpoint (base_url up to but excluding `/chat/completions`) with an
+    /// optional bearer key. Tool execution happens inside channel.
+    Engine {
+        provider: EngineProvider,
+    },
+}
+
+/// Connection parameters for the in-process engine backend. Model,
+/// workspace, permission mode and conversation history ride on the regular
+/// [`SessionConfig`] fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EngineProvider {
+    pub base_url: String,
+    pub api_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -646,6 +664,8 @@ pub enum BackendKind {
     Acp,
     StructuredCli,
     PlainCli,
+    /// In-process agent-loop executor (no subprocess, no wire transport).
+    Engine,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1453,8 +1473,8 @@ pub struct TodoSnapshot {
     pub explanation: Option<String>,
 }
 
-/// 运行中子代理（worker）条目：ZCode 会话状态 `subagents.running[]` 的
-/// 投影。ended 名单带游标分页（量大），只投影总数。
+/// 子代理（worker）条目：ZCode 会话状态 `subagents.running[]` 的投影，
+/// 引擎形态（BackendSpec::Engine）额外携带任务内容与活动日志。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentRunning {
     /// 子会话 id（`sess_subagent_<agentId>` 形态）。
@@ -1465,8 +1485,16 @@ pub struct SubagentRunning {
     pub subagent_type: String,
     /// 任务短标题（派发 prompt 首行截断）。
     pub title: String,
-    /// running | waiting | blocked。
+    /// running | waiting | blocked | completed | failed。
     pub status: String,
+    /// 最新一行摘要（app-server 条目 summary 透传；引擎取活动末行）。
+    pub summary: Option<String>,
+    /// 完整任务 prompt（引擎形态；截断防快照膨胀，其余形态 None）。
+    pub prompt: Option<String>,
+    /// 工具活动日志（引擎形态逐条追加，容量截尾；其余形态空）。
+    pub activity: Vec<String>,
+    /// 最终报告（引擎形态结束条目携带；运行中为 None）。
+    pub report: Option<String>,
 }
 
 /// 子代理（worker）名单全量快照：ZCode `state.updated` 的
@@ -1479,8 +1507,10 @@ pub struct SubagentsSnapshot {
     pub child_session_ids: Vec<String>,
     /// 当前运行中的 worker（含 waiting/blocked）。
     pub running: Vec<SubagentRunning>,
-    /// 已结束 worker 总数。
+    /// 已结束 worker 总数（app-server 形态 ended 名单分页不可得，仅计数）。
     pub ended_total: u64,
+    /// 已结束 worker 条目（引擎形态携带身份与报告；其余形态空）。
+    pub ended: Vec<SubagentRunning>,
 }
 
 /// todo/plan 类工具名判定：小写并去掉 `_`/`-`/空格后等于 `todowrite` 或

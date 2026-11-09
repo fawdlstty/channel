@@ -51,12 +51,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The role of a chat message in a conversation.
+/// The role of a chat message in a conversation. `Tool` carries one tool
+/// result back to the server (OpenAI chat-completions `role:"tool"`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageRole {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 impl MessageRole {
@@ -65,6 +67,7 @@ impl MessageRole {
             Self::System => "system",
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::Tool => "tool",
         }
     }
 }
@@ -75,13 +78,40 @@ impl std::fmt::Display for MessageRole {
     }
 }
 
+/// One tool invocation requested by the assistant (OpenAI `tool_calls`
+/// entry): the server-assigned id, the function name and the JSON-string
+/// arguments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallData {
+    pub id: String,
+    pub name: String,
+    /// Raw JSON string as produced by the model (OpenAI `function.arguments`).
+    pub arguments: String,
+}
+
+/// A tool definition offered to the model (OpenAI `tools` entry body).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the `parameters` object.
+    pub parameters: serde_json::Value,
+}
+
 /// A single message in a conversation, stamped with a microsecond Unix
-/// timestamp taken from [`SystemTime`].
+/// timestamp taken from [`SystemTime`]. `tool_calls` is set on assistant
+/// messages that invoke tools; `tool_call_id` links a [`MessageRole::Tool`]
+/// result to its invocation. Both fields are omitted on the wire when absent
+/// so pre-tool payloads keep round-tripping.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub ts_micros: i64,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -90,6 +120,8 @@ impl ChatMessage {
             role,
             ts_micros: unix_micros(),
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -104,6 +136,28 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::new(MessageRole::Assistant, content)
     }
+
+    /// An assistant message carrying tool invocations (`content` may be
+    /// empty when the model only calls tools).
+    pub fn assistant_with_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCallData>) -> Self {
+        let mut message = Self::new(MessageRole::Assistant, content);
+        message.tool_calls = tool_calls;
+        message
+    }
+
+    /// A tool result linked to its invocation id.
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        let mut message = Self::new(MessageRole::Tool, content);
+        message.tool_call_id = Some(tool_call_id.into());
+        message
+    }
+}
+
+/// Token usage reported by the provider for one request (OpenAI `usage`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct StreamUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
 }
 
 /// One chunk of a streaming chat response.
@@ -111,6 +165,13 @@ impl ChatMessage {
 pub enum StreamChunk {
     /// An incremental piece of assistant text.
     Content(String),
+    /// The assistant requested tool invocations; emitted once per response
+    /// after all `delta.tool_calls` fragments have been aggregated, right
+    /// before [`StreamChunk::Done`].
+    ToolCalls(Vec<ToolCallData>),
+    /// Provider-reported token usage for the request (final streaming chunk
+    /// or the non-streaming body); optional.
+    Usage(StreamUsage),
     /// The stream or the protocol reported a failure.
     Error(String),
     /// The stream finished; no further chunks are sent.
@@ -130,12 +191,32 @@ pub struct LlmModelInfo {
 /// Shared message log handed to background streaming tasks.
 pub(crate) type MessageLog = Arc<RwLock<Vec<ChatMessage>>>;
 
+/// One `delta.tool_calls` fragment from a streaming chunk: the stream-level
+/// index plus the partial id/name/arguments pieces carried by this fragment
+/// (OpenAI fragments must be concatenated per index until the terminator).
+#[cfg(feature = "llm")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ToolCallFragment {
+    pub index: usize,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments: Option<String>,
+}
+
 /// The action extracted from one server-sent event block or one NDJSON
 /// line.
 #[cfg(feature = "llm")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SseAction {
     Content(String),
+    /// All `delta.tool_calls` fragments of one event (OpenAI allows several
+    /// per chunk), in wire order.
+    ToolCallDelta(Vec<ToolCallFragment>),
+    /// The `finish_reason` of the current choice (e.g. "stop"/"tool_calls").
+    FinishReason(String),
+    /// Provider-reported usage (typically the final chunk with
+    /// `stream_options.include_usage`).
+    Usage(StreamUsage),
     Done,
     /// Only emitted by the openai-responses, anthropic-messages and ollama
     /// parsers.
@@ -162,11 +243,13 @@ pub(crate) fn unix_seconds() -> i64 {
 }
 
 /// Pops the next complete SSE event block (delimited by a blank line) from
-/// `buffer`; incomplete trailing data stays buffered.
+/// the byte buffer; incomplete trailing data stays buffered. The event bytes
+/// are decoded as one unit so multibyte characters split across network
+/// chunks survive (per-chunk lossy decoding corrupts them).
 #[cfg(feature = "llm")]
-pub(crate) fn next_sse_event(buffer: &mut String) -> Option<String> {
-    let position = buffer.find("\n\n")?;
-    let event = buffer[..position].to_owned();
+pub(crate) fn next_sse_event_bytes(buffer: &mut Vec<u8>) -> Option<String> {
+    let position = buffer.windows(2).position(|pair| pair == b"\n\n")?;
+    let event = String::from_utf8_lossy(&buffer[..position]).into_owned();
     buffer.drain(..position + 2);
     Some(event)
 }
@@ -180,11 +263,13 @@ pub(crate) fn sse_data_payload(event: &str) -> Option<&str> {
 }
 
 /// Pops the next complete NDJSON line (delimited by a single newline) from
-/// `buffer`; incomplete trailing data stays buffered.
+/// the byte buffer; incomplete trailing data stays buffered. The line bytes
+/// are decoded as one unit so multibyte characters split across network
+/// chunks survive (per-chunk lossy decoding corrupts them).
 #[cfg(feature = "llm")]
-pub(crate) fn next_ndjson_line(buffer: &mut String) -> Option<String> {
-    let position = buffer.find('\n')?;
-    let line = buffer[..position].to_owned();
+pub(crate) fn next_ndjson_line_bytes(buffer: &mut Vec<u8>) -> Option<String> {
+    let position = buffer.iter().position(|byte| *byte == b'\n')?;
+    let line = String::from_utf8_lossy(&buffer[..position]).into_owned();
     buffer.drain(..position + 1);
     Some(line)
 }
@@ -283,6 +368,9 @@ pub(crate) struct ClientCore {
     pub(crate) session: potato::Session,
     pub(crate) messages: MessageLog,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    /// Tool definitions offered to the model on every request (agent-loop
+    /// executor sets these once per session).
+    pub(crate) tools: Vec<ToolSpec>,
 }
 
 #[cfg(feature = "llm")]
@@ -295,7 +383,13 @@ impl ClientCore {
             session: potato::Session::new(),
             messages: Arc::new(RwLock::new(Vec::new())),
             reasoning_effort: None,
+            tools: Vec::new(),
         }
+    }
+
+    /// Replaces the tool definitions sent with every request.
+    pub(crate) fn set_tools(&mut self, tools: Vec<ToolSpec>) {
+        self.tools = tools;
     }
 
     pub(crate) fn set_system_prompt(&mut self, prompt: impl Into<String>) {
@@ -383,6 +477,7 @@ impl ClientCore {
             "model": self.model,
             "messages": self.read_messages(),
             "reasoning_effort": self.reasoning_effort.map(|effort| effort.as_str()),
+            "tools": self.tools,
         });
         serde_json::to_string(&state)
             .map_err(|error| Error::ProtocolError(format!("failed to serialize client: {error}")))
@@ -430,6 +525,10 @@ impl ClientCore {
             .and_then(|value| value.as_str())
             .map(parse_reasoning_effort)
             .transpose()?;
+        let tools: Vec<ToolSpec> = state
+            .get("tools")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
 
         Ok(Self {
             base_url,
@@ -438,6 +537,7 @@ impl ClientCore {
             session: potato::Session::new(),
             messages: Arc::new(RwLock::new(messages)),
             reasoning_effort,
+            tools,
         })
     }
 }
@@ -491,8 +591,28 @@ pub(crate) fn finalize_assistant_message(messages: &MessageLog, content: String)
     }
 }
 
+/// Appends an assistant message that carries tool invocations: the trailing
+/// assistant entry (streamed text) keeps its content and gains `tool_calls`,
+/// or a fresh entry is appended when nothing was streamed.
+pub(crate) fn log_assistant_tool_calls(messages: &MessageLog, tool_calls: Vec<ToolCallData>) {
+    let mut history = messages
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let content = history
+        .last()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
+    if history.last().is_some_and(|message| message.role == MessageRole::Assistant) {
+        history.pop();
+    }
+    history.push(ChatMessage::assistant_with_tool_calls(content, tool_calls));
+}
+
 /// Spawns the background task that turns an SSE response into a
 /// [`StreamChunk`] channel while keeping the message log up to date.
+/// `delta.tool_calls` fragments are aggregated per stream index and emitted
+/// as one [`StreamChunk::ToolCalls`] right before the terminator.
 #[cfg(feature = "llm")]
 pub(crate) fn spawn_sse_stream(
     response: potato::HttpResponse,
@@ -503,11 +623,16 @@ pub(crate) fn spawn_sse_stream(
     tokio::spawn(async move {
         let mut response = response;
         let mut stream = response.body.stream_data();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         let mut assistant_content = String::new();
+        // OpenAI streams tool calls as fragments keyed by stream index; the
+        // id/name arrive on the first fragment of each call, the arguments
+        // are split across several events and must be concatenated.
+        let mut tool_fragments: std::collections::BTreeMap<usize, (String, String, String)> =
+            std::collections::BTreeMap::new();
         while let Some(chunk) = stream.next().await {
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(event) = next_sse_event(&mut buffer) {
+            buffer.extend_from_slice(&chunk);
+            while let Some(event) = next_sse_event_bytes(&mut buffer) {
                 match parse_event(&event) {
                     SseAction::Content(content) => {
                         assistant_content.push_str(&content);
@@ -516,7 +641,42 @@ pub(crate) fn spawn_sse_stream(
                             return;
                         }
                     }
+                    SseAction::ToolCallDelta(fragments) => {
+                        for fragment in fragments {
+                            let entry =
+                                tool_fragments.entry(fragment.index).or_default();
+                            if let Some(id) = fragment.id {
+                                entry.0.push_str(&id);
+                            }
+                            if let Some(name) = fragment.name {
+                                entry.1.push_str(&name);
+                            }
+                            if let Some(arguments) = fragment.arguments {
+                                entry.2.push_str(&arguments);
+                            }
+                        }
+                    }
+                    SseAction::FinishReason(_) => {}
+                    SseAction::Usage(usage) => {
+                        if tx.send(StreamChunk::Usage(usage)).await.is_err() {
+                            return;
+                        }
+                    }
                     SseAction::Done => {
+                        if !tool_fragments.is_empty() {
+                            let calls: Vec<ToolCallData> = tool_fragments
+                                .into_values()
+                                .map(|(id, name, arguments)| ToolCallData {
+                                    id,
+                                    name,
+                                    arguments,
+                                })
+                                .collect();
+                            log_assistant_tool_calls(&messages, calls.clone());
+                            if tx.send(StreamChunk::ToolCalls(calls)).await.is_err() {
+                                return;
+                            }
+                        }
                         finalize_assistant_message(&messages, assistant_content);
                         let _ = tx.send(StreamChunk::Done).await;
                         return;
@@ -551,11 +711,11 @@ pub(crate) fn spawn_ndjson_stream(
     tokio::spawn(async move {
         let mut response = response;
         let mut stream = response.body.stream_data();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         let mut assistant_content = String::new();
         while let Some(chunk) = stream.next().await {
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(line) = next_ndjson_line(&mut buffer) {
+            buffer.extend_from_slice(&chunk);
+            while let Some(line) = next_ndjson_line_bytes(&mut buffer) {
                 match parse_line(&line) {
                     SseAction::Content(content) => {
                         assistant_content.push_str(&content);
@@ -569,6 +729,11 @@ pub(crate) fn spawn_ndjson_stream(
                         let _ = tx.send(StreamChunk::Done).await;
                         return;
                     }
+                    // Ollama protocol carries no tool calls (ndjson parser
+                    // never produces these actions; kept for exhaustiveness).
+                    SseAction::ToolCallDelta(_)
+                    | SseAction::FinishReason(_)
+                    | SseAction::Usage(_) => {}
                     SseAction::Error(message) => {
                         let _ = tx.send(StreamChunk::Error(message)).await;
                         let _ = tx.send(StreamChunk::Done).await;
@@ -622,19 +787,19 @@ mod tests {
 
     #[test]
     fn sse_event_splitter_handles_partial_and_multiple_events() {
-        let mut buffer = String::new();
-        assert_eq!(next_sse_event(&mut buffer), None);
+        let mut buffer = Vec::new();
+        assert_eq!(next_sse_event_bytes(&mut buffer), None);
 
-        buffer.push_str("data: {\"a\":1}\n\ndata: {\"b\"");
+        buffer.extend_from_slice(b"data: {\"a\":1}\n\ndata: {\"b\"");
         assert_eq!(
-            next_sse_event(&mut buffer).as_deref(),
+            next_sse_event_bytes(&mut buffer).as_deref(),
             Some("data: {\"a\":1}")
         );
-        assert_eq!(next_sse_event(&mut buffer), None);
+        assert_eq!(next_sse_event_bytes(&mut buffer), None);
 
-        buffer.push_str(":2}\n\n");
+        buffer.extend_from_slice(b":2}\n\n");
         assert_eq!(
-            next_sse_event(&mut buffer).as_deref(),
+            next_sse_event_bytes(&mut buffer).as_deref(),
             Some("data: {\"b\":2}")
         );
         assert!(buffer.is_empty());
@@ -652,15 +817,47 @@ mod tests {
 
     #[test]
     fn ndjson_line_splitter_handles_partial_and_multiple_lines() {
-        let mut buffer = String::new();
-        assert_eq!(next_ndjson_line(&mut buffer), None);
+        let mut buffer = Vec::new();
+        assert_eq!(next_ndjson_line_bytes(&mut buffer), None);
 
-        buffer.push_str("{\"a\":1}\n{\"b\"");
-        assert_eq!(next_ndjson_line(&mut buffer).as_deref(), Some("{\"a\":1}"));
-        assert_eq!(next_ndjson_line(&mut buffer), None);
+        buffer.extend_from_slice(b"{\"a\":1}\n{\"b\"");
+        assert_eq!(
+            next_ndjson_line_bytes(&mut buffer).as_deref(),
+            Some("{\"a\":1}")
+        );
+        assert_eq!(next_ndjson_line_bytes(&mut buffer), None);
 
-        buffer.push_str(":2}\n");
-        assert_eq!(next_ndjson_line(&mut buffer).as_deref(), Some("{\"b\":2}"));
+        buffer.extend_from_slice(b":2}\n");
+        assert_eq!(
+            next_ndjson_line_bytes(&mut buffer).as_deref(),
+            Some("{\"b\":2}")
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn byte_frame_splitters_survive_multibyte_split_across_chunks() {
+        // 多字节字符跨 TCP chunk 切开：按字节攒齐后整帧解码，不得产出
+        // U+FFFD（按 chunk 逐段 lossy 的旧行为会读坏中文）。
+        let mut buffer = Vec::new();
+        let event = "data: {\"text\":\"中文输出\"}\n\n".as_bytes();
+        buffer.extend_from_slice(&event[..event.len() - 6]);
+        assert_eq!(next_sse_event_bytes(&mut buffer), None);
+        buffer.extend_from_slice(&event[event.len() - 6..]);
+        assert_eq!(
+            next_sse_event_bytes(&mut buffer).as_deref(),
+            Some("data: {\"text\":\"中文输出\"}")
+        );
+
+        let mut buffer = Vec::new();
+        let line = "{\"reply\":\"中文字符串\"}\n".as_bytes();
+        buffer.extend_from_slice(&line[..8]);
+        buffer.extend_from_slice(&line[8..14]);
+        buffer.extend_from_slice(&line[14..]);
+        assert_eq!(
+            next_ndjson_line_bytes(&mut buffer).as_deref(),
+            Some("{\"reply\":\"中文字符串\"}")
+        );
         assert!(buffer.is_empty());
     }
 

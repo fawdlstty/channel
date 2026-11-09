@@ -905,6 +905,13 @@ fn subagents_events(payload: &Value) -> Vec<Event> {
                             .and_then(Value::as_str)
                             .unwrap_or("running")
                             .to_owned(),
+                        summary: entry
+                            .get("summary")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        prompt: None,
+                        activity: Vec::new(),
+                        report: None,
                     })
                 })
                 .collect()
@@ -916,6 +923,7 @@ fn subagents_events(payload: &Value) -> Vec<Event> {
                 child_session_ids,
                 running,
                 ended_total,
+                ended: Vec::new(),
             })]
         }
         _ => Vec::new(),

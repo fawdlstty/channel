@@ -353,15 +353,18 @@ mod tests {
                       data: {\"type\":\"response.output_text.delta\",\"delta\":\"He\"}\n\n\
                       data: {\"type\":\"response.output_text.delta\",\"delta\":\"llo\"}\n\n\
                       data: {\"type\":\"response.completed\"}\n\n";
-        let mut buffer = stream.to_owned();
+        let mut buffer = stream.to_owned().into_bytes();
         let mut collected = String::new();
         let mut done = false;
-        while let Some(event) = super::super::next_sse_event(&mut buffer) {
+        while let Some(event) = super::super::next_sse_event_bytes(&mut buffer) {
             match parse_sse_event(&event) {
                 SseAction::Content(content) => collected.push_str(&content),
                 SseAction::Done => done = true,
                 SseAction::Error(message) => panic!("unexpected error: {message}"),
                 SseAction::Ignore => {}
+                SseAction::ToolCallDelta(_)
+                | SseAction::FinishReason(_)
+                | SseAction::Usage(_) => {}
             }
         }
         assert_eq!(collected, "Hello");

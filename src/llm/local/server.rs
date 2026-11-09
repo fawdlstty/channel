@@ -460,6 +460,7 @@ where
             // Mid-stream engine failures are forwarded as a final content
             // delta; the protocol frames around it stay valid.
             StreamChunk::Error(message) => emit(message).await?,
+            StreamChunk::ToolCalls(_) | StreamChunk::Usage(_) => {}
         }
     }
     Ok(())

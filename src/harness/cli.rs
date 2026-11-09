@@ -726,17 +726,6 @@ impl CliBackend {
             _ => return None,
         }
         self.worker_revision += 1;
-        // TEMP-PROBE: 验证后移除
-        let entries = self
-            .workers_running
-            .iter()
-            .map(|(_, entry)| format!("{}:{}", entry.subagent_type, entry.title))
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!(
-            "[worker-probe] emit revision={} running={} ended={} entries=[{}]",
-            self.worker_revision, self.workers_running.len(), self.worker_ended_total, entries
-        );
         Some(Event::Subagents(SubagentsSnapshot {
             revision: self.worker_revision,
             child_session_ids: Vec::new(),
@@ -746,6 +735,7 @@ impl CliBackend {
                 .map(|(_, entry)| entry.clone())
                 .collect(),
             ended_total: self.worker_ended_total,
+            ended: Vec::new(),
         }))
     }
 }
@@ -804,6 +794,10 @@ fn subagent_entry_from_input(input: &Value) -> SubagentRunning {
         subagent_type: kind,
         title,
         status: "running".to_owned(),
+        summary: None,
+        prompt: None,
+        activity: Vec::new(),
+        report: None,
     }
 }
 
@@ -981,13 +975,14 @@ impl crate::protocol::BackendSpec {
             | crate::protocol::BackendSpec::PlainCli { command, args } => {
                 Ok((command.clone(), args.clone()))
             }
-            crate::protocol::BackendSpec::Auto => kind.cli_command(),
-            crate::protocol::BackendSpec::CodexAppServer { .. }
-            | crate::protocol::BackendSpec::ZcodeAppServer { .. }
-            | crate::protocol::BackendSpec::Acp { .. } => Err(Error::InvalidConfig(
-                "CLI backend cannot use an ACP, Codex or Zcode App Server specification"
-                    .to_owned(),
-            )),
+        crate::protocol::BackendSpec::Auto => kind.cli_command(),
+        crate::protocol::BackendSpec::CodexAppServer { .. }
+        | crate::protocol::BackendSpec::ZcodeAppServer { .. }
+        | crate::protocol::BackendSpec::Acp { .. }
+        | crate::protocol::BackendSpec::Engine { .. } => Err(Error::InvalidConfig(
+            "CLI backend cannot use an ACP, Codex, Zcode App Server or engine specification"
+                .to_owned(),
+        )),
         }
     }
 }

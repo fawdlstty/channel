@@ -96,6 +96,9 @@ pub(crate) enum Adapter {
     Zcode,
     Acp,
     Cli,
+    /// In-process agent-loop executor (feature `engine`).
+    #[cfg(feature = "engine")]
+    Engine,
 }
 
 impl Adapter {
@@ -107,8 +110,18 @@ impl Adapter {
             // headless structured CLI stays the Auto default for ZCode.
             BackendSpec::ZcodeAppServer { .. } => Adapter::Zcode,
             BackendSpec::Acp { .. } => Adapter::Acp,
+            #[cfg(feature = "engine")]
+            BackendSpec::Engine { .. } => Adapter::Engine,
+            #[cfg(not(feature = "engine"))]
+            BackendSpec::Engine { .. } => {
+                unreachable!("engine backend requires the `engine` feature")
+            }
             BackendSpec::Auto => match config.kind {
                 HarnessKind::Codex => Adapter::Codex,
+                #[cfg(feature = "engine")]
+                HarnessKind::BlackAgentEngine => Adapter::Engine,
+                #[cfg(not(feature = "engine"))]
+                HarnessKind::BlackAgentEngine => Adapter::Cli,
                 HarnessKind::OpenCode
                 | HarnessKind::ZedAcp
                 | HarnessKind::DeepSeek
@@ -160,6 +173,20 @@ impl Adapter {
                     }),
                 ))
             }
+            #[cfg(feature = "engine")]
+            Self::Engine => Ok(HarnessDiscovery::discover(
+                &HarnessKind::BlackAgentEngine,
+                BackendKind::Engine,
+                "in-process",
+                &[],
+                std::path::PathBuf::new(),
+                TransportKind::InProcess,
+                Some(ProtocolInfo {
+                    name: "blackagent-engine".to_owned(),
+                    version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                    initialized: true,
+                }),
+            )),
             Self::Cli => cli::CliBackend::initialize(&kind, backend, init),
         }
     }
@@ -227,6 +254,15 @@ impl Adapter {
                 )
                 .await
             }
+            #[cfg(feature = "engine")]
+            Self::Engine => {
+                crate::engine::adapter::create_session_with_config(
+                    config,
+                    first_message,
+                    attachments,
+                )
+                .await
+            }
         }
     }
 }
@@ -242,6 +278,40 @@ impl BackendKind {
             BackendKind::ZcodeAppServer => zcode::ZcodeBackend::supported_capabilities(),
             BackendKind::StructuredCli => cli::CliBackend::structured_capabilities(kind),
             BackendKind::PlainCli => cli::CliBackend::plain_capabilities(),
+            // `BackendKind::Engine` is defined unconditionally, so the match
+            // needs both cfg arms (same pattern as `Adapter::for_config`):
+            // without the `engine` feature the in-process executor is not
+            // compiled in and the capability set degrades to "unavailable".
+            #[cfg(not(feature = "engine"))]
+            BackendKind::Engine => crate::protocol::CapabilitySet::default(),
+            #[cfg(feature = "engine")]
+            BackendKind::Engine => crate::protocol::CapabilitySet {
+                streaming_events: true,
+                structured_text: true,
+                reasoning_summary: false,
+                tool_calls: true,
+                tool_inputs: true,
+                tool_outputs: true,
+                file_reads: true,
+                file_writes: true,
+                file_deletes: true,
+                command_execution: true,
+                network_access_control: false,
+                permission_requests: true,
+                permission_responses: true,
+                user_input_requests: true,
+                user_input_responses: true,
+                turn_cancel: true,
+                session_close: true,
+                // The message log persists via the host's serialized client
+                // state, not a provider-side id.
+                provider_persistence: false,
+                provider_resume: false,
+                native_ui_discovery: false,
+                native_ui_attach: false,
+                session_history: true,
+                raw_events: false,
+            },
         }
     }
 }

@@ -56,6 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match chunk {
             channel::StreamChunk::Content(text) => print!("{text}"),
             channel::StreamChunk::Error(message) => eprintln!("\n[error: {message}]"),
+            // Tool/usage chunks: the plain chat example has no tool surface.
+            channel::StreamChunk::ToolCalls(_) | channel::StreamChunk::Usage(_) => {}
             channel::StreamChunk::Done => println!(),
         }
     }

@@ -365,8 +365,10 @@ impl crate::protocol::BackendSpec {
             Self::Acp { .. } => BackendKind::Acp,
             Self::StructuredCli { .. } => BackendKind::StructuredCli,
             Self::PlainCli { .. } => BackendKind::PlainCli,
+            Self::Engine { .. } => BackendKind::Engine,
             Self::Auto => match kind {
                 HarnessKind::Codex => BackendKind::CodexAppServer,
+                HarnessKind::BlackAgentEngine => BackendKind::Engine,
                 HarnessKind::OpenCode
                 | HarnessKind::ZedAcp
                 | HarnessKind::DeepSeek
@@ -386,6 +388,8 @@ impl crate::protocol::BackendSpec {
             | Self::Acp { command, .. }
             | Self::StructuredCli { command, .. }
             | Self::PlainCli { command, .. } => Some(command.clone()),
+            // The engine runs in-process; no external command is spawned.
+            Self::Engine { .. } => None,
             Self::Auto => match kind {
                 HarnessKind::Codex => Some("codex".to_owned()),
                 HarnessKind::OpenCode => Some("opencode".to_owned()),
@@ -394,6 +398,7 @@ impl crate::protocol::BackendSpec {
                 HarnessKind::DeepSeek => Some("deepseek".to_owned()),
                 HarnessKind::Hermes => Some("hermes".to_owned()),
                 HarnessKind::ClaudeCode => Some("claude".to_owned()),
+                HarnessKind::BlackAgentEngine => None,
             },
         }
     }
@@ -405,6 +410,7 @@ impl crate::protocol::BackendSpec {
             | Self::Acp { args, .. }
             | Self::StructuredCli { args, .. }
             | Self::PlainCli { args, .. } => args.clone(),
+            Self::Engine { .. } => Vec::new(),
             Self::Auto => match kind {
                 HarnessKind::Codex => vec!["app-server".to_owned(), "--stdio".to_owned()],
                 HarnessKind::OpenCode
@@ -412,6 +418,7 @@ impl crate::protocol::BackendSpec {
                 | HarnessKind::DeepSeek
                 | HarnessKind::Hermes => vec!["acp".to_owned()],
                 HarnessKind::ZCode | HarnessKind::ClaudeCode => Vec::new(),
+                HarnessKind::BlackAgentEngine => Vec::new(),
             },
         }
     }

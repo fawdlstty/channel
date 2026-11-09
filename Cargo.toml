@@ -1,6 +1,6 @@
 ﻿[package]
 name = "channel"
-version = "0.3.18"
+version = "0.3.19"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT"
@@ -45,6 +45,7 @@ ormer = { version = "0.2", optional = true, default-features = false, features =
 # Always compiled: the HTTP/ws transport underpins `llm`/`switch`/the local
 # model server and the Codex ws endpoint alike (no separate transport feature).
 potato = { version = "0.4", default-features = false, features = ["std", "tls", "websocket"] }
+regex = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = { version = "2", optional = true }
@@ -153,6 +154,11 @@ ccswitch = ["dep:ormer", "dep:toml"]
 # for external-compaction transcription rides the same ormer (short-lived
 # connections, SELECT only).
 history = ["dep:ormer", "dep:uuid"]
+# In-process ZCode-style agent-loop executor: EngineBackend implements the
+# Backend trait against an OpenAI Chat Completions endpoint and runs the
+# built-in tool surface (Bash/Read/Write/Edit/Glob/Grep/Todo/Ask/plan/Cron/
+# subagents) inside channel. Implies `llm` (protocol client) + regex (Grep).
+engine = ["llm", "dep:regex"]
 # In-process local inference, `local-<weight format>-<backend>`: the weight
 # format implies the engine — safetensors runs on the pure-Rust candle engine,
 # GGUF on llama.cpp (needs cmake and a C++ toolchain). The candle baseline (CPU) carries the

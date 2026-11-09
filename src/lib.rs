@@ -2,6 +2,9 @@
 // (feature `harness`, former `charness` crate); see the module docs there.
 pub mod harness;
 mod catalog;
+// In-process ZCode-style agent-loop executor (feature `engine`).
+#[cfg(feature = "engine")]
+pub mod engine;
 #[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 mod llm;
 mod process;
@@ -9,7 +12,7 @@ mod protocol;
 mod runtime;
 mod session;
 mod switch;
-mod utils;
+pub mod utils;
 
 use protocol::{HarnessInit, HarnessState};
 
@@ -19,7 +22,8 @@ pub use protocol::{
     AccountRef, ApprovalPolicy, AuditDescriptor, AuditMode, BackendInfo, BackendKind, BackendSpec,
     Capabilities, Capability, CapabilityEvidence, CapabilityReport, CapabilitySet, Confidence,
     ConversationOptions, ConversationSpec, CredentialSource, DecimalAmount, DirectoryRequirement,
-    EndpointRequest, EnvValuePolicy, Error, Event, EventEnvelope, EventPolicy, EventVisibility,
+    EndpointRequest, EngineProvider, EnvValuePolicy, Error, Event, EventEnvelope, EventPolicy,
+    EventVisibility,
     FileChange, FileChangeKind, FileRead, FileReadSource, FileReadStatus, FilesystemAccess,
     FilesystemPermission, Finish, FinishInfo, HarnessKind, ModelInfo, ModelOptions, NetworkPolicy,
     Observation, ObservationSource, PathVisibility, PermissionInfo, PermissionLimitation,
@@ -64,18 +68,24 @@ pub use history::{
     // 常量
     DB_FILE_NAME, DEFAULT_TITLE, ENTRY_SUFFIX_CHANNEL_SELECTION,
     ENTRY_SUFFIX_PROVIDER_SESSION, ENTRY_SUFFIX_TODO_STATE,
-    ENTRY_TYPE_CHANNEL_SELECTION, ENTRY_TYPE_PROVIDER_SESSION,
-    ENTRY_TYPE_TODO_STATE, SETTING_SCOPE, SETTING_SCOPE_ID,
+    ENTRY_SUFFIX_TURN_ERRORS, ENTRY_TYPE_CHANNEL_SELECTION,
+    ENTRY_TYPE_PROVIDER_SESSION, ENTRY_TYPE_TODO_STATE,
+    ENTRY_TYPE_TURN_ERRORS, SETTING_SCOPE, SETTING_SCOPE_ID,
     TASK_TYPE_INTERACTIVE, TITLE_SOURCE_CUSTOM, TITLE_SOURCE_DEFAULT,
     TITLE_SOURCE_FIRST_INPUT,
     // 引擎会话续接（provider resume）
     ProviderSessionRecord,
+    // 轮错误记录（宿主回载会话恢复错误卡）
+    TurnErrorRecord,
 };
 
 // Types shared by the HTTP protocol clients (`llm`) and the local-model
 // client (`local-safetensors-cpu`).
 #[cfg(any(feature = "llm", feature = "local-safetensors-cpu"))]
 pub use llm::{ChatMessage, LlmModelInfo, MessageRole, StreamChunk};
+// Tool-calling primitives for the agent-loop executor (`llm` clients).
+#[cfg(feature = "llm")]
+pub use llm::{StreamUsage, ToolCallData, ToolSpec};
 // The four HTTP protocol clients; pure potato transports.
 #[cfg(feature = "llm")]
 pub use llm::{ChatCompletionsClient, ForwardedCompletion, MessagesClient, OllamaClient, ResponsesClient};
@@ -172,6 +182,9 @@ impl Harness {
                 command: discovery.backend.command.clone().unwrap_or_default(),
                 args: discovery.runtime.args.clone(),
             },
+            // The engine backend keeps its provider spec (in-process; there
+            // is no external command to re-record).
+            crate::protocol::BackendKind::Engine => config.backend.clone(),
         };
         if let Some(executable) = discovery.runtime.executable_path.clone() {
             config.runtime.process.executable = Some(executable);

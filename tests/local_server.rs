@@ -95,6 +95,8 @@ async fn openai_chat_completions_round_trip() {
                 break;
             }
             channel::StreamChunk::Error(message) => panic!("stream error: {message}"),
+            // 工具调用/用量块与本断言无关，忽略。
+            channel::StreamChunk::ToolCalls(_) | channel::StreamChunk::Usage(_) => {}
         }
     }
     assert!(saw_done, "stream ends with Done");
@@ -126,6 +128,8 @@ async fn ollama_chat_round_trip() {
                 break;
             }
             channel::StreamChunk::Error(message) => panic!("stream error: {message}"),
+            // 工具调用/用量块与本断言无关，忽略。
+            channel::StreamChunk::ToolCalls(_) | channel::StreamChunk::Usage(_) => {}
         }
     }
     assert!(saw_done);
@@ -175,6 +179,8 @@ async fn anthropic_and_responses_round_trip() {
             channel::StreamChunk::Content(text) => content.push_str(&text),
             channel::StreamChunk::Done => break,
             channel::StreamChunk::Error(message) => panic!("stream error: {message}"),
+            // 工具调用/用量块与本断言无关，忽略。
+            channel::StreamChunk::ToolCalls(_) | channel::StreamChunk::Usage(_) => {}
         }
     }
     assert!(!content.trim().is_empty());
@@ -198,6 +204,8 @@ async fn anthropic_and_responses_round_trip() {
                 break;
             }
             channel::StreamChunk::Error(message) => panic!("stream error: {message}"),
+            // 工具调用/用量块与本断言无关，忽略。
+            channel::StreamChunk::ToolCalls(_) | channel::StreamChunk::Usage(_) => {}
         }
     }
     assert!(saw_done);

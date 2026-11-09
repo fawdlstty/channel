@@ -539,6 +539,7 @@ impl LocalClient {
             match chunk {
                 StreamChunk::Content(text) => content.push_str(&text),
                 StreamChunk::Error(message) => failure = Some(message),
+                StreamChunk::ToolCalls(_) | StreamChunk::Usage(_) => {}
                 StreamChunk::Done => break,
             }
         }
@@ -778,6 +779,11 @@ fn spawn_forwarder(
                 }
                 StreamChunk::Error(message) => {
                     let _ = destination.send(StreamChunk::Error(message)).await;
+                }
+                StreamChunk::ToolCalls(_) | StreamChunk::Usage(_) => {
+                    // Local models don't emit tool-call chunks today; pass
+                    // through untouched so future producers stay visible.
+                    let _ = destination.send(chunk).await;
                 }
                 StreamChunk::Done => {
                     finalize_assistant_message(&shared.messages, content);

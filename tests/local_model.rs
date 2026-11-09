@@ -164,6 +164,8 @@ async fn streaming_emits_content_then_done() {
                 break;
             }
             channel::StreamChunk::Error(message) => panic!("unexpected stream error: {message}"),
+            // 工具调用/用量块与本断言无关，忽略。
+            channel::StreamChunk::ToolCalls(_) | channel::StreamChunk::Usage(_) => {}
         }
     }
     assert!(saw_done, "the stream must end with Done");
