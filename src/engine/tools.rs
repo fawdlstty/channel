@@ -326,11 +326,12 @@ fn apply_reported_cwd(ctx: &ToolContext, cwd_file: &Path) {
     if trimmed.is_empty() {
         return;
     }
-    let next = if cfg!(windows) {
-        super::shell::posix_to_windows_path(trimmed).unwrap_or_else(|| PathBuf::from(trimmed))
-    } else {
-        PathBuf::from(trimmed)
-    };
+    // Compile-time gates: `posix_to_windows_path` only exists on Windows.
+    #[cfg(windows)]
+    let next =
+        super::shell::posix_to_windows_path(trimmed).unwrap_or_else(|| PathBuf::from(trimmed));
+    #[cfg(not(windows))]
+    let next = PathBuf::from(trimmed);
     if next.is_dir() {
         *ctx.cwd.lock().unwrap() = next;
     }

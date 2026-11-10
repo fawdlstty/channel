@@ -24,7 +24,9 @@
 //! probes, a PATH scan and one `ver` spawn run once). The module lives
 //! under the `engine` feature alongside its consumers.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// The dialect a resolved shell speaks.
@@ -217,11 +219,12 @@ pub fn environment_section(workspace: &Path) -> String {
         "aarch64" => "arm64",
         other => other,
     };
-    let os_version = if cfg!(windows) {
-        format!("win32 {} {}", windows_os_version(), arch)
-    } else {
-        format!("{} {}", std::env::consts::OS, arch)
-    };
+    // Compile-time gates: `windows_os_version()` only exists on Windows,
+    // so a runtime `if cfg!(windows)` would not compile on other targets.
+    #[cfg(windows)]
+    let os_version = format!("win32 {} {}", windows_os_version(), arch);
+    #[cfg(not(windows))]
+    let os_version = format!("{} {}", std::env::consts::OS, arch);
     let guidance = match shell.dialect {
         ShellDialect::GitBash => "The Bash tool executes commands with Git Bash (POSIX): quoting, pipes and the Unix toolset work as documented, so multi-step network requests (curl, ...) succeed as one command. Windows paths are accepted; inside the shell they also read as /c/... style paths.",
         ShellDialect::Cmd => "The Bash tool executes commands with cmd.exe: POSIX tools (head, tail, grep, sed, awk) are not available (use findstr, more, or PowerShell), single quotes do not quote (use double quotes), and backslash line continuations do not work. For web requests use curl with double-quoted URLs on a single line.",
@@ -302,6 +305,7 @@ pub(crate) fn posix_to_windows_path(raw: &str) -> Option<PathBuf> {
 }
 
 /// Appends a POSIX tail (`a/b/../c`) to a Windows path, honoring `.`/`..`.
+#[cfg(windows)]
 fn push_posix_tail(path: &mut PathBuf, tail: &str) {
     for segment in tail.split('/') {
         if segment.is_empty() || segment == "." {
